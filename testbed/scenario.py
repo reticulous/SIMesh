@@ -65,7 +65,26 @@ DEFAULT_SETUP = [
     "lora 0 bw 125",
 ]
 
-DEFAULT_PHYSICS = {"exponent": 2.7, "noise_figure_db": 6, "capture_db": 6}
+DEFAULT_PHYSICS = {"exponent": 2.7, "noise_figure_db": 6, "capture_db": 6,
+                   "shadowing_db": 0, "shadowing_seed": 0,
+                   "capture_model": "margin"}
+
+# Physics a file carries only when it says something, so a scenario written
+# before they existed, or one that leaves them at their defaults, is written
+# back exactly as it was read.
+OPTIONAL_PHYSICS = ("shadowing_db", "shadowing_seed", "capture_model")
+
+
+def physics_value(key, value):
+    """One physics setting as the file holds it: a whole seed, a named capture
+    model, a number otherwise."""
+    if key == "capture_model":
+        if value not in ("margin", "bench"):
+            raise ScenarioError("capture_model is margin or bench, not %r" % (value,))
+        return value
+    if key == "shadowing_seed":
+        return int(value)
+    return float(value)
 
 # The kinds a scenario that names none has: one `reticulous` kind, from simd's
 # --elf and --fixed. Set by simd before anything is read, so every scenario
@@ -199,9 +218,12 @@ def dump(data):
     """
     out = ["origin: [%s, %s]" % (scalar(data["origin"][0]), scalar(data["origin"][1]))]
     physics = data.get("physics") or DEFAULT_PHYSICS
+    keys = ["exponent", "noise_figure_db", "capture_db"] + [
+        key for key in OPTIONAL_PHYSICS
+        if physics.get(key, DEFAULT_PHYSICS[key]) != DEFAULT_PHYSICS[key]]
     out.append("physics: { %s }" % ", ".join(
         "%s: %s" % (key, scalar(physics.get(key, DEFAULT_PHYSICS[key])))
-        for key in ("exponent", "noise_figure_db", "capture_db")))
+        for key in keys))
 
     kinds = data.get("kinds") or {}
     if kinds and kinds != DEFAULT_KINDS:
@@ -261,6 +283,10 @@ def read(path):
     filled = blank()
     filled["origin"] = [float(v) for v in (data.get("origin") or [0.0, 0.0])[:2]]
     filled["physics"] = {**DEFAULT_PHYSICS, **(data.get("physics") or {})}
+    try:
+        physics_value("capture_model", filled["physics"]["capture_model"])
+    except ScenarioError as err:
+        raise ScenarioError("%s: %s" % (path, err)) from err
     kinds = data.get("kinds")
     if kinds:
         if not isinstance(kinds, dict) or not all(
@@ -471,7 +497,8 @@ class Scenario:
 
     def set_physics(self, values):
         self.data["physics"] = {**self.physics,
-                                **{k: float(v) for k, v in values.items()
+                                **{k: physics_value(k, v)
+                                   for k, v in values.items()
                                    if k in DEFAULT_PHYSICS}}
         self.dirty = True
 
