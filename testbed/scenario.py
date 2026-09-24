@@ -65,7 +65,31 @@ DEFAULT_SETUP = [
     "lora 0 bw 125",
 ]
 
-DEFAULT_PHYSICS = {"exponent": 2.7, "noise_figure_db": 6, "capture_db": 6}
+DEFAULT_PHYSICS = {"exponent": 2.7, "noise_figure_db": 6, "capture_db": 6,
+                   "shadowing_db": 0, "shadowing_seed": 0,
+                   "capture_model": "margin", "sf_orthogonality": "none"}
+
+# Physics a file carries only when it says something, so a scenario written
+# before they existed, or one that leaves them at their defaults, is written
+# back exactly as it was read.
+OPTIONAL_PHYSICS = ("shadowing_db", "shadowing_seed", "capture_model",
+                    "sf_orthogonality")
+
+
+def physics_value(key, value):
+    """One physics setting as the file holds it: a whole seed, a named capture
+    model, a number otherwise."""
+    if key == "capture_model":
+        if value not in ("margin", "bench"):
+            raise ScenarioError("capture_model is margin or bench, not %r" % (value,))
+        return value
+    if key == "sf_orthogonality":
+        if value not in ("none", "croce"):
+            raise ScenarioError("sf_orthogonality is none or croce, not %r" % (value,))
+        return value
+    if key == "shadowing_seed":
+        return int(value)
+    return float(value)
 
 # The kinds a scenario that names none has: one `reticulous` kind, from simd's
 # --elf and --fixed. Set by simd before anything is read, so every scenario
@@ -148,7 +172,8 @@ def blank():
             "kinds": copy.deepcopy(DEFAULT_KINDS),
             "setup": list(DEFAULT_SETUP),
             "nodes": {},
-            "obstructions": []}
+            "obstructions": [],
+            "links": []}
 
 
 def first_kind(data):
@@ -199,9 +224,12 @@ def dump(data):
     """
     out = ["origin: [%s, %s]" % (scalar(data["origin"][0]), scalar(data["origin"][1]))]
     physics = data.get("physics") or DEFAULT_PHYSICS
+    keys = ["exponent", "noise_figure_db", "capture_db"] + [
+        key for key in OPTIONAL_PHYSICS
+        if physics.get(key, DEFAULT_PHYSICS[key]) != DEFAULT_PHYSICS[key]]
     out.append("physics: { %s }" % ", ".join(
         "%s: %s" % (key, scalar(physics.get(key, DEFAULT_PHYSICS[key])))
-        for key in ("exponent", "noise_figure_db", "capture_db")))
+        for key in keys))
 
     kinds = data.get("kinds") or {}
     if kinds and kinds != DEFAULT_KINDS:
@@ -244,6 +272,12 @@ def dump(data):
     out += ["  - { between: [%s, %s], db: %s }"
             % (wall["between"][0], wall["between"][1], scalar(wall.get("db", 0)))
             for wall in walls]
+    links = data.get("links") or []
+    if links:
+        out.append("links:")
+        out += ["  - { between: [%s, %s], loss_db: %s }"
+                % (link["between"][0], link["between"][1], scalar(link["loss_db"]))
+                for link in links]
     return "\n".join(out) + "\n"
 
 
@@ -261,6 +295,11 @@ def read(path):
     filled = blank()
     filled["origin"] = [float(v) for v in (data.get("origin") or [0.0, 0.0])[:2]]
     filled["physics"] = {**DEFAULT_PHYSICS, **(data.get("physics") or {})}
+    try:
+        physics_value("capture_model", filled["physics"]["capture_model"])
+        physics_value("sf_orthogonality", filled["physics"]["sf_orthogonality"])
+    except ScenarioError as err:
+        raise ScenarioError("%s: %s" % (path, err)) from err
     kinds = data.get("kinds")
     if kinds:
         if not isinstance(kinds, dict) or not all(
@@ -272,6 +311,12 @@ def read(path):
     filled["obstructions"] = [
         {"between": list(wall["between"])[:2], "db": float(wall.get("db", 0))}
         for wall in (data.get("obstructions") or [])]
+    try:
+        filled["links"] = [
+            {"between": list(link["between"])[:2], "loss_db": float(link["loss_db"])}
+            for link in (data.get("links") or [])]
+    except (KeyError, TypeError, ValueError) as err:
+        raise ScenarioError("%s: a link is { between: [a, b], loss_db: <dB> }" % path) from err
     filled["nodes"] = {}
     ids = {}
     for name, node in (data.get("nodes") or {}).items():
@@ -387,6 +432,10 @@ class Scenario:
         return self.data["obstructions"]
 
     @property
+    def links(self):
+        return self.data.setdefault("links", [])
+
+    @property
     def kinds(self):
         """Kind name -> its spec, in the file's order; the first is the default."""
         return self.data["kinds"]
@@ -454,6 +503,8 @@ class Scenario:
         del self.nodes[name]
         self.data["obstructions"] = [
             wall for wall in self.obstructions if name not in wall["between"]]
+        self.data["links"] = [
+            link for link in self.links if name not in link["between"]]
         shutil.rmtree(self.node_dir(name), ignore_errors=True)
         self.dirty = True
 
@@ -471,7 +522,8 @@ class Scenario:
 
     def set_physics(self, values):
         self.data["physics"] = {**self.physics,
-                                **{k: float(v) for k, v in values.items()
+                                **{k: physics_value(k, v)
+                                   for k, v in values.items()
                                    if k in DEFAULT_PHYSICS}}
         self.dirty = True
 
@@ -526,7 +578,8 @@ class Scenario:
         return {"name": self.name, "dirty": self.dirty,
                 "origin": list(self.origin), "physics": dict(self.physics),
                 "setup": list(self.setup), "kinds": list(self.kinds),
-                "obstructions": [dict(w) for w in self.obstructions]}
+                "obstructions": [dict(w) for w in self.obstructions],
+                "links": [dict(link) for link in self.links]}
 
 
 # ---- loading -------------------------------------------------------------
