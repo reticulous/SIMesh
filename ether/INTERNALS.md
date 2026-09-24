@@ -48,7 +48,7 @@ A link is geometry, not a number somebody wrote down:
 
 ```
 L = P_tx + G_tx + G_rx − PL(d)
-PL(d) = FSPL(1 m, f) + 10·n·log10(d) + obstruction(tx, rx)
+PL(d) = FSPL(1 m, f) + 10·n·log10(d) + X(tx, rx) + obstruction(tx, rx)
 ```
 
 The free-space term is taken at the **frame's own carrier**, because a
@@ -58,6 +58,16 @@ how big a network feels: at 2.7 a station is audible for tens of kilometres and
 almost everything hears almost everything, and at 3.6 the same field breaks into
 neighbourhoods. That is a property of the air, not of the map, which is why it
 sits in `physics:` beside the noise figure and the capture margin.
+
+Shadowing is what the exponent alone cannot give: two pairs at one distance
+that do not hear each other equally, because what stands between them is not
+the same. It is one draw per pair from a normal distribution of spread
+`shadowing_db`, from a hash of `shadowing_seed` and the two station numbers, so
+it is the same in both directions, for every frame, and after a restart. It is
+fixed for the run on purpose: a loss drawn afresh for every frame lets every
+retry through in the end, which flatters exactly what a scenario is usually run
+to judge. The spread scales one standard-normal draw, so two runs that differ
+only in `shadowing_db` stand on the same ground, one of it rougher.
 
 Distance is floored at one metre. Without that, two stations dropped at the
 same point make `log10(0)`, and the answer a person wants there is "very loud",
@@ -144,6 +154,20 @@ when it was delivered. A station can be dragged across the map while two frames
 are in the air, and the answer that matters is where it was when the reception
 ended.
 
+## Which frame a receiver follows
+
+A demodulator follows one frame at a time, so when a second frame reaches a
+receiver already following one, the chip needs to know whether it takes the
+receiver or goes unheard. That is the question of which of the two survives,
+and the ether answers it with the same rule: `rx_begin` carries `takes`. A
+receiver following nothing takes the frame that reaches it; one following a
+frame keeps it unless the new frame leads it there by the capture margin, the
+margin the verdict applies. The ether keeps its own note of what each receiver
+follows, from the `rx_begin`s it sent and the states it was told, and a
+receiver that leaves `RX` lets go. A chip that decided for itself at a margin of
+its own would hand up a frame the medium had spoiled, or drop one it had kept,
+whenever a scenario's margin was not the chip's.
+
 ## A frame's two names
 
 A station numbers its own transmissions and knows nothing of anyone else's, so
@@ -182,9 +206,9 @@ medium: the ether's job is the frames, and everything watching is optional.
 
 ## What is deliberately not here
 
-- **Fading and per-frame variation.** A level is computed once from the
-  geometry and is the same for every frame between one pair. No shadowing, no
-  multipath, no antenna pattern, no rain.
+- **Fading and per-frame variation.** A level is computed once, from the
+  geometry and the pair's shadowing, and is the same for every frame between
+  one pair. No multipath, no antenna pattern, no rain.
 - **The CRC band.** The threshold is the spreading factor's own, and above it a
   frame is delivered. A real receiver also has a few dB above that threshold
   where a frame locks but fails its CRC at a probability. `welcome` already

@@ -14,10 +14,10 @@ capture margin.
 
 The level a frame arrives at is computed, not stated. Every station has a
 position in metres and an antenna gain, every pair may have an obstruction in
-dB, and
+dB and, when the scenario asks for it, a shadowing draw of its own, and
 
     L = P_tx + G_tx + G_rx − PL(d)
-    PL(d) = FSPL(1 m, f) + 10·n·log10(d) + obstruction(tx, rx)
+    PL(d) = FSPL(1 m, f) + 10·n·log10(d) + X(tx, rx) + obstruction(tx, rx)
 
 Positions arrive by direct call — `place()` and `obstruct()` — from whatever
 is driving the run; the UDP wire to the stations never mentions them, and a
@@ -36,6 +36,8 @@ wall-clock timestamp, direction, station id, JSON.
 
 import argparse
 import asyncio
+import functools
+import hashlib
 import json
 import math
 import os
@@ -65,6 +67,8 @@ DEFAULT_EXPONENT = 2.7      # suburban; 2 is free space
 DEFAULT_NOISE_FIGURE_DB = 6
 DEFAULT_CAPTURE_DB = 6      # how far a frame must lead an interferer to survive it
 DEFAULT_POWER_DBM = 14      # a `tx` that did not say what it was sent at
+DEFAULT_SHADOWING_DB = 0.0  # the spread of a pair's shadowing draw; 0 is none
+DEFAULT_SHADOWING_SEED = 0  # which draws: the same seed is the same ground
 
 # The SNR a spreading factor needs before its receiver detects a preamble at
 # all, from the SX1262 datasheet: -2.5 dB at SF5 and 2.5 dB lower per step. A
@@ -126,31 +130,60 @@ def fspl_1m_db(freq_hz):
     return 20.0 * math.log10(4.0 * math.pi * max(freq_hz, 1.0) / SPEED_OF_LIGHT)
 
 
+@functools.lru_cache(maxsize=65536)
+def shadowing_unit(seed, a, b):
+    """One pair's shadowing in standard deviations, the same draw every time.
+
+    A standard normal from a hash of the seed and the unordered pair, so it
+    depends on those three numbers and nothing else: not on the order stations
+    joined in, not on which end transmits, not on the platform. The scenario's
+    `shadowing_db` scales it, so two runs that differ only in the spread stand
+    on the same ground, one of it rougher.
+    """
+    lo, hi = (a, b) if a <= b else (b, a)
+    digest = hashlib.sha256(("%d:%d:%d" % (seed, lo, hi)).encode()).digest()
+    u1 = (int.from_bytes(digest[:8], "big") + 1) / 2.0 ** 64     # (0, 1]
+    u2 = int.from_bytes(digest[8:16], "big") / 2.0 ** 64         # [0, 1)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+
 class Physics:
     """The scenario's constants: how fast the air eats a signal, and the noise."""
 
     def __init__(self, exponent=DEFAULT_EXPONENT,
                  noise_figure_db=DEFAULT_NOISE_FIGURE_DB,
-                 capture_db=DEFAULT_CAPTURE_DB):
+                 capture_db=DEFAULT_CAPTURE_DB,
+                 shadowing_db=DEFAULT_SHADOWING_DB,
+                 shadowing_seed=DEFAULT_SHADOWING_SEED):
         self.exponent = float(exponent)
         self.noise_figure_db = float(noise_figure_db)
         self.capture_db = float(capture_db)
+        self.shadowing_db = float(shadowing_db)
+        self.shadowing_seed = int(shadowing_seed)
 
     def describe(self):
-        return "exponent %.2f, noise figure %.1f dB, capture margin %.1f dB" % (
+        text = "exponent %.2f, noise figure %.1f dB, capture margin %.1f dB" % (
             self.exponent, self.noise_figure_db, self.capture_db)
+        if self.shadowing_db:
+            text += ", shadowing %.1f dB (seed %d)" % (self.shadowing_db,
+                                                      self.shadowing_seed)
+        return text
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
         return cls(data.get("exponent", DEFAULT_EXPONENT),
                    data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
-                   data.get("capture_db", DEFAULT_CAPTURE_DB))
+                   data.get("capture_db", DEFAULT_CAPTURE_DB),
+                   data.get("shadowing_db", DEFAULT_SHADOWING_DB),
+                   data.get("shadowing_seed", DEFAULT_SHADOWING_SEED))
 
     def as_dict(self):
         return {"exponent": self.exponent,
                 "noise_figure_db": self.noise_figure_db,
-                "capture_db": self.capture_db}
+                "capture_db": self.capture_db,
+                "shadowing_db": self.shadowing_db,
+                "shadowing_seed": self.shadowing_seed}
 
 
 class Placement:
@@ -247,6 +280,7 @@ class Ether(asyncio.DatagramProtocol):
         self.places = {}            # sid -> Placement, whether or not it has joined
         self.obstructions = {}      # frozenset({a, b}) -> dB
         self.frames = []            # frames still in flight or just ended
+        self.locks = {}             # (sid, slot) -> (frame, level): what a receiver follows
         self.next_eid = 0           # the ether's own frame numbering
         self.seed = seed if seed is not None else random.randrange(1 << 31)
         self.on_tx = None           # (sid, eid, freq, t_start, t_end)
@@ -302,6 +336,9 @@ class Ether(asyncio.DatagramProtocol):
         if d is None:
             return None
         loss = fspl_1m_db(freq_hz) + 10.0 * self.physics.exponent * math.log10(d)
+        if self.physics.shadowing_db:
+            loss += self.physics.shadowing_db * shadowing_unit(
+                self.physics.shadowing_seed, a, b)
         return loss + self.obstructions.get(frozenset((a, b)), 0.0)
 
     def level(self, tx_sid, rx_sid, freq_hz, power_dbm=DEFAULT_POWER_DBM):
@@ -437,6 +474,8 @@ class Ether(asyncio.DatagramProtocol):
         station = self.station_for(sid, addr)
         slot = msg.get("slot", 0)
         station.states[slot] = msg
+        if msg.get("mode") != "RX":
+            self.locks.pop((sid, slot), None)   # a receiver that leaves RX lets go
         log("station %d slot %s %s freq=%s bw=%s sf=%s sync=%s" % (
             sid, slot, msg.get("mode"), msg.get("freq"), msg.get("bw"),
             msg.get("sf"), msg.get("sync")))
@@ -488,6 +527,7 @@ class Ether(asyncio.DatagramProtocol):
                     # and the map draws no reception for it.
                     self.send(rsid, dict(begin, cad=True))
                     continue
+                begin["takes"] = self.takes_receiver(rsid, slot, frame, level, start)
                 frame.receivers.append((rsid, slot, level))
                 self.send(rsid, begin)
                 self.loop.call_later(span / 1_000_000.0,
@@ -502,6 +542,23 @@ class Ether(asyncio.DatagramProtocol):
         """True when a receiver's stated radio can hear this transmission."""
         return (all(state.get(k) == tx.get(k) for k in MATCH_KEYS)
                 and same_carrier(state.get("freq"), tx.get("freq"), state.get("bw")))
+
+    def takes_receiver(self, rsid, slot, frame, level, now):
+        """Whether this frame takes a receiver, which then follows it.
+
+        A demodulator follows one frame at a time. A receiver following nothing
+        takes the frame that reaches it; one already following a frame keeps it
+        unless the new frame leads it there by the capture margin. The ether
+        says so in the `rx_begin`, because it is the ether that rules on which
+        of the two survives: a chip deciding at a margin of its own would hand
+        up a frame the medium had spoiled, or drop one it had kept.
+        """
+        held = self.locks.get((rsid, slot))
+        if (held is not None and held[0].end_us > now
+                and level - held[1] < self.physics.capture_db):
+            return False
+        self.locks[(rsid, slot)] = (frame, level)
+        return True
 
     # ---- delivery -------------------------------------------------------
 

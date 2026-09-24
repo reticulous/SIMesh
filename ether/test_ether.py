@@ -166,6 +166,7 @@ class Bench:
         self.stations = []
         self.places = {}            # sid -> (x_m, y_m, gain_db)
         self.walls = []             # (sid, sid, dB)
+        self.physics = {}           # the scenario's `physics:`, when a test states it
 
     def place(self, sid, x_m, y_m=0.0, gain_db=0.0):
         assert self.proc is None, "the ether is already running"
@@ -188,7 +189,11 @@ class Bench:
                          % (sid, sid, lat, lon, gain_db))
         walls = ["  - { between: [n%d, n%d], db: %g }" % (a, b, db)
                  for a, b, db in self.walls]
-        text = "origin: [0.0, 0.0]\nnodes:\n" + "\n".join(nodes) + "\n"
+        text = "origin: [0.0, 0.0]\n"
+        if self.physics:
+            text += "physics: { %s }\n" % ", ".join(
+                "%s: %s" % (key, value) for key, value in self.physics.items())
+        text += "nodes:\n" + "\n".join(nodes) + "\n"
         if walls:
             text += "obstructions:\n" + "\n".join(walls) + "\n"
         path = self.tmp_path / "scenario.yaml"
@@ -333,6 +338,36 @@ def test_two_stations_at_one_point_are_held_a_metre_apart(ether):
 
     sender.tx(1)
     assert receiver.expect("rx_begin")["level"] == round(expected_level(1.0))
+
+
+def test_shadowing_is_one_draw_per_pair_the_same_both_ways_and_every_time():
+    draw = ether_module.shadowing_unit
+    assert draw(3, 1, 2) == draw(3, 2, 1)
+    assert draw(3, 1, 2) == draw(3, 1, 2)
+    assert draw(3, 1, 2) != draw(3, 1, 3)
+    assert draw(3, 1, 2) != draw(4, 1, 2)
+
+
+def test_shadowing_draws_spread_like_a_standard_normal():
+    draws = [ether_module.shadowing_unit(7, a, b)
+             for a in range(1, 41) for b in range(a + 1, 41)]
+    mean = sum(draws) / len(draws)
+    spread = math.sqrt(sum((d - mean) ** 2 for d in draws) / (len(draws) - 1))
+    assert abs(mean) < 0.12
+    assert spread == pytest.approx(1.0, abs=0.08)
+
+
+def test_shadowing_moves_a_link_by_its_pairs_draw_times_the_spread(ether):
+    ether.physics = {"shadowing_db": 7, "shadowing_seed": 3}
+    sender, receiver = ether(1, 0), ether(2, FAR_M)
+    sender.hello()
+    receiver.hello()
+    receiver.state("RX")
+    time.sleep(0.1)
+
+    sender.tx(1)
+    shadow = 7 * ether_module.shadowing_unit(3, 1, 2)
+    assert receiver.expect("rx_begin")["level"] == round(expected_level(FAR_M) - shadow)
 
 
 def test_the_sender_is_not_a_receiver_and_others_must_match(ether):
@@ -579,6 +614,70 @@ def test_a_receiver_that_hears_only_one_of_two_colliding_frames_keeps_it(ether):
     end = d.expect("rx_end")     # d heard only c, and cleanly
     assert base64.b64decode(end["payload"]) == b"from c"
     assert end["verdict"] == "clean"
+
+
+def test_a_frame_that_finds_its_receiver_idle_takes_it(ether):
+    sender, receiver = ether(1, 0), ether(2, NEAR_M)
+    sender.hello()
+    receiver.hello()
+    receiver.state("RX")
+    time.sleep(0.1)
+
+    sender.tx(121)
+    assert receiver.expect("rx_begin")["takes"] is True
+
+
+def collide_at(ether, a_m, c_m):
+    """b at the origin follows a's frame when c's lands on it; both rx_begins."""
+    a, b, c = ether(1, a_m), ether(2, 0), ether(3, c_m)
+    for station in (a, b, c):
+        station.hello()
+        station.state("RX")
+    time.sleep(0.1)
+
+    a.tx(131, payload=b"from a")
+    first = b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)          # squarely inside a's frame
+    c.tx(132, payload=b"from c")
+    return first, b.expect("rx_begin")
+
+
+def test_a_later_frame_takes_a_busy_receiver_past_the_capture_margin(ether):
+    """Half the distance is 8 dB at the default exponent: over the margin."""
+    first, second = collide_at(ether, 2 * FAR_M, -FAR_M)
+    assert first["takes"] is True
+    assert second["takes"] is True
+
+
+def test_a_later_frame_under_the_capture_margin_does_not_take_it(ether):
+    """1.4 km against 2 km is 4 dB at the default exponent: under it."""
+    first, second = collide_at(ether, 2 * FAR_M, -1.4 * FAR_M)
+    assert first["takes"] is True
+    assert second["takes"] is False
+
+
+def test_the_receiver_is_told_the_scenarios_margin_not_a_fixed_one(ether):
+    """The same 4 dB takes the receiver when the scenario's margin is 3 dB."""
+    ether.physics = {"capture_db": 3}
+    first, second = collide_at(ether, 2 * FAR_M, -1.4 * FAR_M)
+    assert second["takes"] is True
+
+
+def test_a_receiver_that_leaves_rx_lets_go_of_the_frame_it_followed(ether):
+    a, b, c = ether(1, 2 * FAR_M), ether(2, 0), ether(3, -1.4 * FAR_M)
+    for station in (a, b, c):
+        station.hello()
+        station.state("RX")
+    time.sleep(0.1)
+
+    a.tx(141, payload=b"from a")
+    assert b.expect("rx_begin")["takes"] is True
+    b.state("STDBY_RC")
+    time.sleep(0.02)
+    b.state("RX")
+    time.sleep(0.02)
+    c.tx(142, payload=b"from c")
+    assert b.expect("rx_begin")["takes"] is True
 
 
 def test_a_station_that_was_never_placed_hears_nothing(ether):
