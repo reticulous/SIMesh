@@ -48,7 +48,7 @@ A link is geometry, not a number somebody wrote down:
 
 ```
 L = P_tx + G_tx + G_rx − PL(d)
-PL(d) = FSPL(1 m, f) + 10·n·log10(d) + obstruction(tx, rx)
+PL(d) = FSPL(1 m, f) + 10·n·log10(d) + X(tx, rx) + obstruction(tx, rx)
 ```
 
 The free-space term is taken at the **frame's own carrier**, because a
@@ -59,6 +59,16 @@ almost everything hears almost everything, and at 3.6 the same field breaks into
 neighbourhoods. That is a property of the air, not of the map, which is why it
 sits in `physics:` beside the noise figure and the capture margin.
 
+Shadowing is what the exponent alone cannot give: two pairs at one distance
+that do not hear each other equally, because what stands between them is not
+the same. It is one draw per pair from a normal distribution of spread
+`shadowing_db`, from a hash of `shadowing_seed` and the two station numbers, so
+it is the same in both directions, for every frame, and after a restart. It is
+fixed for the run on purpose: a loss drawn afresh for every frame lets every
+retry through in the end, which flatters exactly what a scenario is usually run
+to judge. The spread scales one standard-normal draw, so two runs that differ
+only in `shadowing_db` stand on the same ground, one of it rougher.
+
 Distance is floored at one metre. Without that, two stations dropped at the
 same point make `log10(0)`, and the answer a person wants there is "very loud",
 not a crash.
@@ -67,6 +77,14 @@ What the levels are *for* has not changed: the medium needs to know which of two
 frames is the louder one, and by how much. Computing them rather than reading
 them buys the thing a testbed most wants — that moving a station changes what it
 can hear, and that the change is the same change a person would reason about.
+
+A **link** is the one exception, and a deliberate one: a pair whose loss was
+measured, or computed by a propagation model that knows the terrain and the
+buildings between them, can have that figure stated outright. It stands in for
+the distance and the shadowing of that pair only, in both directions and at
+every carrier, and an obstruction still adds to it. A station that is moved
+keeps its links, because a link is a fact about two stations, not about where
+they stand on the plane.
 
 ## The sensitivity threshold
 
@@ -139,10 +157,37 @@ been pruned still knows what spoiled it. Scheduling an `rx_end` does not settle
 it: a frame still in the air when a second one starts is spoiled retroactively
 for receivers already told it was arriving, which is exactly what a radio does.
 
+`capture_model: bench` swaps the margin for what a bench measured: the
+reticulum project's tools/rncapture, with an SX1262 listening to an SX1262 and
+an LR2021, SF7 at 125 kHz, 289 collisions. Its table is for frames that start
+within one preamble of each other. Its one finding past that, six frames about
+2 dB stronger landing 30 ms into a frame the listener had locked on to and
+spoiling both, is extended to every later frame: the listener stays on what it
+has and receives nothing else. The straight line between 2.7 and 6.1 dB is an
+assumption, and so is every spreading factor but 7. Each pair is judged once,
+from a draw keyed to the ether's seed, the two frames and the receiver, so the
+verdict on either frame and the `takes` the receiver was told read the same
+outcome.
+
 An interferer's level is recomputed at the verdict rather than remembered from
 when it was delivered. A station can be dragged across the map while two frames
 are in the air, and the answer that matters is where it was when the reception
 ended.
+
+## Which frame a receiver follows
+
+A demodulator follows one frame at a time, so when a second frame reaches a
+receiver already following one, the chip needs to know whether it takes the
+receiver or goes unheard. That is the question of which of the two survives,
+and the ether answers it with the same rule: `rx_begin` carries `takes`. A
+receiver following nothing takes the frame that reaches it; one following a
+frame keeps it unless the new frame would win the pair by the rule the verdict
+applies: the capture margin, or the bench's table. The ether keeps its own note
+of what each receiver
+follows, from the `rx_begin`s it sent and the states it was told, and a
+receiver that leaves `RX` lets go. A chip that decided for itself at a margin of
+its own would hand up a frame the medium had spoiled, or drop one it had kept,
+whenever a scenario's margin was not the chip's.
 
 ## A frame's two names
 
@@ -182,17 +227,23 @@ medium: the ether's job is the frames, and everything watching is optional.
 
 ## What is deliberately not here
 
-- **Fading and per-frame variation.** A level is computed once from the
-  geometry and is the same for every frame between one pair. No shadowing, no
-  multipath, no antenna pattern, no rain.
-- **The CRC band.** The threshold is the spreading factor's own, and above it a
-  frame is delivered. A real receiver also has a few dB above that threshold
-  where a frame locks but fails its CRC at a probability. `welcome` already
-  carries a `seed` so that band, when it arrives, has a reproducible generator
-  to draw from.
-- **Orthogonality.** Two frames on one carrier interfere whatever their
-  spreading factors, though a real receiver can often demodulate through a
-  frame at another SF. The medium is pessimistic here, and knowingly.
+- **Fading and per-frame variation.** A level is computed once, from the
+  geometry and the pair's shadowing, and is the same for every frame between
+  one pair. No multipath, no antenna pattern, no rain.
+- **The CRC band, by default.** The threshold is the spreading factor's own,
+  and above it a frame is delivered. A real receiver also has a few dB above
+  that threshold where a frame locks but fails its CRC at a probability, and
+  `crc_band_db` models that as a straight line from certain failure at the
+  threshold to none at the top of the band, drawn from the ether's seed. The
+  line is a simplification of a steeper, S-shaped curve; the band's width is
+  the scenario's to state.
+- **Orthogonality, by default.** Two frames on one carrier interfere whatever
+  their spreading factors, though a real receiver can often demodulate through
+  a frame at another SF. The medium is pessimistic here, and knowingly, unless
+  a scenario asks for `sf_orthogonality: croce`: then a frame at another
+  spreading factor spoils it only when it leads by more than a table measured
+  with an SX1272 allows (Croce et al., 2018, Table II). SF5 and SF6 were not
+  measured, and pairs involving them stay pessimistic.
 - **A referee.** The ether does not judge a station's behaviour — it does not
   check that a transmission was preceded by carrier sense, or that a duty cycle
   was respected. The record is there so something else can.

@@ -378,7 +378,7 @@ a frame arrives at is
 
 ```
 L = P_tx + G_tx + G_rx − PL(d)
-PL(d) = FSPL(1 m, f) + 10·n·log10(d) + obstruction(tx, rx)
+PL(d) = FSPL(1 m, f) + 10·n·log10(d) + X(tx, rx) + obstruction(tx, rx)
 ```
 
 with `n` the scenario's exponent — 2 is free space, 2.7 suburban, and higher
@@ -387,11 +387,22 @@ its spreading factor needs — −7.5 dB at SF7, down to −20 dB at SF12 — is
 delivered at all, and that is what "out of range" means here. So a link is in
 range only if it is one the modem could actually hold, and moving to a slower
 spreading factor really does reach further. An **obstruction** is a per-pair constant in dB, which is how two
-stations near each other are put out of each other's reach.
+stations near each other are put out of each other's reach. **Shadowing**
+(`shadowing_db` in `physics:`, 0 by default) gives every pair a fixed draw of
+its own on top, so two pairs at one distance need not hear each other equally;
+`shadowing_seed` picks the draw. A **link** states one pair's path loss
+outright, measured or from a propagation model such as ITU-R P.1812, and
+stands in for that pair's distance and shadowing:
+
+```yaml
+links:
+  - { between: [alpha, charlie], loss_db: 131.5 }
+```
 
 Two frames that share a carrier and any instant of air interfere, and each
 receiver rules on them for itself: a frame survives where it leads everything
-else that station could hear by the capture margin.
+else that station could hear by the capture margin, or, with `capture_model:
+bench`, as a bench measured it.
 [`ether/README.md`](ether/README.md) has the whole of what the medium
 decides.
 
