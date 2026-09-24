@@ -76,6 +76,70 @@ def test_kinds_round_trip_through_dump_and_read(tmp_path):
     assert again == data
 
 
+def test_shadowing_is_written_only_when_it_says_something(tmp_path):
+    data = scenario_module.read(write(tmp_path, MIXED))
+    assert "shadowing" not in scenario_module.dump(data)
+
+    data["physics"].update(shadowing_db=7, shadowing_seed=3)
+    text = scenario_module.dump(data)
+    assert "shadowing_db: 7" in text and "shadowing_seed: 3" in text
+    assert scenario_module.read(write(tmp_path, text, "again.yaml")) == data
+
+
+def test_the_page_sets_shadowing_and_the_seed_stays_a_whole_number(tmp_path):
+    data = scenario_module.read(write(tmp_path, MIXED))
+    sc = scenario_module.Scenario("mixed", data, run_dir=str(tmp_path / "run"))
+    sc.set_physics({"shadowing_db": "6.5", "shadowing_seed": "4", "unknown": 1})
+    assert sc.physics["shadowing_db"] == 6.5
+    assert sc.physics["shadowing_seed"] == 4
+    assert isinstance(sc.physics["shadowing_seed"], int)
+    assert "unknown" not in sc.physics
+
+
+def test_the_capture_model_is_written_only_when_it_is_the_bench(tmp_path):
+    data = scenario_module.read(write(tmp_path, MIXED))
+    assert "capture_model" not in scenario_module.dump(data)
+
+    data["physics"]["capture_model"] = "bench"
+    text = scenario_module.dump(data)
+    assert 'capture_model: "bench"' in text
+    assert scenario_module.read(write(tmp_path, text, "again.yaml")) == data
+
+
+def test_a_capture_model_nobody_knows_is_refused(tmp_path):
+    data = scenario_module.read(write(tmp_path, MIXED))
+    sc = scenario_module.Scenario("mixed", data, run_dir=str(tmp_path / "run"))
+    with pytest.raises(scenario_module.ScenarioError):
+        sc.set_physics({"capture_model": "optimistic"})
+    text = MIXED.replace("setup:\n  - \"hostname", 'physics: { capture_model: "guess" }\nsetup:\n  - "hostname', 1)
+    with pytest.raises(scenario_module.ScenarioError):
+        scenario_module.read(write(tmp_path, text, "bad.yaml"))
+
+
+def test_links_are_written_only_when_there_are_some_and_round_trip(tmp_path):
+    data = scenario_module.read(write(tmp_path, MIXED))
+    assert "links" not in scenario_module.dump(data)
+
+    data["links"] = [{"between": ["alpha", "sergey"], "loss_db": 118.5}]
+    text = scenario_module.dump(data)
+    assert "  - { between: [alpha, sergey], loss_db: 118.5 }" in text
+    assert scenario_module.read(write(tmp_path, text, "again.yaml")) == data
+
+
+def test_removing_a_node_drops_its_links(tmp_path):
+    text = MIXED + "links:\n  - { between: [alpha, sergey], loss_db: 118.5 }\n"
+    data = scenario_module.read(write(tmp_path, text))
+    sc = scenario_module.Scenario("mixed", data, run_dir=str(tmp_path / "run"))
+    sc.remove_node("sergey")
+    assert sc.links == []
+
+
+def test_a_link_without_a_loss_is_refused(tmp_path):
+    text = MIXED + "links:\n  - { between: [alpha, sergey] }\n"
+    with pytest.raises(scenario_module.ScenarioError):
+        scenario_module.read(write(tmp_path, text))
+
+
 def test_scenario_setup_goes_to_the_first_kind_only(tmp_path):
     data = scenario_module.read(write(tmp_path, MIXED))
     sc = scenario_module.Scenario("mixed", data, run_dir=str(tmp_path / "run"))
