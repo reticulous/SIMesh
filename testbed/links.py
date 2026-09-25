@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Link geometry from an ether record and its scenario, and power by distance.
+
+    links.py RECORD --scenario YAML [--from S] [--to S] [--min-clean N]
+             [--calling HZ] [--all-carriers] [--power] [--json OUT]
+
+A **usable link** is an ordered pair (transmitter, receiver) with at least
+--min-clean (20) clean receptions inside [--from, --to), counted on the
+calling channel (--calling, 869.525 MHz by default) unless --all-carriers.
+For them:
+
+- distance of every usable one-way link: mean, minimum, p10, median, p90,
+  maximum and a histogram in 200 m steps, and the share of links usable in
+  both directions;
+- neighbours per station (the receivers of its usable links) with the
+  nearest and farthest of them;
+- hop diameter over usable links both ways, and through transports only
+  (the stations whose last `transport_enabled` setup line is 1);
+- the scenario's own figures beside them: the range at which the ether's
+  formula puts a frame at the calling SF, bandwidth and power (from the
+  `lora 0 sf|bw|txp` setup lines) at the threshold, and the neighbour count
+  and diameter that range gives.
+
+--power adds, for frames off the calling channel (SUPE's traffic channels):
+transmit power by frame and by airtime (minimum, quartiles, maximum, a
+histogram in 2 dB steps), the exchanges with any frame below the maximum
+(an exchange is frames on one carrier with under 1 s of silence between
+them, as airtime.py counts it), the SF and bandwidth the frames flew at, and
+power against the distance to the peer, binned by 200 m. A frame's peer is
+the other station of its exchange when exactly two stations spoke in it,
+else the one station that received it cleanly; a frame with neither is left
+out of the distance table.
+
+Positions are projected as the ether projects them; distances are metres on
+that plane.
+"""
+import argparse
+import base64
+import collections
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+
+import yaml
+
+SIM_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SIM_DIR, "..", "ether"))
+import ether as E  # noqa: E402 - the path is set just above
+
+BIN_M = 200
+
+
+def quantiles(values):
+    v = sorted(values)
+    if not v:
+        return None
+    q = lambda f: v[min(len(v) - 1, int(f * (len(v) - 1) + 0.5))]
+    return {"n": len(v), "mean": sum(v) / len(v), "min": v[0], "p10": q(.1), "p25": q(.25),
+            "median": q(.5), "p75": q(.75), "p90": q(.9), "max": v[-1]}
+
+
+def radio_of(lines):
+    sf, bw, power = 8, 125_000, 14.0
+    for line in lines:
+        m = re.match(r"lora 0 (sf|bw|txp) (\d+(?:\.\d+)?)$", line.strip())
+        if m:
+            v = float(m.group(2))
+            if m.group(1) == "sf":
+                sf = int(v)
+            elif m.group(1) == "bw":
+                bw = int(v * 1000)
+            else:
+                power = v
+    return sf, bw, power
+
+
+def load_scenario(path):
+    if os.path.isdir(path):
+        path = os.path.join(path, "scenario.yaml")
+    data = yaml.safe_load(open(path))
+    origin = tuple(data["origin"])
+    pos, names, transport = {}, {}, set()
+    shared = list(data.get("setup") or [])
+    for name, node in data["nodes"].items():
+        sid = int(node["id"])
+        pos[sid] = E.project(origin, node["pos"][0], node["pos"][1])
+        names[sid] = name
+        t = [l for l in shared + list(node.get("setup") or []) if "transport_enabled" in l]
+        if t and t[-1].strip().endswith(" 1"):
+            transport.add(sid)
+    return data, pos, names, transport
+
+
+def dist(pos, a, b):
+    return max(E.MIN_DISTANCE_M, math.hypot(pos[a][0] - pos[b][0], pos[a][1] - pos[b][1]))
+
+
+def bfs(adj, src, via=None):
+    d = {src: 0}
+    frontier = [src]
+    while frontier:
+        nxt = []
+        for a in frontier:
+            if via is not None and a != src and a not in via:
+                continue
+            for b in adj.get(a, ()):
+                if b not in d:
+                    d[b] = d[a] + 1
+                    nxt.append(b)
+        frontier = nxt
+    return d
+
+
+def diameter(adj, nodes, via=None):
+    worst, unreached = 0, 0
+    for s in nodes:
+        d = bfs(adj, s, via)
+        unreached += sum(1 for n in nodes if n not in d)
+        worst = max([worst] + [d[n] for n in nodes if n in d])
+    return {"hops": worst, "pairs_unreached": unreached}
+
+
+def read(args):
+    """Frames in the window: sender, start, span, carrier, power, sf, bw, clean receivers."""
+    lo = int(args.frm * 1e6) if args.frm is not None else None
+    hi = int(args.to * 1e6) if args.to is not None else None
+    frames, by_key, begins = [], {}, {}
+    for line in open(args.record, encoding="utf-8"):
+        is_tx = '"type":"tx"' in line
+        if not is_tx and '"type":"rx_' not in line:
+            continue
+        stamp, direction, sid, blob = line.rstrip("\n").split("\t", 3)
+        msg = json.loads(blob)
+        if is_tx and direction == "in":
+            t_us = int(round(float(stamp) * 1e6))
+            if (lo is not None and t_us < lo) or (hi is not None and t_us >= hi):
+                continue
+            payload = base64.b64decode(msg.get("payload") or "")
+            f = {"sid": int(sid), "t": t_us, "span": max(0, int(msg.get("t_end", 0)) - int(msg.get("t0", 0))),
+                 "freq": msg.get("freq"), "power": msg.get("power_dbm"), "sf": msg.get("sf"),
+                 "bw": msg.get("bw"), "clean": set(), "crc": 0}
+            by_key[(t_us, hashlib.blake2b(payload, digest_size=8).digest())] = f
+            frames.append(f)
+        elif direction == "out" and msg.get("type") == "rx_begin" and not msg.get("cad"):
+            begins[(int(sid), msg["id"])] = int(msg["t0"])
+        elif direction == "out" and msg.get("type") == "rx_end":
+            t0 = begins.pop((int(sid), msg["id"]), None)
+            if t0 is None:
+                continue
+            f = by_key.get((t0, hashlib.blake2b(base64.b64decode(msg.get("payload") or ""),
+                                                digest_size=8).digest()))
+            if f is None:
+                continue
+            if msg.get("verdict") == "clean":
+                f["clean"].add(int(sid))
+            else:
+                f["crc"] += 1
+    return frames
+
+
+def geometry(frames, pos, names, transport, data, args):
+    tol = 125_000 // 4
+    on_call = lambda f: abs(f["freq"] - args.calling) <= tol
+    clean = collections.Counter()
+    for f in frames:
+        if args.all_carriers or on_call(f):
+            for r in f["clean"]:
+                clean[(f["sid"], r)] += 1
+    links = sorted(p for p, n in clean.items() if n >= args.min_clean and p[0] in pos and p[1] in pos)
+    lset = set(links)
+    d = [dist(pos, a, b) for a, b in links]
+    hist = collections.Counter(int(x // BIN_M) for x in d)
+    out = {"usable_links_one_way": len(links),
+           "both_ways": sum(1 for a, b in links if (b, a) in lset) // 2,
+           "distance_m": quantiles(d),
+           "histogram_m": {"%d-%d" % (k * BIN_M, (k + 1) * BIN_M): hist[k]
+                           for k in range(0, max(hist) + 1 if hist else 0)}}
+    heard_by = collections.defaultdict(set)      # receiver -> transmitters it hears
+    for a, b in links:
+        heard_by[b].add(a)
+    nodes = sorted(pos)
+    counts = [len(heard_by[n]) for n in nodes]
+    near = [min(dist(pos, n, m) for m in heard_by[n]) for n in nodes if heard_by[n]]
+    far = [max(dist(pos, n, m) for m in heard_by[n]) for n in nodes if heard_by[n]]
+    out["neighbours_per_station"] = quantiles(counts)
+    out["stations_hearing_nobody"] = [names[n] for n in nodes if not heard_by[n]]
+    out["nearest_neighbour_m"] = quantiles(near)
+    out["farthest_neighbour_m"] = quantiles(far)
+    both = collections.defaultdict(set)
+    for a, b in links:
+        if (b, a) in lset:
+            both[a].add(b)
+    out["diameter_both_ways"] = diameter(both, nodes)
+    out["diameter_both_ways_through_transports"] = diameter(both, nodes, transport)
+    out["per_station"] = {names[n]: {"neighbours": len(heard_by[n]),
+                                     "nearest_m": round(min(dist(pos, n, m) for m in heard_by[n]))
+                                     if heard_by[n] else None,
+                                     "farthest_m": round(max(dist(pos, n, m) for m in heard_by[n]))
+                                     if heard_by[n] else None}
+                          for n in nodes}
+
+    # The formula's own view of the same map.
+    sf, bw, power = radio_of(data.get("setup") or [])
+    e = E.Ether.__new__(E.Ether)
+    e.physics = E.Physics.from_dict(data.get("physics"))
+    need = e.noise(bw) + e.sensitivity(sf)
+    reach = 10 ** ((power - need - E.fspl_1m_db(args.calling)) / (10 * e.physics.exponent))
+    model = collections.defaultdict(set)
+    for a in nodes:
+        for b in nodes:
+            if a != b and dist(pos, a, b) <= reach:
+                model[a].add(b)
+    out["model"] = {"sf": sf, "bw": bw, "power_dbm": power, "reach_m": reach,
+                    "neighbours_per_station": quantiles([len(model[n]) for n in nodes]),
+                    "diameter": diameter(model, nodes),
+                    "diameter_through_transports": diameter(model, nodes, transport),
+                    "links_one_way": sum(len(v) for v in model.values())}
+    return out
+
+
+def power(frames, pos, args):
+    tol = 125_000 // 4
+    other = sorted((f for f in frames if abs(f["freq"] - args.calling) > tol and f["power"] is not None),
+                   key=lambda f: (f["freq"], f["t"]))
+    if not other:
+        return None
+    top = max(f["power"] for f in other)
+    ex, cur, last = [], None, None
+    for f in other:
+        if cur is None or f["freq"] != cur["freq"] or f["t"] - last > 1_000_000:
+            cur = {"freq": f["freq"], "frames": [], "stations": set()}
+            ex.append(cur)
+        cur["frames"].append(f)
+        cur["stations"].add(f["sid"])
+        last = f["t"] + f["span"]
+    for e in ex:
+        two = sorted(e["stations"]) if len(e["stations"]) == 2 else None
+        for f in e["frames"]:
+            if two:
+                f["peer"] = two[1] if f["sid"] == two[0] else two[0]
+            elif len(f["clean"]) == 1:
+                f["peer"] = next(iter(f["clean"]))
+            else:
+                f["peer"] = None
+    pw = [f["power"] for f in other]
+    air = collections.Counter()
+    hist = collections.Counter()
+    for f in other:
+        b = int(math.floor(f["power"] / 2) * 2)
+        hist[b] += 1
+        air[b] += f["span"]
+    total_air = sum(f["span"] for f in other)
+    wq = []                       # airtime-weighted quartiles, over frames sorted by power
+    acc = 0
+    fs = sorted(other, key=lambda f: f["power"])
+    for q in (0.0, 0.25, 0.5, 0.75, 1.0):
+        target = q * total_air
+        acc = 0
+        for f in fs:
+            acc += f["span"]
+            if acc >= target:
+                wq.append(f["power"])
+                break
+    rates = collections.Counter((f["sf"], f["bw"]) for f in other)
+    rate_air = collections.Counter()
+    for f in other:
+        rate_air[(f["sf"], f["bw"])] += f["span"]
+    bins = collections.defaultdict(list)
+    for f in other:
+        if f.get("peer") in pos and f["sid"] in pos:
+            bins[int(dist(pos, f["sid"], f["peer"]) // BIN_M)].append(f["power"])
+    ex_below = sum(1 for e in ex if any(f["power"] < top for f in e["frames"]))
+    return {
+        "frames": len(other), "max_dbm": top,
+        "by_frame": quantiles(pw),
+        "by_airtime_min_q1_median_q3_max": wq,
+        "mean_by_airtime": sum(f["power"] * f["span"] for f in other) / total_air if total_air else None,
+        "below_max_frames": sum(1 for p in pw if p < top),
+        "histogram_2db": {"%d..%d" % (b, b + 1):{"frames": hist[b], "airtime_s": air[b] / 1e6}
+                          for b in sorted(hist)},
+        "exchanges": len(ex), "exchanges_any_below_max": ex_below,
+        "rate_steps": {"SF%s/%dk" % (k[0], (k[1] or 0) // 1000): {"frames": v, "airtime_s": rate_air[k] / 1e6}
+                       for k, v in sorted(rates.items(), key=lambda x: -x[1])},
+        "frames_with_peer": sum(len(v) for v in bins.values()),
+        "by_distance_m": {"%d-%d" % (k * BIN_M, (k + 1) * BIN_M): dict(
+            quantiles(v), below_max=sum(1 for p in v if p < top)) for k, v in sorted(bins.items())},
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("record")
+    ap.add_argument("--scenario", required=True)
+    ap.add_argument("--from", dest="frm", type=float)
+    ap.add_argument("--to", type=float)
+    ap.add_argument("--min-clean", type=int, default=20)
+    ap.add_argument("--calling", type=int, default=869_525_000)
+    ap.add_argument("--all-carriers", action="store_true")
+    ap.add_argument("--power", action="store_true")
+    ap.add_argument("--json")
+    args = ap.parse_args()
+    data, pos, names, transport = load_scenario(args.scenario)
+    frames = read(args)
+    out = geometry(frames, pos, names, transport, data, args)
+    if args.power:
+        out["power_traffic_channels"] = power(frames, pos, args)
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(out, f, indent=1)
+    brief = {k: v for k, v in out.items() if k != "per_station"}
+    print(json.dumps(brief, indent=1))
+
+
+if __name__ == "__main__":
+    main()
