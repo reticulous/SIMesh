@@ -55,6 +55,16 @@ export interface Flash {
   start: number
 }
 
+/** How the run keeps time: real, or virtual at a pace (`rate` seconds of T
+ *  per second of wall, null for as fast as it goes) that simd has lately
+ *  `observed`. */
+export interface Clock {
+  mode: 'real' | 'virtual'
+  rate: number | null
+  observed: number | null
+  t: number
+}
+
 const FLASH_MS = 400
 const MAX_PULSES = 400       // a busy network, bounded
 
@@ -73,6 +83,7 @@ export const useSim = defineStore('sim', {
     levels: {} as Record<string, Record<string, number>>,
     /** The port the browser reached simd on, for the station links. */
     port: '9011',
+    clock: { mode: 'real', rate: 1, observed: null, t: 0 } as Clock,
     errors: [] as string[],
     socket: null as WebSocket | null,
   }),
@@ -83,6 +94,13 @@ export const useSim = defineStore('sim', {
     dirty: (s): boolean => s.scenario?.dirty ?? false,
     running: (s): number =>
       Object.values(s.nodes).filter(n => n.status === 'up').length,
+    /** Seconds of the run's time per second of the browser's: 1 in real
+     *  time, the pace of a paced run, or what an unpaced one lately did. */
+    speed: (s): number => {
+      if (s.clock.mode !== 'virtual') return 1
+      const r = s.clock.rate ?? s.clock.observed
+      return r && r > 0 ? r : 1
+    },
   },
 
   actions: {
@@ -109,6 +127,7 @@ export const useSim = defineStore('sim', {
           this.scenarios = (msg.scenarios as string[]) ?? []
           this.snapshots = (msg.snapshots as string[]) ?? []
           this.port = String(msg.port ?? '9011')
+          if (msg.clock) this.clock = msg.clock as Clock
           this.nodes = {}
           for (const node of (msg.nodes as Node[]) ?? []) this.nodes[node.name] = node
           this.pulses = []
@@ -144,13 +163,19 @@ export const useSim = defineStore('sim', {
           })
           break
         }
+        case 'clock':
+          this.clock = msg as unknown as Clock
+          break
         case 'tx': {
+          // The frame's time on the air, in the browser's milliseconds: a
+          // virtual-time run that goes ten times the wall draws it a tenth
+          // as long, so a ring still lasts exactly the frame's span.
           const span = (msg.t_end as number) - (msg.t_start as number)
           this.pulses.push({
             eid: msg.eid as number,
             name: msg.name as string,
             start: performance.now(),
-            duration: Math.max(60, span / 1000),
+            duration: Math.max(60, span / 1000 / this.speed),
           })
           if (this.pulses.length > MAX_PULSES) this.pulses.splice(0, this.pulses.length - MAX_PULSES)
           break

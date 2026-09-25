@@ -8,7 +8,7 @@ It is the medium and nothing else. It holds no firmware, speaks no Reticulum,
 and knows a frame only as a carrier, a duration and a payload it never opens.
 
 ```sh
-python3 ether.py --bind 127.0.0.1:7000 --record record.tsv --scenario <dir>
+python3 ether.py --bind 127.0.0.1:7000 --record record.tsv --scenario <dir> [--time real|max|<k>x]
 ```
 
 Stations reach it through the testbed, which holds it in its own event loop and
@@ -106,6 +106,33 @@ earshot of one station right now, and at what level.
 
 ## The wire
 
+A real-time run:
+
+```
+station → ether   hello {sid, slots}
+ether → station   welcome {t, mode: "real", rate: 1, epoch, seed}
+station → ether   state {slot, mode, freq, bw, sf, sync}          on every mode or carrier change
+station → ether   tx {slot, id, t0, t_pre, t_hdr, t_end, …, payload}
+ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level}   each receiver in earshot
+ether → station   rx_end {slot, id, verdict, payload, rssi, snr}         at the frame's end
+```
+
+A virtual-time run is the same conversation with the ether as conductor: it
+owns conductor time T and moves it only when every station has said it is
+idle.
+
+```
+station → ether   hello {sid, slots}
+ether → station   welcome {t, mode: "virtual", rate, epoch, seed, seq: 1}
+station → ether   idle {seq: 1, until: 25000}            nothing to do before T 25 000
+ether → station   run {t: 25000, seq: 2}                 every station idle; T moves to 25 000
+station → ether   state {…}  tx {t0: 25000, …}           what it did at 25 000
+station → ether   idle {seq: 2, until: 30000}
+ether → station   rx_begin {t: 25000, seq: 7, …}         to each receiver, at the same T
+receiver → ether  idle {seq: 7, until: …}
+ether → station   rx_end {t: 266000, seq: 9, …}          when T reaches the frame's end
+```
+
 JSON, one message per datagram, payloads base64, times in microseconds.
 Positions are not on it in either direction: a station never learns where it is.
 
@@ -116,30 +143,68 @@ Positions are not on it in either direction: a station never learns where it is.
 | `hello` | this station exists, and which radio slots it has |
 | `state` | a slot's mode and carrier — the ether matches on these |
 | `tx` | a transmission: its carrier, its power, its three instants, and its payload |
+| `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
 
 **Ether → station**
 
 | Message | Says |
 |---|---|
-| `welcome` | joined; the ether's clock origin, its seed, and that it runs in real time |
+| `welcome` | joined: `t`, the ether's clock now; `mode`, `real` or `virtual`; `rate`, how many times the wall clock a virtual run is paced at (`null`: as fast as it goes); `epoch`, the wall-clock microseconds T 0 stands for; and `seed` |
 | `rx_begin` | a frame is arriving: when its preamble, header and end fall, and how strongly; `"cad": true` when the station is in CAD and no end will follow |
 | `rx_end` | that frame is over: the verdict, the payload, RSSI and SNR |
+| `run` | virtual time: T has reached the instant this station asked for |
 
-A station's `t` fields are its own clock and mean something only against each
-other within one message. Unknown message types are ignored, on both sides.
+A station's `t0`, `t_pre`, `t_hdr` and `t_end` are its own clock in real time
+and mean something only against each other within one message; in virtual
+time they are T. Unknown message types are ignored, on both sides.
 
 The `id` in a `tx` is the transmitter's own count of its frames; the `id` in an
 `rx_begin` and `rx_end` is the **ether's**, and no two frames share it. A
 receiver has to be able to tell two frames apart while both are in the air, and
 the number the transmitter gave each of them cannot do that.
 
+### Virtual time
+
+`--time max` runs T as fast as the stations allow, `--time <k>x` paces it at
+k times the wall clock (falling behind rather than racing to catch up), and
+`--time real`, the default, is the event loop's clock and no conductor.
+
+In virtual time every message the ether sends is an instant: it carries `t`,
+the T it happens at, and `seq`, the station's own count of messages from the
+ether. The station applies it at that T and answers with an `idle` for that
+`seq`; an idle for an older one is stale and ignored. Anything else a station
+sends — a `state`, a `tx`, a second `hello` — means it is not idle.
+
+- **T moves only when every station is idle**, and every station the testbed
+  has started and not yet heard from counts as busy. It moves to the earliest
+  of every station's `until` and the ether's own timers (a frame's end), and
+  every station whose `until` is reached is sent a `run`.
+- **What stations say while T stands is held** and taken when every station
+  is idle again, in station-id order, so two stations acting at one instant
+  are ruled on the same way every run.
+- **A `tx` stamped before T** came from a station that acted on something from
+  outside the run after its last idle. It goes on the air at T, and the ether
+  logs it.
+- **A station that asks for the T it already has**, 64 times running, is
+  working in no time at all; it is given 10 ms of T instead, one FreeRTOS tick.
+- **A station that restarts** says `hello` again, and everything it had
+  scheduled or said goes with its old process.
+
+A station that stays busy cannot stop T for good: its own side reports idle
+after 20 ms of wall time with nothing to show for it (the busy watchdog in
+[`../radio/src/conductor.cpp`](../radio/src/conductor.cpp)).
+
 ## The record
 
-Every datagram in and out is one tab-separated line of `record.tsv`:
+Every datagram in and out, except `idle` and `run`, is one tab-separated line
+of `record.tsv`:
 
 ```
-<wall-clock stamp>  <in|out>  <station id>  <json>
+<stamp>  <in|out>  <station id>  <json>
 ```
+
+The stamp is the wall clock (ISO 8601, UTC) in a real-time run and T in
+seconds in a virtual one.
 
 It is the account of what actually happened on the air, against which a
 station's own view can be checked — which frames went out, who was told about

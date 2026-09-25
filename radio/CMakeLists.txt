@@ -5,10 +5,10 @@
 #
 # The ESP-IDF backend is not built here: it is an IDF component
 # (backend/esp-idf/CMakeLists.txt) and builds inside a firmware's own project.
-# Keep the source list flat and free of generated files: a Rust station
-# compiles exactly these four with the `cc` crate.
+# Keep the sources flat under src/ and free of generated files: a Rust station
+# compiles every src/*.cpp and the posix backend with the `cc` crate.
 cmake_minimum_required(VERSION 3.16)
-project(simradio LANGUAGES CXX)
+project(simradio LANGUAGES C CXX)
 
 set(SIMRADIO_BACKEND "posix" CACHE STRING "posix|esp-idf")
 set_property(CACHE SIMRADIO_BACKEND PROPERTY STRINGS posix esp-idf)
@@ -26,6 +26,7 @@ find_package(Threads REQUIRED)
 set(SIMRADIO_SOURCES
     src/model.cpp
     src/ether_link.cpp
+    src/conductor.cpp
     src/json.cpp
     backend/posix/services.cpp
 )
@@ -41,3 +42,11 @@ target_link_libraries(simradio PUBLIC Threads::Threads)
 add_library(simradio_shared SHARED $<TARGET_OBJECTS:simradio_objects>)
 set_target_properties(simradio_shared PROPERTIES OUTPUT_NAME simradio)
 target_link_libraries(simradio_shared PUBLIC Threads::Threads)
+
+# The time shim a station of any kind is started with in a virtual-time run
+# (LD_PRELOAD=build/libsimclock.so): the C library's clocks, sleeps and
+# timeouts in node time, from the chip library in the same process.
+add_library(simclock SHARED shim/simclock.c)
+target_include_directories(simclock PRIVATE include)
+target_compile_options(simclock PRIVATE -Wall -Wextra)
+target_link_libraries(simclock PRIVATE Threads::Threads ${CMAKE_DL_LIBS})

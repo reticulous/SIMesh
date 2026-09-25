@@ -14,10 +14,11 @@ One command starts this, and this is the whole testbed. It holds
 
 The page gets one `snapshot` on connect and deltas after it; everything a
 person does to the network is one message the other way. See README.md for
-the protocol and INTERNALS.md for why it is shaped this way.
+the messages a script uses and INTERNALS.md for why it is shaped this way.
 
-Nothing here blocks. Every wait is an awaitable, the stations' CLI is spoken
-over asyncio streams with a timeout, and a pty is a reader on the loop.
+Nothing here blocks. Every wait is an awaitable, the stations' ptys are read
+on a thread of their own (stations.Ptys) that hands this loop what it acts
+on, and a framed-RPC query is a future that a reply handed over completes.
 """
 
 import argparse
@@ -51,6 +52,7 @@ TRANSPORT_POLL_S = 6.0      # how often a station is asked whether it forwards
 SETUP_TIMEOUT_S = 90.0      # how long a fresh station has to say it is up
 SHUTDOWN_TIMEOUT_S = 5.0    # how long a connection may hold up a stop
 SETTLE_S = 15.0             # how long a first boot gets to finish landing what setup asked for
+CLOCK_REPORT_S = 1.0        # how often the page hears how fast T is going
 WEBRTC_PORT = 4433          # the station's own DataChannel port (s.net.webrtc_port)
 SIGNAL_PATH = "/webrtc"     # the one station route simd keeps for itself
 
@@ -81,6 +83,8 @@ class Simd:
         self.runner = None
         self.relay = None                   # the WebRTC UDP relay
         self.starter = None                 # the staggered start, while it runs
+        self.observed_rate = None           # seconds of T per second of wall, lately
+        self.clock_watch = None
 
     # ---- lookups ---------------------------------------------------------
 
@@ -139,11 +143,57 @@ class Simd:
         os.makedirs(scenario_module.RUN_DIR, exist_ok=True)
         bind = ether_module.parse_bind(self.ether_addr)
         self.ether_transport, self.ether = await loop.create_datagram_endpoint(
-            lambda: ether_module.Ether(record), local_addr=bind)
+            lambda: ether_module.Ether(record, time_mode=self.args.time), local_addr=bind)
         self.ether.on_tx = self.ether_tx
         self.ether.on_rx = self.ether_rx
         self.ether.on_station = self.ether_station
         log("ether on %s, recording to %s" % (self.ether_addr, record))
+        log("time: %s" % ether_module.describe_time(self.ether.mode, self.ether.rate))
+        if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
+            log("error: no time shim at %s: a virtual-time run needs it "
+                "(see SIMesh/README.md)" % kinds_module.SHIM)
+
+    @property
+    def virtual(self):
+        return self.ether is not None and self.ether.clock.virtual
+
+    async def sleep(self, seconds):
+        """Wait on the run's clock: conductor time in a virtual run."""
+        await self.ether.sleep(seconds)
+
+    def clock_message(self):
+        """What the page is told about time: the mode, T, and how fast it goes."""
+        if self.ether is None:
+            return None
+        return {"type": "clock", "mode": self.ether.mode, "rate": self.ether.rate,
+                "t": self.ether.now(), "observed": self.observed_rate,
+                "barriers": self.ether.barriers,
+                "slow_idles": sum(st.slow_idles for st in self.ether.stations.values())}
+
+    async def watch_clock(self):
+        """Tell the page how fast T is going, once a second of wall."""
+        loop = asyncio.get_running_loop()
+        last_wall, last_t = loop.time(), self.ether.now()
+        slow_seen = {}
+        while not self.stopping:
+            await asyncio.sleep(CLOCK_REPORT_S)
+            wall, t = loop.time(), self.ether.now()
+            if wall > last_wall:
+                self.observed_rate = (t - last_t) / 1_000_000.0 / (wall - last_wall)
+            if self.virtual and t == last_t and self.ether.busy():
+                log("T stands at %.3f s, waiting on station(s) %s" % (
+                    t / 1e6, ", ".join(str(s) for s in self.ether.waiting_on())))
+            if self.virtual:
+                slow = {sid: st.slow_idles - slow_seen.get(sid, 0)
+                        for sid, st in self.ether.stations.items()}
+                slow = {sid: n for sid, n in slow.items() if n > 0}
+                if slow and self.observed_rate is not None and self.observed_rate < 2:
+                    log("T at %.3f s held by busy station(s): %s" % (t / 1e6, ", ".join(
+                        "%s %d" % (self.name_of(sid) or sid, n)
+                        for sid, n in sorted(slow.items(), key=lambda x: -x[1])[:5])))
+                slow_seen = {sid: st.slow_idles for sid, st in self.ether.stations.items()}
+            last_wall, last_t = wall, t
+            self.broadcast(self.clock_message())
 
     def apply_to_ether(self):
         """Put the loaded scenario's geometry into the medium, wholesale.
@@ -191,10 +241,20 @@ class Simd:
 
     def make_station(self, name):
         node = self.scenario.node(name)
-        return stations_module.Station(
+        station = stations_module.Station(
             name, node["id"], self.scenario.node_dir(name),
             self.kinds[node["kind"]], self.ether_addr,
-            on_status=self.station_status, on_output=self.station_output)
+            on_status=self.station_status, on_output=self.station_output,
+            clock=self.ether if self.virtual else None)
+        station.watchers = len(self.consoles.get(name, ()))
+        return station
+
+    def watched(self, name):
+        """The console windows open on a station, as the pty thread sees it:
+        it hands console bytes over only while there is one."""
+        station = self.stations.get(name)
+        if station is not None:
+            station.watchers = len(self.consoles.get(name, ()))
 
     def station_status(self, station, status):
         self.broadcast(self.node_message(station.name))
@@ -230,6 +290,7 @@ class Simd:
             except kinds_module.CommandError as err:
                 self.error("setting up %s: %s" % (station.name, err))
         station.set_status(stations_module.UP)
+        log("station %s is up at t %.3f s" % (station.name, self.ether.now() / 1e6))
         await self.read_transport(station)
         if not station.was_configured:
             # Not everything the setup lines ask for lands at once: an LXMF
@@ -237,7 +298,7 @@ class Simd:
             # created it has returned. One more flush once that has settled, so
             # a station reset moments after its first boot keeps what it was
             # given rather than coming back half-configured.
-            await asyncio.sleep(SETTLE_S)
+            await self.sleep(SETTLE_S)
             await self.flush_station(station)
 
     async def send_setup(self, station):
@@ -330,7 +391,7 @@ class Simd:
         gap = self.args.stagger / len(pending)
         for index, name in enumerate(pending):
             if index:
-                await asyncio.sleep(gap)
+                await self.sleep(gap)
             # A minute is long enough for the scenario to have moved on.
             if self.stopping or self.scenario is None:
                 return
@@ -423,7 +484,8 @@ class Simd:
                 "snapshots": scenario_module.snapshots(),
                 "nodes": [self.node_message(name)
                           for name in (self.scenario.nodes if self.scenario else ())],
-                "port": self.args.public_port}
+                "port": self.args.public_port,
+                "clock": self.clock_message()}
 
     def broadcast(self, message):
         text = json.dumps(message)
@@ -554,7 +616,7 @@ class Simd:
         gap = self.args.stagger / len(stations)
         for index, station in enumerate(stations):
             if index:
-                await asyncio.sleep(gap)
+                await self.sleep(gap)
             if self.stopping:
                 return
             await station.restart()
@@ -573,9 +635,21 @@ class Simd:
         line = (msg.get("line") or "").strip()
         if not line:
             return
-        kind = msg.get("kind") or sc.default_kind
+        # `after`: seconds on the run's clock before the line goes out, so a
+        # script can put a command at an instant of a virtual-time run. The
+        # wait is a task of its own: the page's next message is not held
+        # behind it.
+        after = max(0.0, float(msg.get("after") or 0))
+        if after:
+            async def later():
+                await self.sleep(after)
+                await self.handle(dict(msg, after=0))
+            asyncio.ensure_future(later())
+            return
+        only = msg.get("name")
+        kind = msg.get("kind") or (sc.node(only).get("kind") if only else sc.default_kind)
         targets = [(name, s) for name, s in self.stations.items()
-                   if s.kind.name == kind
+                   if s.kind.name == kind and (only is None or name == only)
                    and s.status in (stations_module.UP, stations_module.SETUP)]
         # Spread over this many seconds. A command that puts something on the
         # air — `lora 0 a` above all — fired at two dozen stations in the same
@@ -587,7 +661,7 @@ class Simd:
 
         async def run(index, name, station):
             if gap:
-                await asyncio.sleep(index * gap)
+                await self.sleep(index * gap)
             try:
                 text = await station.kind.run(
                     station, scenario_module.expand(line, name, sc.node(name)))
@@ -597,7 +671,8 @@ class Simd:
 
         results = dict(await asyncio.gather(
             *(run(i, n, s) for i, (n, s) in enumerate(targets))))
-        self.broadcast({"type": "command_result", "line": line, "results": results})
+        self.broadcast({"type": "command_result", "line": line, "name": only,
+                        "results": results, "t": self.ether.now()})
         log("ran %r on %d %s station(s)%s" % (line, len(results), kind,
             " over %.0fs" % spread if spread else ""))
 
@@ -668,7 +743,7 @@ class Simd:
     async def do_scenario_load(self, msg):
         """A scenario is a design, so loading one is a factory-fresh network."""
         await self.adopt(scenario_module.load_scenario(msg["name"]))
-        log("loaded scenario %s" % msg["name"])
+        log("loaded scenario %s at t %.3f s" % (msg["name"], self.ether.now() / 1e6))
 
     async def do_scenario_save(self, msg):
         self.need_scenario().save()
@@ -722,6 +797,7 @@ class Simd:
         socket = web.WebSocketResponse(heartbeat=30)
         await socket.prepare(request)
         self.consoles.setdefault(name, set()).add(socket)
+        self.watched(name)
         try:
             async for message in socket:
                 station = self.stations.get(name)
@@ -739,6 +815,7 @@ class Simd:
                                        int(control.get("rows", 24)))
         finally:
             self.consoles.get(name, set()).discard(socket)
+            self.watched(name)
         return socket
 
     async def ws_signalling(self, request):
@@ -916,6 +993,7 @@ class Simd:
         await self.start_ether()
         await self.start_http()
         self.poller = asyncio.ensure_future(self.poll_transport())
+        self.clock_watch = asyncio.ensure_future(self.watch_clock())
         try:
             await done
         finally:
@@ -935,6 +1013,8 @@ class Simd:
         log("stopping")
         if self.poller is not None:
             self.poller.cancel()
+        if self.clock_watch is not None:
+            self.clock_watch.cancel()
         await self.stop_all()
         if self.runner is not None:
             with contextlib.suppress(asyncio.TimeoutError):
@@ -971,6 +1051,15 @@ def parse_args(argv):
     ap.add_argument("--relay-host", default="127.0.0.1",
                     help="the address a browser sends the DataChannel to "
                          "(default 127.0.0.1)")
+    ap.add_argument("--time", default="real",
+                    help="real (default): the stations and the medium run on the "
+                         "wall clock; max: virtual time, as fast as the stations "
+                         "allow; <k>x: virtual time paced at k times the wall")
+    ap.add_argument("--run", default=scenario_module.RUN_DIR,
+                    help="the run directory: the live map, the stations' state "
+                         "and logs, and the record (default %s); a second "
+                         "testbed on the same host needs its own"
+                         % os.path.relpath(scenario_module.RUN_DIR))
     ap.add_argument("--net", default=stations_module.NET,
                     help="the network the stations' addresses come from, one "
                          "/24 at a time with hosts 5 to 254 (default %s: 1000 "
@@ -979,8 +1068,10 @@ def parse_args(argv):
     args = ap.parse_args(argv)
     try:
         stations_module.set_net(args.net)
+        ether_module.parse_time_mode(args.time)
     except ValueError as err:
         ap.error(str(err))
+    scenario_module.RUN_DIR = os.path.abspath(args.run)
     args.elf = os.path.abspath(args.elf)
     args.fixed = os.path.abspath(args.fixed)
     scenario_module.DEFAULT_KINDS.clear()

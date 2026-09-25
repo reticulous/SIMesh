@@ -22,7 +22,7 @@ Reticulum / LXMF / web UI                   Node, LoRaIface
         │  RadioLibHal                              │  embedded-hal
    VirtualHal ── GPIO shim                     simesh-hal
         │                                           │
-        └──────────── the chip model (radio/, or its copy in iface-lora)
+        └──────────── the chip model (radio/), linked by each
                             │  UDP, JSON
                         the ether                   who hears what, and when
 ```
@@ -42,7 +42,8 @@ errata.
 ## One process
 
 `simd.py` is the ether, the stations, the proxy and the control server in one
-asyncio loop. It could have been four processes talking over sockets. One is
+asyncio loop, and the stations' ptys on a second loop in a thread of their
+own (below). It could have been four processes talking over sockets. One is
 better for one reason that matters:
 
 > **Positions reach the medium by method call.**
@@ -60,12 +61,32 @@ process that stopped.
 
 ## Nothing blocks
 
-Every wait is an awaitable. A station's pty is a reader on the loop, its CLI
-is spoken over asyncio streams with a timeout, and the websocket handlers are
-coroutines. The one rule that follows: **a subscriber must not be able to stop
-the medium.** The ether calls its `on_tx`/`on_rx`/`on_station` subscribers
-inline and swallows what they raise, because a page that has gone away is not
-the air's problem.
+Every wait is an awaitable. A framed-RPC query is a future the drain
+completes, with a timeout, and the websocket handlers are coroutines. The one
+rule that follows: **a subscriber must not be able to stop the medium.** The
+ether calls its `on_tx`/`on_rx`/`on_station` subscribers inline and swallows
+what they raise, because a page that has gone away is not the air's problem.
+
+## The ptys have a thread of their own
+
+In virtual time the main loop runs every barrier, and a barrier waits for the
+slowest thing on that loop. So what the stations print is not read there:
+every station's pty is a reader on a second event loop, in a thread of
+simd's own (`stations.Ptys`, started with the first station), which reads
+it, takes the framed-RPC replies out
+(`rpc.FrameDemux`), appends the rest to the station's log and watches for the
+capability marker. The main loop is handed only what it acts on, with
+`call_soon_threadsafe` and in the order it was read: a reply for the station's
+RPC client, the marker, the console bytes while somebody has the station's
+console window open, and the end of the stream. The log file is the pty
+thread's alone from a station's first start, so a restart's banner and the
+last bytes of the process before it land in the order they happened; when a
+start ends, the thread reads what is left on the pty before it closes it.
+
+Both loops keep the rule above. The pty thread blocks in nothing but its
+loop's own wait, and the main loop writes to a pty the way it always did,
+non-blocking, with what the pty will not take held for its writer, so a frame
+is never cut.
 
 ## One port, and `Host` decides
 
@@ -106,6 +127,10 @@ first, and the difference would be invisible in the file.
 
 Half of a network is its identities, keys, paths and message history, which is
 why snapshots exist at all and why they are a directory rather than a file.
+A snapshot is the stores, so what it brings back is what each firmware
+reloads from its store at boot: a `reticulous` station's paths only when
+`s.rnsd.dir.persist_routes` is on, and only as of its last directory write
+([README.md](README.md#a-scenario-and-a-snapshot)).
 
 ## The run is a copy, and a snapshot is taken live
 
@@ -245,8 +270,8 @@ the second one to start finds the port taken.
 
 `stopped` → `starting` → `setup` → `up`, with `restarting` for the gap after an
 exit nobody asked for. `up` is **the station answering the door its kind
-talks through** — a `reticulous` station's TCP CLI, a `berlinmesh` station's
-`rncfg detect` — not the process existing: a firmware process that has forked
+talks through** — a `reticulous` station's framed RPC, a `berlinmesh`
+station's `rncfg detect` — not the process existing: a firmware process that has forked
 but not finished booting is not a station you can do anything with, and the
 map should not claim otherwise.
 
@@ -282,7 +307,36 @@ and they never run.
 **One conversation at a time on a station's door.** `rncfg` opens the
 station's KISS pty per command; two at once interleave their frames and both
 read garbage, so the `berlinmesh` kind holds a lock per station around every
-invocation, the transport poll included.
+invocation, the transport poll included. A `reticulous` station runs its
+framed-RPC frames one after another and answers each with the id it was sent;
+two queries in flight whose ids collided would each take the other's answer,
+so its client holds a lock per station around every frame.
+
+## Framed RPC, and why the testbed does not use the TCP CLI
+
+A `reticulous` station is set up and asked things over framed RPC on its
+console pty, the channel flashmon uses on a board's USB console. The TCP CLI
+would work, but on a board it is closed until someone opens it, and a testbed
+that needed it open would need the firmware to behave differently here; the
+console is there from the first instant on both.
+
+The pty drain is a state machine rather than a search, because a read can
+end anywhere: in the middle of the magic, of a header or of a payload. Bytes
+that might be the start of a frame are held until the next read settles them;
+a false start gives them back to the text, first byte first, and reads the
+rest again, because a magic can start inside a false one. A frame that is not
+one — an id outside the range a query uses, a magic inside a payload, or a
+remainder that has not arrived within a second — is given back the same way.
+The device writes a whole reply under the console's write lock, so none of
+that happens in a healthy run; it is there so that a line of noise costs one
+answer and not the stream.
+
+The device bounds a command at five seconds and cuts a reply that outgrows its
+buffer at the last complete line, without saying so. A reply is therefore not
+proof that a command finished: a line that came back at the bound may still
+be running, and the next frame would find the command line busy. So a slow
+line is followed by a question that confirms it landed, and a caller asks for
+one key at a time rather than a subtree whose tail could be cut.
 
 **Ids are unique across kinds.** The ether keys stations by id; two processes
 answering under one id are one station to the medium, and two sockets on one
@@ -309,7 +363,10 @@ on the last, so a drag is one edit rather than fifty.
 
 Frames arrive as `tx` and `rx` and are drawn on the **browser's** clock: the
 ether's microseconds are its own, and the only thing in a `tx` that means
-anything here is how long the frame occupies the air.
+anything here is how long the frame occupies the air. In a virtual-time run
+that span is divided by the run's pace — the pace asked for, or for `max` the
+pace the last `clock` message observed — so a ring lasts the frame's time on
+the air as the run experiences it.
 
 ## What a reticulous station has instead of hardware
 
@@ -320,7 +377,7 @@ anything here is how long the frame occupies the air.
 | `/state` | LittleFS on a partition | a directory the process `chdir()`ed into |
 | NVS | a flash partition | a file under `/tmp`, sized from the built partition table |
 | addresses | WiFi | one loopback address per station |
-| console | a serial port | a pty, bridged to the map's terminal window, plus a TCP CLI |
+| console | a serial port | a pty, bridged to the map's terminal window, carrying framed RPC as a board's USB console does |
 | radio | an SX1262 | a model, and the ether |
 
 The pty matters: a station's stdin and stdout **are** its serial console, so
@@ -429,29 +486,139 @@ and drops the host's callback, and opening the slot again powers it up fresh.
 
 ## Time
 
-Real time, throughout. `esp_timer` is `CLOCK_MONOTONIC` in microseconds from
-the first reading, and every timed event in the model — the instant a
-preamble ends, a header lands, a frame finishes — is an `esp_timer` one-shot.
-The FreeRTOS tick is 100 Hz, so nothing is accurate below ten milliseconds;
-the frames the driver sends take tens to hundreds of milliseconds, which is
-why that is survivable.
+A run keeps **real time** or **virtual time** (`simd --time real|max|<k>x`),
+for every station alike.
 
-A station's `t` fields are its own clock. They are meaningful only against
-each other inside one message, and the ether rebases every frame onto its own
-clock before scheduling. The offsets within a frame are the transmitter's and
-travel unchanged, because the offsets are what a receiver actually needs.
+In real time `esp_timer` is `CLOCK_MONOTONIC` in microseconds from the first
+reading, and every timed event in the model — the instant a preamble ends, a
+header lands, a frame finishes — is a one-shot on the backend's timer. The
+FreeRTOS tick is 100 Hz while a task runs and stops while every task is
+blocked, so nothing is accurate below ten milliseconds; the
+frames the driver sends take tens to hundreds of milliseconds, which is why
+that is survivable. A station's `t` fields are its own clock, meaningful only
+against each other inside one message, and the ether rebases every frame onto
+its own clock before scheduling.
+
+In virtual time the ether is the **conductor**: it owns conductor time T and
+moves it only when every station has said it is idle
+([`ether/INTERNALS.md`](ether/INTERNALS.md#the-barrier)). A run is then
+limited by the work the stations do, not by the air: a quiet stretch of an
+hour costs what the stations' timers cost to run, and a busy host slows the
+run down instead of changing what happens in it. `max` goes as fast as that
+allows; `<k>x` paces T at k times the wall clock, so a person can watch.
+
+```
+ether        welcome {t, mode: virtual, …}   the station's clock starts at T
+station      runs until every thread is blocked, then  idle {seq, until}
+ether        every station idle: T → min(until, the air's next instant)
+ether        run {t} / rx_begin {t} / rx_end {t}      to each station due
+station      conductor moves T, runs its timers and wakes due at T, owes an idle
+```
+
+**The station's side is `radio/src/conductor.cpp`**, in the chip library, so
+every kind has it by linking `radio/`. It keeps the last T granted, runs the
+model's timers and the host's **wakes** when a grant reaches them, works out
+the next instant the station needs (`until`) and sends the idle. The model
+reads T; the host reads **node time**, f(T), which is where a node's own
+crystal — drift, an offset — goes. f is the identity unless the station's
+environment has `SIMESH_CLOCK_PROFILE`, a piecewise-linear map given as
+`T:node` pairs in microseconds, both increasing, slope 1 outside them
+([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
+only place it is defined.
+
+**The C library's time is answered by a preloaded shim**,
+`radio/build/libsimclock.so` (built from `radio/shim/simclock.c`), which every
+station of a virtual run is started with (`LD_PRELOAD`, `SIMESH_TIME=virtual`,
+`SIMESH_EPOCH_US`). The chip
+library finds it by name when the station opens its link and hands it the
+clock (`include/simclock.h`); from then on `clock_gettime`, `gettimeofday`
+and `time` read node time (plus the run's epoch for the wall clocks), and
+every sleep, `setitimer`, `poll`/`select`/`epoll_wait` timeout and
+`pthread_cond_timedwait` ends when node time reaches it. A waiting thread
+blocks on an eventfd of its own, which a wake writes, so a signal still ends
+its wait exactly as it ends a real one. Two rules keep it honest:
+
+- **Every wait's end is rounded up to a whole millisecond of node time.** A
+  driver that spins on microsecond `nanosleep`s makes each one a barrier;
+  rounded, they share one, and the ends of many threads' waits on many
+  stations fall on the same instants.
+- **Every C library function the shim wraps is resolved in its constructor**,
+  before `main()`. A thread switched out by a signal inside a lazy `dlsym`
+  holds the dynamic linker's lock, and the next thread to resolve a symbol
+  waits on it for good.
+
+**Idle is the station saying every thread is blocked**, and each kind has a
+way to know it:
+
+- a `reticulous` station on `hw-linux`: FreeRTOS's tickless idle
+  ([`hw-linux`](../hw-linux/README.md#the-tick)), which runs only when every
+  task is blocked and knows the tick the first of them is due at. The
+  board's clock hooks ([`hw-linux`](../hw-linux/README.md#the-stations-clock))
+  are implemented by `radio/backend/esp-idf/services.cpp`: `esp_timer` counts
+  node time from the whole second of it in which the station joined, its next
+  expiry and the next tick a task waits for are wakes, so `until` is the
+  earlier of the two, and the link opens at board bring-up, since nothing in
+  the station can wait on time before the ether has said what T is. The tick
+  is not a timer: the board steps the tick count to node time every time T
+  moves (`simradio_on_advance`), before anything due at the new T runs, and
+  the port's `setitimer` is stopped. A station whose tasks sleep for a second
+  wakes the run once in that second, not a hundred times; and because every
+  station's clock is a whole number of seconds from every other's, the ticks
+  of all of them fall on the same instants of T and share their barriers.
+- a `berlinmesh` station, whose threads are plain pthreads: the shim's thread
+  census (`SIMESH_IDLE=threads`). A thread counts as blocked while it is in
+  one of the shim's waits, an untimed `pthread_cond_wait`, or a read on a
+  blocking descriptor; when the last one blocks, the station is idle.
+
+Neither can be told apart from a thread that is simply slow, so the
+conductor also has a **busy watchdog**: a station that has not said idle
+20 ms of wall time after it was last told anything, or last sent the ether
+anything, says so anyway, with the
+`until` it has — for a `reticulous` station, whose `until` is the next tick
+while a task runs, a tick at a time. That is what keeps a thread spinning on the wall clock, or a
+host descriptor nobody is watching, from stopping T. It also fires on honest
+work that takes longer than 20 ms of wall — key generation at first boot,
+a signature check under load — and then T moves on while the station is
+still computing, so that work lands later in T by the ticks it spanned. How
+often that happens depends on the host's speed and load; the `clock` message
+counts it as `slow_idles`, and simd logs the stations concerned when the
+run's pace drops below 2x.
+
+**What comes from outside the run arrives between barriers.** A command
+typed at a console, a framed-RPC query, a TCP connection: the ether knows
+nothing of it, so T may move while a station deals with one, and a `tx` it
+causes is stamped with the T the station last had and goes on the air at the
+T the ether has. The testbed's own waits between commands (`Kind.pause`,
+`simd`'s `sleep` and `after`) are on T, so a setup script and a driven run
+land at the same instants in T whatever the pace.
 
 ## The rules a host-only file obeys on ESP-IDF's host target
 
-Five, for the reticulous firmware and for `radio/backend/esp-idf`, and they
+Six, for the reticulous firmware and for `radio/backend/esp-idf`, and they
 are not negotiable — each one is a way this port breaks.
 
 **No FreeRTOS task blocks in a host system call.** The port only knows a task
 is blocked when it blocked on a FreeRTOS primitive; a task sitting in `recv`
 is, to the scheduler, the running task, and it starves everything below it.
-So sockets and stdin are non-blocking, and the only waits are `select()` —
-which IDF interposes when lwIP is off, polling and then sleeping on a delay —
-FreeRTOS primitives, and `vTaskDelay`. No busy-waiting.
+So sockets and stdin are non-blocking, and the only waits are `select()`,
+FreeRTOS primitives and `vTaskDelay`. `select()` is hw-linux's: it blocks the
+task until a descriptor is ready, woken by a signal that lands on the running
+task's thread the way the tick does ([`hw-linux`](../hw-linux/README.md#waiting-on-a-descriptor)),
+so a quiet station's tasks sleep rather than poll. No busy-waiting.
+
+**Nothing wakes at tick rate while nothing happens.** The kernel is tickless
+([`hw-linux`](../hw-linux/README.md#the-tick)): while every task is blocked
+the tick stops, and a station costs nothing until the first of them is due.
+A task that loops on a one-tick delay or a one-tick timeout keeps the tick
+running, and in a virtual-time run wakes the whole run every 10 ms of T. A
+task waits on what it serves — its notification, `hwLinuxWait()` on its
+descriptors and its inbox — for as long as nothing comes, and a timeout is
+the time something is actually due, rounded **up** to a whole tick: rounded
+down, a deadline inside the current tick is a wait of zero, and the task
+spins until it comes — on a chip for up to a tick, and in a virtual-time run
+until the busy watchdog lets T move, 20 ms of wall each time. Where the shared source polls on a chip,
+the host's behaviour goes behind the board's weak `hwLinuxWait` or into
+`src/host/`, and the chip's path stays as it is.
 
 **The console writes with `write(2)`.** The tick signal can land inside a libc
 call that is not async-signal-safe and switch to a task that makes the same
@@ -474,8 +641,8 @@ belong to the board straddle — which arrives with `--with` and is in nobody's
 `requires:`. A platform or feature straddle may not depend on one. So a file
 that needs `hwLinuxNodeId()`, `hwLinuxBindAddr()` or `hwLinuxEtherAddr()`
 declares it `extern "C" __attribute__((weak))` with a sane default and lets it
-resolve at executable link time. The same rule is why the chip model lives
-with the interface that drives it rather than with the board that wires it.
+resolve at executable link time. The same rule is why the chip model is
+linked by the interface that drives it rather than by the board that wires it.
 
 ## What this cannot tell you
 

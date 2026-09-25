@@ -1,6 +1,6 @@
 # SIMesh
 
-A real-time LoRa testbed. Stations are real firmware, built as Linux
+A LoRa testbed, run in real time or in virtual time. Stations are real firmware, built as Linux
 processes, each on its own loopback address; below their radio driver sits a
 model of an SX1262 on a virtual SPI bus, and between the models sits one
 medium, the ether, that decides who hears what. A map in the browser places
@@ -32,8 +32,8 @@ Two exist:
 
 | Kind | The firmware | Up when | Setup lines are | Web UI |
 |---|---|---|---|---|
-| `reticulous` | Reticulous (spangap/reticulous), built for `hw-linux` | its TCP CLI on `:8081` answers | its CLI, typed over `:8081`, then `save` | port 80 |
-| `berlinmesh` | Sergeyculum, the Rust Reticulum stack at [git.emcomm.cc/berlinmesh/reticulum](https://git.emcomm.cc/berlinmesh/reticulum), as its `fw/simesh` target | its `kiss` pty answers `rncfg detect` | `rncfg` without program and port: `name set {name}` runs `rncfg name <dir>/kiss set <name>` | none |
+| `reticulous` | Reticulous (spangap/reticulous), built for `hw-linux` | it answers a framed-RPC frame on its console: after printing the marker, or to one blind probe | CLI commands, one framed-RPC frame each over its console pty, then `save` | port 80 |
+| `berlinmesh` | "Sergeyculum", the Rust Reticulum stack at [git.emcomm.cc/berlinmesh/reticulum](https://git.emcomm.cc/berlinmesh/reticulum), as its `fw/simesh` target | its `kiss` pty answers `rncfg detect` | `rncfg` without program and port: `name set {name}` runs `rncfg name <dir>/kiss set <name>` | none |
 
 Sergeyculum is a working name; the project calls itself `reticulum` and the
 kind is named after its repository.
@@ -94,14 +94,44 @@ That starts the ether, the stations, the proxy and the control page, on
 stops everything it started. It takes `--bind` (default `0.0.0.0:9011`),
 `--ether` (default `127.0.0.1:7000`), `--elf` and `--fixed` (the reticulous
 binary and its `/fixed` tree, defaulting to the build above), `--stagger`,
-and `--net`.
+`--net`, `--run` (the run directory, default `testbed/run/`) and `--time`.
 
-**Two testbeds on one host** need their own port, their own ether and their
-own station addresses, because every station binds its own address and two
-stations on one address are one port taken twice:
+**`--time`** is how the run keeps time, for the ether and every station
+alike:
+
+| | |
+|---|---|
+| `real` (default) | the wall clock; a person is in the loop at the pace of a real network |
+| `max` | virtual time as fast as the stations allow |
+| `<k>x` | virtual time paced at k times the wall clock: `10x` is ten minutes of the network per wall minute, `0.5x` half speed |
+
+In virtual time the ether owns the run's clock, T, and moves it only when
+every station has nothing left to do at the T it has, so what a network does
+in an hour takes the stations' own work to run and not an hour, and a loaded
+host slows a run down instead of changing it. A frame occupies T for its
+time on the air, a station's timers and sleeps run on T, the record and
+`seq.py` are stamped with T, and simd logs the T at which a scenario loaded
+and each station came up. How is in
+[INTERNALS.md](INTERNALS.md#time) and the wire in
+[`ether/README.md`](ether/README.md#virtual-time). The header of the page
+shows the mode, the pace (for `max`, the pace lately reached) and T, and a
+transmission's ring lasts its time on the air at the run's pace.
+
+A virtual run needs `radio/build/libsimclock.so`
+([The chip library](#the-chip-library)). What it does not change: a command
+typed at a console, asked over framed RPC or sent over a station's TCP CLI is
+outside the run, and arrives at whatever T the run has reached; a script that
+means to act at an instant of the run asks simd to wait on T first (`after` on
+the control websocket's `command` message, [below](#the-control-websocket)).
+
+**Two testbeds on one host** need their own port, their own ether, their own
+station addresses and their own run directory, because every station binds its
+own address, two stations on one address are one port taken twice, and two
+testbeds in one run directory load over each other's stations and write one
+record:
 
 ```sh
-python3 simd.py --bind 0.0.0.0:9012 --ether 127.0.0.1:7001 --net 127.0.4.0/22
+python3 simd.py --bind 0.0.0.0:9012 --ether 127.0.0.1:7001 --net 127.0.4.0/22 --run /tmp/run2
 ```
 
 takes its addresses from `127.0.4.0/22` instead of `127.0.0.0/22`. A network
@@ -159,6 +189,13 @@ testbed/snapshots/<name>/nodes/<node name>/state/
 
 Loading a scenario gives a factory-fresh network, reproducible from a file you
 can read. Loading a snapshot gives back a network that had been running.
+
+What comes back is what the firmware reloads at boot. A `reticulous` station
+keeps its identities, keys and message history, but its paths only when
+`s.rnsd.dir.persist_routes` is `1` (the default `0` drops restored routes and
+relearns them on demand), and only as of its last directory write, every
+`s.rnsd.dir.persist_s` seconds (default 900): a snapshot is a copy of the
+store, and the store does not hold the path table in between.
 
 ```yaml
 origin: [52.3740, 4.8897]           # lat, lon of the map's centre
@@ -234,9 +271,9 @@ two stations on one id would be one station to the ether.
 
 What `mixed.yaml` shows once its five stations are up, and the command that
 shows it. `rncfg` is Sergeyculum's tool; `<kiss>` is `run/nodes/<name>/kiss`.
-A Reticulous station answers on its TCP CLI, port 8081 on its own address
-(`{addr}` in a setup line, `127.0.4.5` for node 1 under the `--net` below),
-or through **Run command** on the page.
+A Reticulous station answers through **Run command** on the page, on its
+**Console**, or on its TCP CLI once that is opened (see
+[A station's own doors](#a-stations-own-doors)).
 
 | What | How to see it |
 |---|---|
@@ -249,10 +286,14 @@ or through **Run command** on the page.
 
 Three things the two stacks do differently, all visible in the record:
 
-- **Sergeyculum receives no resources.** A link to it establishes, and every
-  resource advertisement is answered with a resource cancel. A Reticulous
-  LXMF message over the 500 B packet limit is therefore never delivered to a
-  Sergeyculum station; under it, it is.
+- **Sergeyculum receives resources only when built for it.** A build with
+  the `resource-rx` feature and a ceiling set through `set_resource_rx_max`
+  accepts a resource advertisement up to that ceiling; `fw/simesh` has both
+  (1 MiB), so a Reticulous LXMF message over the 500 B packet limit is
+  accepted over a link, proven, and pushed up the station's `kiss` pty to its
+  host (not into its mailbox: `rncfg mbox count` does not move). The
+  nRF52840 boards have neither and answer every advertisement with a
+  resource cancel, so such a message never reaches them.
 - **A proof is forwarded only by the transport that forwarded the packet.**
   When a Sergeyculum proof reaches a Reticulous transport that did not carry
   the packet, it ends there, and the sender gives up on the message after its
@@ -342,9 +383,34 @@ moved node, a new one, a removed one, a physics change. The header shows a dot
 beside the name, and Load and New ask before discarding it. State is not part
 of that: a station writing to its store is not a change to the design.
 
+### The control websocket
+
+```
+page/script → simd   command {line, kind?, name?, stagger?, after?}
+simd → all pages     command_result {line, name, results: {<station>: <reply>}, t}
+simd → all pages     clock {mode, rate, t, observed, barriers, slow_idles}   once a wall second
+```
+
+Everything the page does is one JSON message on `ws://<simd>/ws`, and a
+script can speak the same messages. The one a script needs most is
+`command`, which is **Run command**: `line` goes to every `up` or `setup`
+station of `kind` (default the scenario's first), or to the one station
+`name` names; `stagger` spreads them over that many seconds; `after` holds the
+whole command back that many seconds on the run's clock, so in a virtual-time
+run it lands at an instant of T. Its answer is one `command_result` per
+command, broadcast to every page: `name` as it was asked (null for a whole
+kind), each station's reply by name, and `t`, the run's clock when the last
+reply came. `clock` says how the run keeps time — `rate` the pace asked for
+(null: as fast as it goes), `observed` the pace of the last wall second, `t`
+the run's clock in microseconds, `barriers` how often T has moved and
+`slow_idles` how many idles have arrived at the busy watchdog's pace
+([INTERNALS.md](INTERNALS.md#time)); the `snapshot` a page gets on connecting
+carries one too.
+
 ### The run
 
-The live run is neither a scenario nor a snapshot. It is `testbed/run/`:
+The live run is neither a scenario nor a snapshot. It is `testbed/run/`, or
+the directory simd's `--run` names:
 
 | Path | What it is |
 |---|---|
@@ -467,11 +533,53 @@ Besides the map, a station is reachable three other ways:
 - **Console** on its card — its serial console, in a terminal window over a
   websocket. For `reticulous`, first-run setup and every CLI command, exactly
   as a board on a cable; for `berlinmesh`, its log lines.
-- Its kind's own door, from a shell in the container: `nc <addr> 8081`
-  is a `reticulous` station's TCP CLI, and `rncfg <verb> run/nodes/<name>/kiss`
-  talks KISS to a `berlinmesh` one, exactly as over USB. These are the doors
-  simd itself uses for setup.
+- Its kind's own door. simd sets up and asks a `reticulous` station over
+  **framed RPC** on its console pty (below), and a `berlinmesh` one with
+  `rncfg <verb> run/nodes/<name>/kiss`, which talks KISS to it exactly as over
+  USB. A `reticulous` station's TCP CLI is closed, as on a board, until
+  `set s.net.cli_port 8081` opens it (a setup line does that for a whole
+  scenario); then `nc <addr> 8081` from a shell in the container is its
+  command line.
 - `tail -f run/nodes/<name>/log` — everything it has printed, across restarts.
+
+### Framed RPC on the console
+
+```
+station → simd   "… serial] framed rpc v1"                 once, early in boot, as log text
+simd → station   F5 53 47 01 <id> <len:2> show s.net.hostname
+station → simd   F5 53 47 01 <id> <len:2> s.net.hostname = alpha
+simd → station   F5 53 47 01 <id'> <len:2> lora up          one frame per setup line
+station → simd   F5 53 47 01 <id'> <len:2> enabled 1 radio(s)
+```
+
+The firmware multiplexes a framed side channel onto its serial console
+([`spangap-core/docs/framed-rpc.md`](../spangap-core/docs/framed-rpc.md)), and
+a station's console here is its pty. A frame is never echoed, never enters the
+line editor and never turns the log into a CLI session, so simd asks a station
+things while a person types at its **Console**. The pty drain takes each reply
+frame out of the stream and passes every other byte on unchanged, so the log
+and the console window never see one.
+
+A station answers its door once it has printed the marker since it last
+started and answered `show s.net.hostname` with something; it is `up` once
+that is so and its setup lines, if it has any to run, have run. A station that
+prints no marker within 20 seconds of wall time is sent that frame once,
+blind, and a Ctrl-C after it if it does not answer; that undoes it on firmware
+that does not speak frames, and the station stays `starting`.
+
+The device runs one frame at a time, bounds each at five seconds, and cuts a
+reply that outgrows its buffer at the last complete line without saying so.
+So simd keeps one frame in flight per station and asks for one key at a time,
+and a line whose effect lands after its reply is followed until it has:
+`lora up` by `show s.lora.0.enable` until it reads `1`, and any line whose
+reply came back at the five-second bound by `show s.net.hostname` until the
+command line answers again. The id is a hash of the command, so a retry
+carries the one it had, and a reply that arrives after its query gave up
+answers the retry.
+
+A command line of up to 4096 bytes runs over a frame, so an `lxmf send`
+carrying a text that needs a link and a resource goes the same way as any
+other line; a longer one is refused with `rpc: command over 4096 bytes`.
 
 A station that exits is started again, because a restart on this target is a
 process exit: a station rebooting itself comes back on the same address with
@@ -509,10 +617,14 @@ python3 testbed/proxy.py --bind 0.0.0.0:9011
 ## The chip library
 
 `radio/` is the SX1262 model and the station's link to the ether, behind a
-C ABI of eight functions (`radio/include/simradio.h`): open the link, open a
-chip per radio slot, hand it SPI frames, pulse its reset, read its lines. A
+C ABI (`radio/include/simradio.h`): open the link, open a chip per radio
+slot, hand it SPI frames, pulse its reset, read its lines, and, in a
+virtual-time run, read node time, set wakes, learn every move of T and say
+the station is idle. A
 station of any language links it in place of a radio, below an unchanged
-driver.
+driver. Beside it, `radio/shim/simclock.c` builds `libsimclock.so`, the
+preloaded library that answers the C library's clocks and waits in node time
+([INTERNALS.md](INTERNALS.md#time)).
 
 The model reaches its host through six services — a clock, one-shot timers, a
 recursive lock, a UDP socket, a reader, a log — and two backends supply them:
@@ -523,20 +635,20 @@ recursive lock, a UDP socket, a reader, a log — and two backends supply them:
 | `radio/backend/esp-idf/` | an ESP-IDF firmware built for the Linux host target: esp_timer, a FreeRTOS critical section and task; an IDF component |
 
 ```sh
-cd SIMesh/radio && cmake -B build && cmake --build build   # libsimradio.a, libsimradio.so
+cd SIMesh/radio && cmake -B build && cmake --build build   # libsimradio.a, libsimradio.so, libsimclock.so
 python3 -m pytest SIMesh/radio/tests SIMesh/ether SIMesh/testbed   # every test here; none needs firmware
 ```
 
 The model's tests load `libsimradio.so` with ctypes, drive it frame by frame
-the way a driver does, and play the ether on a UDP socket of their own.
+the way a driver does, and play the ether on a UDP socket of their own; the
+conductor's tests do the same in virtual time, and the shim's run a small C
+stand-in station (`radio/tests/standin.c`) under `libsimclock.so`. A virtual
+run needs `libsimclock.so` built: the testbed preloads it from
+`radio/build/`.
 
 The ESP-IDF backend is proved by a throwaway project that links it against
 the IDF host port and sends one frame (`radio/tests/esp-idf-link/`; the
 commands are at the top of its `CMakeLists.txt`).
-
-The reticulous firmware in this workspace still carries its own copy of the
-model in `iface-lora/esp-idf/src/host/`, listed below; it does not link this
-library yet.
 
 ## Where the code lives
 
@@ -550,7 +662,7 @@ It lives with that firmware, not here:
 | Where | What |
 |---|---|
 | [`spangap/build-system`](../spangap/build-system/README.md) | a board straddle's `target:`, exported as `IDF_TARGET`; on `linux`, no flashable image |
-| [`spangap/hw-linux`](../hw-linux/README.md) | the board: station identity and directory, the GPIO shim, esp_timer |
+| [`spangap/hw-linux`](../hw-linux/README.md) | the board: station identity and directory, the GPIO shim, esp_timer, descriptor waits, the tickless tick |
 | `spangap-core/esp-idf/src/host/` | no power manager, no USB transport, and deflate over the system zlib |
 | `spangap-net/esp-idf/src/net_relay.cpp` | the socket relay, shared with the chip: the event bus, the listen sockets, the byte proxy |
 | `spangap-net/esp-idf/src/host/` | the link backend — loopback, up from the first instant — in place of the WiFi state machine |
@@ -565,17 +677,25 @@ code lives in that component's `src/host/`.
 | Where | What |
 |---|---|
 | `radio/` | the chip and the station's UDP link to the ether, as a C library |
-| `iface-lora/esp-idf/src/host/virtual_sx126x.*`, `ether_task.*` | the reticulous firmware's own copy of the chip and the link, which its build links today |
-| `iface-lora/esp-idf/src/host/virtual_hal.*` | RadioLib's HAL over the GPIO shim and that model, in place of the SPI bus |
+| `radio/src/conductor.cpp` | the station's side of virtual time: T, node time, wakes, the idle |
+| `radio/shim/simclock.c` | `libsimclock.so`, the C library's time in node time; `radio/include/simclock.h` is what it is handed |
+| `iface-lora/esp-idf/src/host/virtual_hal.*` | RadioLib's HAL over the GPIO shim and `radio/`, in place of the SPI bus |
 | [`ether/`](ether/README.md) | the medium: positions, path loss, who hears a frame and how it comes out |
 | `testbed/simd.py` | the process: the ether, the stations, the proxy, the control server |
-| `testbed/stations.py` | one firmware process, its pty, its log, its supervisor |
+| `testbed/stations.py` | one firmware process, its pty, its log, its supervisor; the thread every station's pty is read on |
 | `testbed/kinds/` | one class per firmware: its environment, when it is up, how it is set up and asked things |
 | `testbed/scenario.py` | the scenario directory: load, save, save as, reload, new |
-| `testbed/setup.py` | a `reticulous` station's TCP CLI, which its kind speaks |
+| `testbed/rpc.py` | framed RPC on a station's console pty: the demultiplexer in the drain, and the client its kind speaks |
 | `testbed/proxy.py` | the hostname proxy |
+| `testbed/webrtc.py` | the WebRTC relay: the signalling rewritten, and one UDP port in front of every station's DataChannel |
 | `testbed/ui/` | the control page (Quasar 2 on Vue 3, one Pinia store) |
 | `testbed/seq.py` | the record as a sequence diagram |
+| `testbed/compare.py` | two runs' records and logs side by side: milestones, per-station counts, paths |
+| `testbed/traffic.py` | drives one simd through a whole run on the run clock: load, announce warm-up until paths stop growing, snapshot, a seeded hour of LXMF sends with each route length, drain, gather, snapshot |
+| `testbed/delivery.py` | a `traffic.py` run's delivery from the senders' logs: by route hops at send time, radio hops, size class, latency |
+| `testbed/airtime.py` | a record's airtime per station, per carrier (calling channel and SUPE traffic channels) and per frame kind, transmit power, exchanges (frames less than `--gap` seconds apart) at reduced power, and CRC losses; with `--busy`, how much of the time the calling channel was occupied where each station stands; with `--roles`, the airtime per transport and per endpoint, by class of frame on the calling channel and per traffic channel |
+| `testbed/links.py` | a record's link geometry against its scenario: distance of every usable one-way link, neighbours per station, nearest and farthest neighbour, hop diameter, beside the path-loss formula's own figures; with `--power`, traffic-channel transmit power by frame and airtime, rate steps, and power against the distance to the peer |
+| `testbed/scenarios/gen_town100.py` | writes `town100-lora.yaml`, `town100-supe.yaml` (SUPE, channel plan 1) and `town100-supe0.yaml` (SUPE, channel plan 0) from a seed: 100 stations in a 6 by 4 km town at SF7, checked against the formula's neighbour counts and hop diameter |
 
 Nothing above the bus is aware of any of it: the LoRa driver, its CSMA and
 airtime accounting, Reticulum, LXMF and the web UI are the same code that runs

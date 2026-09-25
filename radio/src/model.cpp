@@ -9,6 +9,7 @@
  */
 #include "simradio.h"
 
+#include "conductor.h"
 #include "ether_link.h"
 #include "model.h"
 #include "services.h"
@@ -103,7 +104,7 @@ enum {
     ST_CMD_INVALID = 0x08,
 };
 
-static const struct simradio_services* S() { return simradio_services(); }
+static const struct simradio_services* S() { return conductor::modelServices(); }
 
 /* The LoRa bandwidth register codes, in hertz. */
 static uint32_t bwFromCode(uint8_t code)

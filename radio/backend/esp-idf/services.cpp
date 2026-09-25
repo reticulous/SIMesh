@@ -7,8 +7,10 @@
  * - no FreeRTOS task blocks in a host system call. The port only knows a task
  *   is blocked when it blocked on a FreeRTOS primitive; a task sitting in
  *   recv() is, to the scheduler, the running task. So the socket is
- *   non-blocking and the reader's only wait is a select() with a one-tick
- *   timeout, which IDF interposes: it polls, then sleeps on a delay;
+ *   non-blocking and the reader's only wait is select() with no timeout,
+ *   which is interposed for a task: hw-linux blocks the task until the socket
+ *   is readable, and IDF's own interposer, where no board replaces it, polls
+ *   and sleeps on a delay;
  * - every task stack is at least 20 KB and has no core affinity: a task is a
  *   pthread with a real mapping, and there is one core;
  * - one critical section for everything. On this port it nests (a
@@ -19,6 +21,9 @@
  * firmware's own logger reads everything else.
  */
 #include "services.h"
+
+#include "conductor.h"
+#include "simradio.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -35,7 +40,17 @@
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
+
+/* The board's identity, and the one call it takes back from the clock. Weak:
+ * a project may link this backend without the board. */
+extern "C" __attribute__((weak)) int hwLinuxNodeId(void) { return 1; }
+extern "C" __attribute__((weak)) const char* hwLinuxBindAddr(void) { return "127.0.0.1"; }
+extern "C" __attribute__((weak)) const char* hwLinuxEtherAddr(void) { return ""; }
+extern "C" void hwLinuxClockDue(void) __attribute__((weak));
+extern "C" void hwLinuxClockMoved(void) __attribute__((weak));
 
 namespace {
 
@@ -47,7 +62,17 @@ const char* const kTag = "simradio";
 
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
-int64_t nowUs() { return esp_timer_get_time(); }
+/* The host's monotonic clock, read past any time shim and never through
+ * esp_timer, which reads this library. Zero at the first reading. */
+int64_t nowUs()
+{
+    static int64_t origin = -1;
+    struct timespec ts;
+    syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    if (origin < 0) origin = now;
+    return now - origin;
+}
 
 void* timerCreate(void (*cb)(void*), void* arg, const char* name)
 {
@@ -143,8 +168,7 @@ void readerTask(void* arg)
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(r.fd, &rd);
-        struct timeval tv = { 0, 1000 * portTICK_PERIOD_MS };
-        if (select(r.fd + 1, &rd, nullptr, nullptr, &tv) <= 0) continue;
+        if (select(r.fd + 1, &rd, nullptr, nullptr, nullptr) <= 0) continue;
         for (;;) {
             ssize_t n = recv(r.fd, buf, kMaxDatagram, MSG_DONTWAIT);
             if (n <= 0) break;
@@ -178,9 +202,90 @@ const struct simradio_services kServices = {
     logLine,
 };
 
+/* esp_timer's next expiry, as a wake in node time. */
+int s_timerWake = -1;
+
+void timerDue(void*)
+{
+    if (hwLinuxClockDue) hwLinuxClockDue();
+}
+
+/* The next tick a task waits for, as a wake in node time. Reaching it does
+ * nothing of its own: every move of T already brings the tick count up. */
+int s_tickWake = -1;
+
+void tickDue(void*) {}
+
+void clockMoved()
+{
+    if (hwLinuxClockMoved) hwLinuxClockMoved();
+}
+
+/* The station's clock reads 0 at the whole second of node time the station
+ * joined in. Every station's clock is then a whole number of seconds from
+ * every other's, so what the board times on it — its tick above all — falls
+ * on the same instants of T on every station, and those share a barrier. */
+constexpr int64_t kSecondUs = 1000000;
+
+int64_t clockZero()
+{
+    int64_t join = conductor::nodeAtJoin();
+    return join - join % kSecondUs;
+}
+
+int64_t toNode(int64_t us)
+{
+    return us == conductor::kNever ? conductor::kNever : us + clockZero();
+}
+
 }  // namespace
 
 extern "C" const struct simradio_services* simradio_services(void)
 {
     return &kServices;
+}
+
+/* ---- The board's clock (hw-linux's hwlinux.h) ----
+ *
+ * esp_timer, the board's tick and idle, and its bring-up reach the station's
+ * clock through these. In a real-time run the clock is the host's and this
+ * adds nothing; in a virtual one esp_timer counts node time from the ether's
+ * welcome, its next expiry and the next tick a task waits for are wakes, the
+ * tick count follows every move of T, and the idle task is what tells the
+ * ether this station is idle. */
+
+extern "C" int64_t hwLinuxClockUs(void)
+{
+    if (!conductor::isVirtual()) return nowUs();
+    return conductor::joined() ? conductor::nodeNowUs() - clockZero() : 0;
+}
+
+extern "C" void hwLinuxClockWake(int64_t us)
+{
+    if (!conductor::isVirtual()) return;
+    if (s_timerWake < 0) s_timerWake = conductor::wakeCreate(timerDue, nullptr);
+    conductor::wakeAt(s_timerWake, toNode(us));
+}
+
+extern "C" void hwLinuxClockTickAt(int64_t us)
+{
+    if (!conductor::isVirtual()) return;
+    if (s_tickWake < 0) s_tickWake = conductor::wakeCreate(tickDue, nullptr);
+    conductor::wakeAt(s_tickWake, toNode(us));
+}
+
+extern "C" void hwLinuxClockIdle(void)
+{
+    conductor::idle();
+}
+
+/* A virtual run needs the ether before anything in the station waits on
+ * time, since only the ether moves it: so the link opens here, at the
+ * board's bring-up, rather than when the radio does. */
+extern "C" int hwLinuxClockStart(void)
+{
+    if (!conductor::isVirtual()) return 0;
+    conductor::onAdvance(clockMoved);
+    simradio_station_open(hwLinuxNodeId(), hwLinuxBindAddr(), hwLinuxEtherAddr());
+    return 1;
 }

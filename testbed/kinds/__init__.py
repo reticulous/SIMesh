@@ -20,6 +20,10 @@ Paths in a kind's spec are relative to the directory scenario files live in
 import asyncio
 import os
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+# The time shim every station of a virtual-time run is started with.
+SHIM = os.path.normpath(os.path.join(HERE, "..", "..", "radio", "build", "libsimclock.so"))
+
 
 class CommandError(Exception):
     """A station could not be asked, or did not answer in time."""
@@ -64,8 +68,21 @@ class Kind:
                "SIMESH_NODE_DIR": station.dir,
                "SIMESH_BIND_ADDR": station.addr,
                "SIMESH_ETHER": station.ether_addr}
+        if station.clock is not None:
+            env.update(SIMESH_TIME="virtual",
+                       SIMESH_EPOCH_US=str(station.clock.epoch),
+                       LD_PRELOAD=SHIM)
         env.update(self.extra_env)
         return env
+
+    async def pause(self, station, seconds):
+        """Wait on the run's clock: the ether's T in a virtual-time run, so a
+        poll between two questions costs the station the same time in either
+        mode."""
+        if station.clock is not None:
+            await station.clock.sleep(seconds)
+        else:
+            await asyncio.sleep(seconds)
 
     async def wait_up(self, station, timeout):
         """True once the station answers the way this kind answers."""

@@ -160,7 +160,10 @@ class Frame:
 
 
 def parse_time(stamp):
-    """Seconds out of a record stamp, wrapping at the hour is nobody's problem."""
+    """Seconds out of a record stamp: T itself in a virtual-time run, the time
+    of day in a real one (wrapping at midnight is nobody's problem)."""
+    if ":" not in stamp:
+        return float(stamp)
     clock = stamp.split("T")[-1]
     hour, minute, second = clock.split("+")[0].split("Z")[0].split(":")
     return int(hour) * 3600 + int(minute) * 60 + float(second)

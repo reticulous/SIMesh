@@ -158,8 +158,9 @@ class Bench:
     is stated before then — which is also how a scenario file works.
     """
 
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, time_mode="real"):
         self.tmp_path = tmp_path
+        self.time_mode = time_mode
         self.record = tmp_path / "record.tsv"
         self.proc = None
         self.port = None
@@ -203,7 +204,7 @@ class Bench:
 
     def start(self):
         argv = [sys.executable, ETHER, "--bind", "127.0.0.1:0",
-                "--record", str(self.record)]
+                "--record", str(self.record), "--time", self.time_mode]
         if self.places:
             argv += ["--scenario", str(self.write_scenario())]
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
@@ -254,11 +255,24 @@ def ether(tmp_path):
         bed.close()
 
 
+@pytest.fixture
+def conductor(tmp_path):
+    """The ether in virtual time, as fast as its stations let it go."""
+    bed = Bench(tmp_path, "max")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
 def test_hello_gets_a_welcome(ether):
     welcome = ether(1, 0).hello()
     assert welcome["mode"] == "real"
-    assert isinstance(welcome["t0"], int)
+    assert welcome["rate"] == 1
+    assert isinstance(welcome["t"], int)
+    assert isinstance(welcome["epoch"], int)
     assert isinstance(welcome["seed"], int)
+    assert "seq" not in welcome
 
 
 def test_frame_reaches_a_listening_station(ether):
@@ -631,3 +645,187 @@ def test_the_record_holds_every_message(ether):
     assert ("in", "1", "tx") in kinds
     assert ("out", "2", "rx_begin") in kinds
     assert ("out", "2", "rx_end") in kinds
+
+
+# ---------------------------------------------------------------------------
+# Virtual time: the ether as the conductor
+# ---------------------------------------------------------------------------
+
+def idle(station, seq, until):
+    station.send({"type": "idle", "seq": seq, "until": until})
+
+
+def join_virtual(station):
+    welcome = station.hello()
+    assert welcome["mode"] == "virtual"
+    assert welcome["rate"] is None
+    return welcome
+
+
+def test_virtual_welcome_states_the_mode_and_t(conductor):
+    welcome = join_virtual(conductor(1, 0))
+    assert welcome["t"] == 0
+    assert welcome["seq"] == 1
+    assert isinstance(welcome["epoch"], int)
+
+
+def test_the_barrier_holds_until_every_station_is_idle(conductor):
+    a, b = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(a)
+    join_virtual(b)
+    idle(a, 1, 10_000)
+    a.expect_nothing(0.3)                       # b has not said it is idle
+    idle(b, 1, 20_000)
+    run = a.expect("run")
+    assert (run["t"], run["seq"]) == (10_000, 2)
+    b.expect_nothing(0.2)                       # b has nothing before 20 000
+    idle(a, 2, 20_000)
+    assert a.expect("run")["t"] == 20_000
+    assert b.expect("run")["t"] == 20_000
+
+
+def test_a_stale_idle_does_not_count(conductor):
+    a, b = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(a)
+    join_virtual(b)
+    idle(b, 1, None)
+    idle(a, 1, 5_000)
+    assert a.expect("run")["seq"] == 2
+    idle(a, 1, 6_000)                           # an answer to the last grant, not this one
+    a.expect_nothing(0.3)
+    idle(a, 2, 6_000)
+    assert a.expect("run")["t"] == 6_000
+
+
+def test_anything_a_station_says_retracts_its_idle(conductor):
+    a, b = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(a)
+    join_virtual(b)
+    idle(b, 1, None)
+    a.state("RX")
+    idle(a, 1, 7_000)
+    assert a.expect("run")["t"] == 7_000
+    a.state("RX")                               # before it has answered the run
+    idle(a, 2, 9_000)
+    assert a.expect("run")["t"] == 9_000
+
+
+def test_rx_begin_and_rx_end_arrive_at_their_instants_in_t(conductor):
+    tx, rx = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(tx)
+    join_virtual(rx)
+    rx.state("RX")
+    idle(rx, 1, None)
+    idle(tx, 1, 50_000)
+    assert tx.expect("run")["t"] == 50_000
+    tx.send(dict({"type": "tx", "slot": 0, "id": 1, "t0": 50_000,
+                  "t_pre": 50_000 + FRAME_US // 10, "t_hdr": 50_000 + FRAME_US // 5,
+                  "t_end": 50_000 + FRAME_US, "power_dbm": POWER_DBM,
+                  "payload": base64.b64encode(b"on time").decode()}, **radio("TX")))
+    idle(tx, 2, None)
+    begin = rx.expect("rx_begin")
+    assert (begin["t"], begin["t0"], begin["t_end"]) == (50_000, 50_000, 50_000 + FRAME_US)
+    assert begin["t_pre"] == 50_000 + FRAME_US // 10
+    rx.expect_nothing(0.2)                      # T waits on rx, which has not answered
+    idle(rx, begin["seq"], begin["t_pre"])
+    assert rx.expect("run")["t"] == begin["t_pre"]
+    idle(rx, begin["seq"] + 1, None)
+    end = rx.expect("rx_end")
+    assert end["t"] == 50_000 + FRAME_US
+    assert base64.b64decode(end["payload"]) == b"on time"
+    lines = [l for l in conductor.record.read_text().splitlines() if not l.startswith("#")]
+    stamps = {json.loads(l.split("\t")[3])["type"]: l.split("\t")[0] for l in lines}
+    assert stamps["rx_end"] == "%.6f" % ((50_000 + FRAME_US) / 1e6)
+    assert "idle" not in stamps and "run" not in stamps
+
+
+def test_a_late_tx_is_clamped_to_t(conductor):
+    tx, rx = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(tx)
+    join_virtual(rx)
+    rx.state("RX")
+    idle(rx, 1, None)
+    idle(tx, 1, 80_000)
+    tx.expect("run")
+    idle(tx, 2, None)
+    time.sleep(0.1)
+    # Something from outside the run moves the station after it said it was
+    # idle; the frame it stamps with the T it last had goes on the air at T.
+    tx.send(dict({"type": "tx", "slot": 0, "id": 1, "t0": 30_000, "t_pre": 31_000,
+                  "t_hdr": 32_000, "t_end": 40_000, "power_dbm": POWER_DBM,
+                  "payload": base64.b64encode(b"late").decode()}, **radio("TX")))
+    idle(tx, 2, None)
+    begin = rx.expect("rx_begin")
+    assert (begin["t0"], begin["t_pre"], begin["t_end"]) == (80_000, 81_000, 90_000)
+
+
+def test_one_instant_is_ruled_in_station_order(conductor):
+    early, late, rx = conductor(1, 0), conductor(2, 2 * NEAR_M), conductor(3, NEAR_M)
+    for st in (early, late, rx):
+        join_virtual(st)
+    rx.state("RX")
+    idle(rx, 1, None)
+    idle(early, 1, None)
+    idle(late, 1, None)
+
+    def send_tx(st, payload):
+        st.send(dict({"type": "tx", "slot": 0, "id": 1, "t0": 0,
+                      "t_pre": FRAME_US // 10, "t_hdr": FRAME_US // 5,
+                      "t_end": FRAME_US, "power_dbm": POWER_DBM,
+                      "payload": base64.b64encode(payload).decode()}, **radio("TX")))
+
+    # Station 2 speaks first on the wire; station 1's frame still gets the
+    # lower number, because one instant is taken in station order.
+    send_tx(late, b"two")
+    time.sleep(0.1)
+    send_tx(early, b"one")
+    idle(late, 1, None)
+    idle(early, 1, None)
+    first = rx.expect("rx_begin")
+    idle(rx, first["seq"], None)
+    second = rx.expect("rx_begin")
+    assert first["id"] < second["id"]
+    idle(rx, second["seq"], None)
+    ends = {}
+    for _ in range(2):
+        end = rx.expect("rx_end")
+        ends[end["id"]] = end
+        idle(rx, end["seq"], None)
+    assert ends[first["id"]]["verdict"] == ends[second["id"]]["verdict"] == "crc"
+    lines = [l for l in conductor.record.read_text().splitlines() if not l.startswith("#")]
+    order = [json.loads(l.split("\t")[3]) for l in lines if "\tout\t3\t" in l]
+    begins = [m for m in order if m["type"] == "rx_begin"]
+    assert [m["id"] for m in begins] == sorted(m["id"] for m in begins)
+
+
+def test_a_station_that_leaves_restarts_with_a_hello(conductor):
+    a, b = conductor(1, 0), conductor(2, NEAR_M)
+    join_virtual(a)
+    join_virtual(b)
+    idle(a, 1, 10_000)
+    idle(b, 1, 10_000)
+    assert a.expect("run")["t"] == 10_000
+    b.expect("run")
+    # b restarts: its hello replaces everything the ether knew of it.
+    welcome = b.hello()
+    assert (welcome["t"], welcome["seq"]) == (10_000, 1)
+    idle(a, 2, 20_000)
+    a.expect_nothing(0.2)
+    idle(b, 1, 30_000)
+    assert a.expect("run")["t"] == 20_000
+
+
+def test_paced_time_follows_the_wall(tmp_path):
+    bed = Bench(tmp_path, "10x")
+    try:
+        a = bed(1, 0)
+        a.hello()
+        idle(a, 1, 500_000)                     # half a second of T: 50 ms of wall at 10x
+        start = time.monotonic()
+        a.expect("run")
+        idle(a, 2, 1_500_000)                   # a whole second of T: 100 ms
+        a.expect("run")
+        took = time.monotonic() - start
+        assert 0.08 <= took <= 0.4
+    finally:
+        bed.close()

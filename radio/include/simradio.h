@@ -42,10 +42,47 @@ void simradio_reset(simradio_t*);
 /* What the model drives on a line right now. */
 int simradio_pin(simradio_t*, int pin);
 
-/* Microseconds on the model's clock, for a host that wants to log against it. */
+/* Microseconds on the model's clock, for a host that wants to log against it.
+ * In a virtual-time run this is conductor time, T. */
 int64_t simradio_now_us(void);
 
 void simradio_close(simradio_t*);
+
+/* ---- The station's clock ----
+ *
+ * A run keeps real or virtual time, for every station alike; the ether says
+ * which in its welcome, and SIMESH_TIME=virtual in the environment says it
+ * before the station can reach the ether. In virtual time the ether owns
+ * conductor time T and moves it only when every station is idle. The host
+ * reads node time, f(T) — its own crystal — and tells the library when it
+ * next needs to run; the library tells the ether. */
+
+/* 1 in a virtual-time run. */
+int simradio_virtual(void);
+
+/* Node time, µs: f(T) in a virtual run, the host's monotonic clock in a real one. */
+int64_t simradio_node_us(void);
+
+/* The wall-clock µs that node time 0 stands for. */
+int64_t simradio_epoch_us(void);
+
+/* f⁻¹: the conductor time at which node time reaches `node_us`. */
+int64_t simradio_node_to_conductor(int64_t node_us);
+
+/* A wake the host owns: `due(arg)` runs when a grant reaches the node time it
+ * is set to, on the thread that received the grant, with no lock held. */
+int  simradio_wake_create(void (*due)(void* arg), void* arg);
+void simradio_wake_at(int wake, int64_t node_us);      /* INT64_MAX clears it */
+
+/* The host has nothing to do before its wakes. The first call after each
+ * grant tells the ether; later ones only when the next wake has moved closer. */
+void simradio_idle(void);
+
+/* A host whose own clock is a function of node time — a kernel tick counted
+ * from it — learns of every move: `moved()` runs each time a grant moves T, on
+ * the thread that received it, with no lock held, before any wake or timer
+ * due at the new T. */
+void simradio_on_advance(void (*moved)(void));
 #ifdef __cplusplus
 }
 #endif

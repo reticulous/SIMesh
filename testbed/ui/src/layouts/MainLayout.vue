@@ -72,6 +72,7 @@
           <span v-else class="sim-empty">no scenario</span>
         </q-toolbar-title>
 
+        <span class="sim-time" :title="timeTitle">{{ timeLabel }}</span>
         <span class="sim-count">{{ sim.running }}/{{ sim.nodeList.length }} up</span>
         <span class="sim-link" :class="{ 'sim-link-off': !sim.connected }">
           {{ sim.connected ? 'connected' : 'reconnecting…' }}
@@ -219,6 +220,22 @@ const commandLine = ref('')
 const commandSpread = ref(0)
 /* A line is in one kind's dialect, so it goes to the stations of one kind. */
 const kinds = computed<string[]>(() => sim.scenario?.kinds ?? [])
+
+/* How the run keeps time, in the header: real time, or virtual time at its
+ * pace — paced runs by what they were asked for, unpaced ones by what they
+ * lately did — with the run's own clock beside it. */
+const timeLabel = computed(() => {
+  const c = sim.clock
+  if (c.mode !== 'virtual') return 'real time'
+  const t = (c.t / 1e6).toFixed(0)
+  if (c.rate) return `virtual ${c.rate}× · T ${t} s`
+  const seen = c.observed ? ` ≈${c.observed.toFixed(1)}×` : ''
+  return `virtual max${seen} · T ${t} s`
+})
+const timeTitle = computed(() =>
+  sim.clock.mode === 'virtual'
+    ? 'Virtual time: the ether moves T when every station is idle. Rings are drawn at the run\'s pace.'
+    : 'Real time: stations and the medium run on the wall clock.')
 const commandKind = ref<string | null>(null)
 watch(kinds, (list) => {
   if (!commandKind.value || !list.includes(commandKind.value)) commandKind.value = list[0] ?? null
@@ -306,6 +323,7 @@ watch(() => sim.errors.length, () => {
 .sim-dirty { color: #f59e0b; }
 .sim-empty { color: #6b7280; font-weight: 400; }
 .sim-count { font: 11px ui-monospace, monospace; color: #6b7280; padding-right: 12px; }
+.sim-time { font: 11px ui-monospace, monospace; color: #a78bfa; padding-right: 12px; }
 .sim-link { font: 11px ui-monospace, monospace; color: #22c55e; padding-right: 8px; }
 .sim-link-off { color: #f59e0b; }
 .sim-page-container { height: 100vh; }

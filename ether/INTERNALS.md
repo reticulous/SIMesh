@@ -6,7 +6,8 @@ How the medium decides who hears what, and the choices behind it.
 ## Shape
 
 One `asyncio.DatagramProtocol` on one UDP socket, single-threaded. Everything
-is driven from arriving datagrams and from timers the event loop holds:
+is driven from arriving datagrams and from timers — the event loop's in a
+real-time run, the barrier's heap in a virtual one (below):
 
 - a **placement** is where a station stands, in metres, and what its antenna
   adds — held whether or not that station has ever been heard from;
@@ -30,8 +31,8 @@ two frames.
 
 Three clocks meet here and only one of them is authoritative.
 
-A station stamps its messages with its own `esp_timer`, which starts at zero
-when its process does. Those numbers mean nothing between stations. So on every
+A station stamps its messages with its own clock, which starts at zero when
+its process first reads it. Those numbers mean nothing between stations. So on every
 `tx` the ether reads only the **offsets** — `t_pre − t0`, `t_hdr − t0`,
 `t_end − t0` — and rebases them onto its own monotonic clock at the instant the
 datagram arrived. The `rx_begin` it sends carries ether microseconds; the
@@ -41,6 +42,59 @@ own clock. Each hop keeps what it can trust and discards what it cannot.
 The offsets are clamped: negative is zero, anything beyond the frame's own span
 is the span, and a stated timeline longer than a minute is junk and is cut. A
 station cannot make the ether schedule something absurd by stating it.
+
+That is a real-time run. In a virtual one the ether's clock is **conductor
+time T**, and it is the only clock: a station's timers, its sleeps and its
+radio all run on T (or on node time, the station's own function of T), so a
+`tx` states instants on T and the offsets are read the same way. The event
+loop still carries the datagrams, but nothing the ether schedules is on the
+loop's clock: `rx_end`s and the testbed's own waits (`Ether.sleep`) go into
+one heap ordered by instant, then station id, then the order they were
+scheduled in, and run when T reaches them.
+
+## The barrier
+
+In virtual time T moves only when nothing in the run could still act at the
+T it has. A station is busy from the moment the ether sends it anything —
+every message carries its `seq` — until it answers with an `idle` for that
+`seq`; a station started and not yet heard from is busy too
+(`expect()`, which the testbed calls before it starts the process). A count of
+busy stations is kept, not a scan, because a barrier is taken hundreds of
+times per second of T.
+
+When the count reaches zero, `kick()`:
+
+1. takes whatever stations said while T stood — `state` and `tx`, held in
+   arrival order — in station-id order, which is what makes two frames
+   started at one instant collide the same way every run; taking them makes
+   those stations busy again, so the loop ends there until they answer;
+2. otherwise moves T to the earliest of every station's `until` and the
+   heap's first instant, runs what the heap has due, and sends `run` to every
+   idle station whose `until` has been reached.
+
+Holding a station's messages until the barrier rather than acting on them as
+they arrive is the whole of determinism here. Two stations answering one
+`run` race each other to the socket; taken as they arrived, the ruling on a
+collision would depend on the host's scheduler.
+
+A paced run (`--time <k>x`) measures T against the wall from where it
+started, and a barrier that would get ahead waits on a loop timer. A run that
+has fallen more than a quarter of a second behind carries on from where it is
+rather than racing to catch up.
+
+Two things keep a station from holding T for ever:
+
+- **A station that asks for the T it has**, 64 times running, is given 10 ms
+  instead. Work takes time; a station whose every idle says "run me now" is
+  spinning, and a FreeRTOS tick of T lets it through.
+- **A station that does not answer** answers anyway: its own side reports
+  idle 20 ms of wall time after it was last told anything. An idle that
+  arrives 18 ms or more after the message it answers was sent is counted per
+  station (`slow_idles`), so a run that crawls can say which station is
+  holding it.
+
+A station that leaves (`leave()`) or says `hello` again is forgotten: its
+held messages, its busy mark and its `until` go with its old process.
 
 ## The level, and why it is computed
 
@@ -63,7 +117,7 @@ Distance is floored at one metre. Without that, two stations dropped at the
 same point make `log10(0)`, and the answer a person wants there is "very loud",
 not a crash.
 
-What the levels are *for* has not changed: the medium needs to know which of two
+What the levels are *for* is narrow: the medium needs to know which of two
 frames is the louder one, and by how much. Computing them rather than reading
 them buys the thing a testbed most wants — that moving a station changes what it
 can hear, and that the change is the same change a person would reason about.
@@ -196,5 +250,3 @@ medium: the ether's job is the frames, and everything watching is optional.
 - **A referee.** The ether does not judge a station's behaviour — it does not
   check that a transmission was preceded by carrier sense, or that a duty cycle
   was respected. The record is there so something else can.
-- **Virtual time.** It runs on the event loop's real clock. Stations are
-  processes in real time and a person is in the loop.

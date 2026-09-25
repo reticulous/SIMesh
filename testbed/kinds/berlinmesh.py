@@ -36,6 +36,7 @@ DETECT_OK = re.compile(r"^DETECT\s*:\s*ok", re.MULTILINE)
 TRANSPORT = re.compile(r"^transport:\s*(on|off)\s*$", re.MULTILINE)
 
 TOOL_TIMEOUT_S = 10.0       # one rncfg invocation, KISS round trips included
+TOOL_TRIES = 3              # in a virtual-time run, a line whose reply timed out is tried again
 POLL_S = 0.5                # how often a booting station is asked whether it is up
 
 
@@ -49,6 +50,14 @@ class Berlinmesh(Kind):
         # One rncfg at a time per station: two on one pty interleave their
         # KISS frames and both read garbage.
         self.locks = {}
+
+    def env(self, station):
+        env = super().env(station)
+        if station.clock is not None:
+            # A plain process: the time shim says it is idle when all its
+            # threads are blocked.
+            env["SIMESH_IDLE"] = "threads"
+        return env
 
     def kiss(self, station):
         return os.path.join(station.dir, "kiss")
@@ -74,7 +83,7 @@ class Berlinmesh(Kind):
                         return True
                 except CommandError:
                     pass
-            await asyncio.sleep(POLL_S)
+            await self.pause(station, POLL_S)
         return False
 
     async def run(self, station, line, timeout=TOOL_TIMEOUT_S):
@@ -84,7 +93,13 @@ class Berlinmesh(Kind):
             raise CommandError("%r: %s" % (line, err)) from err
         if not words:
             return ""
-        code, out = await self.rncfg_run(station, words[0], words[1:], timeout)
+        for _ in range(TOOL_TRIES):
+            code, out = await self.rncfg_run(station, words[0], words[1:], timeout)
+            # rncfg waits for each reply on the wall clock; a station in a
+            # virtual-time run answers on its own, which a busy stretch of
+            # the run can make slower than that.
+            if code == 0 or station.clock is None or "timeout" not in out:
+                break
         if code != 0:
             raise CommandError(out.strip() or "rncfg exited %d" % code)
         return out

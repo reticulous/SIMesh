@@ -14,6 +14,7 @@ set(simradio_root "${CMAKE_CURRENT_LIST_DIR}/../..")
 idf_component_register(
     SRCS "${simradio_root}/src/model.cpp"
          "${simradio_root}/src/ether_link.cpp"
+         "${simradio_root}/src/conductor.cpp"
          "${simradio_root}/src/json.cpp"
          "${CMAKE_CURRENT_LIST_DIR}/services.cpp"
     INCLUDE_DIRS "${simradio_root}/include"

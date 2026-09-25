@@ -358,10 +358,10 @@ class Scenario:
     change to the design.
     """
 
-    def __init__(self, name, data, run_dir=RUN_DIR):
+    def __init__(self, name, data, run_dir=None):
         self.name = name
         self.data = data
-        self.run_dir = run_dir
+        self.run_dir = run_dir or RUN_DIR
         self.dirty = False
 
     # ---- the map ---------------------------------------------------------
@@ -531,7 +531,7 @@ class Scenario:
 
 # ---- loading -------------------------------------------------------------
 
-def load_scenario(name, run_dir=RUN_DIR):
+def load_scenario(name, run_dir=None):
     """Put a scenario into the run directory, factory fresh.
 
     Nothing of the previous run's state survives: a scenario describes a
@@ -543,13 +543,14 @@ def load_scenario(name, run_dir=RUN_DIR):
     if not os.path.isfile(path):
         raise ScenarioError("no scenario called %r" % name)
     data = read(path)
+    run_dir = run_dir or RUN_DIR
     os.makedirs(run_dir, exist_ok=True)
     wipe_state(run_dir)
     write(run_dir, data)
     return Scenario(name, data, run_dir)
 
 
-def load_snapshot(name, run_dir=RUN_DIR):
+def load_snapshot(name, run_dir=None):
     """Put a snapshot into the run directory: its map and its state.
 
     The loaded scenario keeps the name of the scenario the snapshot was taken
@@ -562,6 +563,7 @@ def load_snapshot(name, run_dir=RUN_DIR):
     if not os.path.isfile(os.path.join(source, SCENARIO_FILE)):
         raise ScenarioError("no snapshot called %r" % name)
     data = read(source)
+    run_dir = run_dir or RUN_DIR
     os.makedirs(run_dir, exist_ok=True)
     write(run_dir, data)
     copy_state(source, run_dir, wanted=data["nodes"])
@@ -574,7 +576,7 @@ def load_snapshot(name, run_dir=RUN_DIR):
     return Scenario(came_from, data, run_dir)
 
 
-def create(name, run_dir=RUN_DIR):
+def create(name, run_dir=None):
     """Make an empty scenario, written at once so it has a file, and load it."""
     check_name(name)
     if os.path.exists(scenario_path(name)):
