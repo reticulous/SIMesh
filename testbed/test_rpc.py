@@ -204,6 +204,37 @@ def test_client_one_in_flight_late_reply_answers_the_retry():
     asyncio.run(go())
 
 
+def test_a_query_times_out_on_the_runs_clock_when_it_has_one():
+    async def go():
+        sent = []
+        slept = []
+        release = asyncio.Event()
+
+        async def run_sleep(seconds):
+            slept.append(seconds)
+            await release.wait()            # the run's clock, not the wall's
+
+        client = rpc.RpcClient(sent.append, run_sleep)
+        client.available = True
+        task = asyncio.ensure_future(client.query("show x", timeout=8.0, tries=1))
+        await asyncio.sleep(0.1)
+        assert not task.done() and slept == [8.0]
+        release.set()
+        try:
+            await task
+            raise AssertionError("the query was answered")
+        except rpc.RpcError:
+            pass
+
+        # An answer that comes first is the answer.
+        release.clear()
+        task = asyncio.ensure_future(client.query("show y", timeout=8.0, tries=1))
+        await asyncio.sleep(0.05)
+        client.on_frame(sent[-1][4], b"y = 1\n")
+        assert await task == "y = 1\n"
+    asyncio.run(go())
+
+
 def test_client_queries_are_serialised():
     async def go():
         sent = []

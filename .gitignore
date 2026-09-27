@@ -1,8 +1,15 @@
 testbed/run/
+testbed/runs/
+testbed/losses/
+testbed/coverage/
 testbed/snapshots/
 testbed/ui/dist/
 testbed/ui/node_modules/
 testbed/ui/.quasar/
 radio/build/
+planner/target/
+/packs/
+/devices/*
+!/devices/local/
 __pycache__/
 .pytest_cache/

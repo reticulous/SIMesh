@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Airtime, transmit power and losses from an ether record.
+"""Airtime, transmit power and losses from a run's ether record.
 
-    airtime.py RECORD [--scenario YAML] [--from S] [--to S] [--calling HZ]
+    airtime.py RUN [--record PATH] [--from S] [--to S] [--calling HZ]
                [--gap S] [--busy] [--roles] [--json OUT]
 
-Reads `record.tsv` (a virtual-time run's: the first column is T in seconds)
-and counts every transmission that starts inside [--from, --to):
+Reads the run's `record.tsv` (or --record; a virtual-time run's: the first
+column is T in seconds) and counts every transmission that starts inside
+[--from, --to):
 
 - airtime: total seconds on the air, per station (mean and maximum), and as
-  a fraction of the window; split into the calling channel (--calling, the
-  configured frequency, 869.525 MHz by default) and every other carrier,
-  which under SUPE's channel plan are its traffic channels; and by what the
-  frame is (Reticulum packet type and context, SUPE frame type), on every
-  carrier and on the calling channel alone (`by_kind`, `by_kind_calling`),
-  so the announce share can be read off;
+  a fraction of the window; split into the calling channel (--calling; by
+  default the carrier most of the run's nodes declare) and
+  every other carrier, which under SUPE's channel plan are its traffic
+  channels; and by what the frame is (`by_kind`, and on the calling channel
+  alone `by_kind_calling`), so the announce share can be read off. What a
+  frame is belongs to the protocol: in a run with Reticulous stations,
+  Reticulum packet type and context or SUPE frame type
+  (`simesh.reticulum.frames.kind_of`); otherwise every frame is `frame`;
 - transmit power: `power_dbm` of each frame, on the calling channel and on
   the other carriers, weighted by frame and by airtime, with its minimum,
   quartiles and maximum; and exchanges on the other carriers, where an
@@ -31,70 +34,28 @@ by a number of its own that the `tx` line does not carry.
 
 --busy adds, per station, the share of the window the calling channel was
 occupied where it stands: its own frames and every frame it was told of.
-Station names come from --scenario (a scenario or run `scenario.yaml`).
+Station names are the run's nodeset's.
 
---roles (needs --scenario) splits the airtime by role: transports, the
-stations whose last `transport_enabled` setup line (shared, then their own)
-is 1, and endpoints, every other station. For each, the mean seconds per
-station on the calling channel, split into announces and path traffic
-(announces, path requests and responses, SUPE ANNOUNCE), SUPE HAIL, the rest
-of SUPE's frames, and unicast payload (every other frame); on one traffic
-channel, a station's traffic-channel seconds divided by the number of
-traffic channels any frame in the window used; and in total.
+--roles splits the airtime by role, each station's as its node declares it
+(a node declaring none is a `client`). For each role, the mean
+seconds per station on the calling channel, split into announces and path
+traffic (announces, path requests and responses, SUPE ANNOUNCE), SUPE HAIL,
+the rest of SUPE's frames, and unicast payload (every other frame); on one
+traffic channel, a station's traffic-channel seconds divided by the number
+of traffic channels any frame in the window used; and in total.
 """
 import argparse
 import base64
 import collections
 import hashlib
 import json
-import os
 import sys
 
-import yaml
+from simesh import reticulum
+from simesh.reticulum import frames as rframes
+from simesh.view import RunView
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import seq  # noqa: E402 - the path is set just above
-
-
-def kind_of(payload, part):
-    """What a frame is, as one short word: the airtime classes."""
-    if not payload:
-        return "empty"
-    if payload[0] in seq.SUPE_TYPE:
-        return "SUPE " + seq.SUPE_TYPE[payload[0]]
-    if len(payload) == seq.PWRREQ_LEN and payload[0] == seq.MAGIC_PWRREQ:
-        return "power request"
-    if part == 2:
-        return None                         # the second half: its packet's class
-    p = payload[1:]
-    if len(p) < 19 or p[0] & 0x80:
-        return "other"
-    flags = p[0]
-    hdr2 = bool(flags & 0x40)
-    need = 2 + (32 if hdr2 else 16) + 1
-    if len(p) < need:
-        return "other"
-    ptype = flags & 0x03
-    dest = p[2 + (16 if hdr2 else 0):][:16]
-    ctx = p[need - 1]
-    data = p[need:]
-    if ptype == 1:
-        if ctx == 0x0B:
-            return "path response"
-        aspect = seq.NAME_HASHES.get(data[64:74]) if len(data) >= 74 else None
-        return "announce " + (aspect or "other")
-    if ptype == 2:
-        return "link request"
-    if ptype == 3:
-        return "link proof" if ctx == 0xFF else "proof"
-    name = seq.PLAIN_DESTS.get(dest)
-    if name == "rnstransport.path.request":
-        return "path request"
-    if ctx in (0xFB, 0xFC, 0xFE, 0xFA):
-        return "link control"
-    if 0x01 <= ctx <= 0x07:
-        return "resource"
-    return "data"
+TOLERANCE_HZ = 125_000 // 4
 
 
 def quartiles(values):
@@ -103,40 +64,6 @@ def quartiles(values):
         return None
     q = lambda f: v[min(len(v) - 1, int(f * (len(v) - 1) + 0.5))]
     return [v[0], q(0.25), q(0.5), q(0.75), v[-1]]
-
-
-def names_from(path):
-    if not path:
-        return {}
-    if os.path.isdir(path):
-        path = os.path.join(path, "scenario.yaml")
-    data = yaml.safe_load(open(path))
-    return {int(n["id"]): name for name, n in data["nodes"].items()}
-
-
-def transports_from(path):
-    """Station ids whose last `transport_enabled` setup line, shared then their own, is 1."""
-    if os.path.isdir(path):
-        path = os.path.join(path, "scenario.yaml")
-    data = yaml.safe_load(open(path))
-    shared = list(data.get("setup") or [])
-    out = set()
-    for node in data["nodes"].values():
-        t = [l for l in shared + list(node.get("setup") or []) if "transport_enabled" in l]
-        if t and t[-1].strip().endswith(" 1"):
-            out.add(int(node["id"]))
-    return out
-
-
-def calling_class(kind):
-    """The class a calling-channel frame counts under in the role split."""
-    if kind.startswith("announce") or kind in ("SUPE ANNOUNCE", "path request", "path response"):
-        return "announces_and_path"
-    if kind == "SUPE HAIL":
-        return "hails"
-    if kind.startswith("SUPE "):
-        return "supe_other"
-    return "unicast"
 
 
 def union_len(intervals):
@@ -154,17 +81,20 @@ def union_len(intervals):
     return total
 
 
-def analyse(args):
+def generic_kind(payload, part):
+    return "frame"
+
+
+def analyse(args, kind_of=rframes.kind_of):
     lo = int(args.frm * 1e6) if args.frm is not None else None
     hi = int(args.to * 1e6) if args.to is not None else None
     calling = args.calling
-    tol = 125_000 // 4
 
     frames = []                     # one dict per transmission in the window
     by_key = {}                     # (t_us, payload digest) -> index into frames
     begins = {}                     # (receiver, ether frame id) -> the frame's start
     carrier = {}                    # (start, length) -> carrier, for --busy
-    halves = set()
+    halves = rframes.Halves()
     busy = collections.defaultdict(list)
     for line in open(args.record, encoding="utf-8"):
         if line.startswith("#"):
@@ -177,11 +107,8 @@ def analyse(args):
         if is_tx and direction == "in":
             t_us = int(round(float(stamp) * 1e6))
             payload = base64.b64decode(msg.get("payload") or "")
-            part = 0
             s = int(sid)
-            if payload and payload[0] & seq.RNODE_FLAG_SPLIT and payload[0] not in seq.SUPE_TYPE:
-                part = 2 if s in halves else 1
-                halves.symmetric_difference_update({s})
+            part = halves.part(s, payload)
             if (lo is not None and t_us < lo) or (hi is not None and t_us >= hi):
                 continue
             span = max(0, int(msg.get("t_end", 0)) - int(msg.get("t0", 0)))
@@ -194,7 +121,7 @@ def analyse(args):
             by_key[(t_us, hashlib.blake2b(payload, digest_size=8).digest())] = len(frames)
             carrier[(t_us, span)] = f["freq"]
             frames.append(f)
-            if args.busy and abs(f["freq"] - calling) <= tol:
+            if args.busy and abs(f["freq"] - calling) <= TOLERANCE_HZ:
                 busy[s].append((t_us, t_us + span))
         elif direction == "out" and msg.get("type") == "rx_begin":
             if msg.get("cad"):
@@ -208,7 +135,7 @@ def analyse(args):
                 # started at that instant and runs that long does.
                 t_end = int(msg["t_end"])
                 freq = carrier.get((t0, t_end - t0))
-                if freq is not None and abs(freq - calling) <= tol:
+                if freq is not None and abs(freq - calling) <= TOLERANCE_HZ:
                     busy[int(sid)].append((t0, t_end))
         elif direction == "out" and msg.get("type") == "rx_end":
             t0 = begins.pop((int(sid), msg["id"]), None)
@@ -225,16 +152,19 @@ def analyse(args):
             else:
                 f["crc"] += 1
 
+    if not frames:
+        return frames, 0.0, busy
     window = ((hi if hi is not None else max(f["t"] + f["span"] for f in frames))
               - (lo if lo is not None else min(f["t"] for f in frames))) / 1e6
     return frames, window, busy
 
 
-def report(frames, window, busy, args):
-    names = names_from(args.scenario)
-    calling, tol = args.calling, 125_000 // 4
-    on_call = lambda f: abs(f["freq"] - calling) <= tol
-    out = {"window_s": window, "frames": len(frames)}
+def report(frames, window, busy, args, names, roles=None):
+    """The figures. `names` is station id -> name; `roles` station id -> role,
+    for --roles."""
+    calling = args.calling
+    on_call = lambda f: abs(f["freq"] - calling) <= TOLERANCE_HZ
+    out = {"window_s": window, "frames": len(frames), "calling_hz": calling}
     stations = sorted(set(names) | {f["sid"] for f in frames})
     n_st = len(stations) or 1
 
@@ -272,7 +202,7 @@ def report(frames, window, busy, args):
             on_calling[f["kind"]][1] += f["span"]
     out["by_kind_calling"] = {k: {"frames": v[0], "s": v[1] / 1e6}
                               for k, v in sorted(on_calling.items(), key=lambda x: -x[1][1])}
-    ann = sum(v[1] for k, v in kinds.items() if k.startswith("announce") or k == "SUPE ANNOUNCE")
+    ann = sum(v[1] for k, v in kinds.items() if rframes.is_announce_kind(k))
     out["announce_s"] = ann / 1e6
     out["other_s"] = (sum(v[1] for v in kinds.values()) - ann) / 1e6
 
@@ -312,22 +242,20 @@ def report(frames, window, busy, args):
         "frames_lost_at_every_receiver": sum(1 for f in heard if not f["clean"]),
         "frames_nobody_received": len(frames) - len(heard),
     }
-    if getattr(args, "roles", False):
-        transports = transports_from(args.scenario)
+    if roles is not None:
         chans = {f["freq"] for f in frames if not on_call(f)}
-        classes = ("announces_and_path", "hails", "supe_other", "unicast")
         acc = collections.defaultdict(lambda: collections.Counter())
         for f in frames:
             if on_call(f):
-                acc[f["sid"]][calling_class(f["kind"])] += f["span"]
+                acc[f["sid"]][rframes.calling_class(f["kind"])] += f["span"]
             else:
                 acc[f["sid"]]["traffic"] += f["span"]
         out["roles"] = {"traffic_channels": len(chans)}
-        for role, members in (("transport", [s for s in stations if s in transports]),
-                              ("endpoint", [s for s in stations if s not in transports])):
+        for role in sorted(set(roles.values())):
+            members = [s for s in stations if roles.get(s) == role]
             n = len(members) or 1
             mean = lambda key: sum(acc[s][key] for s in members) / 1e6 / n
-            calling_s = {c: mean(c) for c in classes}
+            calling_s = {c: mean(c) for c in rframes.CALLING_CLASSES}
             traffic_s = mean("traffic")
             out["roles"][role] = {
                 "stations": len(members),
@@ -346,30 +274,35 @@ def report(frames, window, busy, args):
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("record")
-    ap.add_argument("--scenario")
+    ap.add_argument("run", help="the run directory")
+    ap.add_argument("--record", help="the record to read (default: the run's record.tsv)")
     ap.add_argument("--from", dest="frm", type=float)
     ap.add_argument("--to", type=float)
-    ap.add_argument("--calling", type=int, default=869_525_000)
+    ap.add_argument("--calling", type=int,
+                    help="the calling channel in Hz (default: the run's most declared carrier)")
     ap.add_argument("--gap", type=float, default=1.0,
                     help="seconds of silence that end an exchange on a traffic channel")
     ap.add_argument("--busy", action="store_true")
-    ap.add_argument("--roles", action="store_true",
-                    help="airtime per transport and per endpoint (needs --scenario)")
+    ap.add_argument("--roles", action="store_true", help="airtime per station role")
     ap.add_argument("--json")
-    args = ap.parse_args()
-    if args.roles and not args.scenario:
-        ap.error("--roles needs --scenario")
-    frames, window, busy = analyse(args)
-    out = report(frames, window, busy, args)
+    args = ap.parse_args(argv)
+    view = RunView(args.run)
+    args.record = args.record or view.record_path
+    if args.calling is None:
+        args.calling = view.calling_hz()
+    kind_of = rframes.kind_of if reticulum in view.protocols() else generic_kind
+    frames, window, busy = analyse(args, kind_of)
+    out = report(frames, window, busy, args, view.names,
+                 view.roles() if args.roles else None)
     text = json.dumps(out, indent=1, default=list)
     if args.json:
         with open(args.json, "w") as f:
             f.write(text + "\n")
     print(text)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

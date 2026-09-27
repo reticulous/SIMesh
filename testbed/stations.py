@@ -5,7 +5,7 @@ A station is a whole firmware built for Linux and run as an ordinary process,
 keeping the station contract (STATION.md); its kind (kinds/) says which
 binary and how to talk to it. It gets:
 
-- a **directory** under the run, `run/nodes/<name>/`, its cwd, with its
+- a **directory** in the run, `runs/<run>/nodes/<name>/`, its cwd, with its
   state under `state/`;
 - a **pty**, because its stdin and stdout are its serial console — the
   supervisor holds the master end and reads it on the pty thread (`Ptys`),
@@ -25,6 +25,7 @@ happens — the caller does that, through `on_status`.
 """
 
 import asyncio
+import functools
 import ipaddress
 import os
 import pty
@@ -70,6 +71,20 @@ def max_node_id():
     return HOSTS_PER_NET * (1 << (24 - net.prefixlen))
 
 
+_cpus = None
+_cpu_next = 0
+
+
+def next_cpu():
+    """The CPU for the next station, taken in turn from those simd may use."""
+    global _cpus, _cpu_next
+    if _cpus is None:
+        _cpus = sorted(os.sched_getaffinity(0))
+    cpu = _cpus[_cpu_next % len(_cpus)]
+    _cpu_next += 1
+    return cpu
+
+
 def bind_addr(node_id):
     """The station's own loopback address."""
     net = ipaddress.ip_network(NET)
@@ -86,7 +101,7 @@ class Ptys:
 
     Everything a station prints is read, split into text and framed-RPC
     replies (rpc.FrameDemux) and appended to its log here, on an event loop of
-    this thread's, so that however much a fleet prints, none of it is work for
+    this thread's, so that however much a nodeset prints, none of it is work for
     the loop that runs the medium. That loop is handed only what it acts on,
     with call_soon_threadsafe, in the order it was read: a reply frame, the
     capability marker, console bytes while a console window is open, the end
@@ -103,6 +118,14 @@ class Ptys:
     def call(self, fn, *args):
         """Run fn(*args) on the pty thread, after whatever is queued there."""
         self.loop.call_soon_threadsafe(fn, *args)
+
+
+def catch_up(drains, main, done):
+    """On the pty thread: every one of `drains` reads all its station has
+    written, then `done` runs on `main`, behind everything they handed it."""
+    for drain in drains:
+        drain.catch_up()
+    main.call_soon_threadsafe(done)
 
 
 _ptys = None
@@ -141,21 +164,37 @@ class Drain:
         self.reading = True
 
     def readable(self):
+        self.read_once()
+
+    def catch_up(self):
+        """Read until the pty has nothing more.
+
+        A read that finds a pty master empty has first waited for the kernel
+        to carry across whatever the station had written, so when this returns
+        everything the station wrote before it was called has been read and
+        handed on."""
+        while self.reading and self.read_once():
+            pass
+
+    def read_once(self):
+        """One read of the pty and what it delivers; False when it had
+        nothing."""
         try:
             data = os.read(self.master, 65536)
         except BlockingIOError:
-            return
+            return False
         except OSError:
             data = b""          # the station let go of the far end
         if not data:
             self.stop_reading()
             self.main.call_soon_threadsafe(self.station.pty_closed, self)
-            return
+            return False
         loop = asyncio.get_running_loop()
         text, frames = self.demux.feed(data, loop.time())
         self.deliver(text, frames)
         if self.demux.pending and self.resync is None:
             self.resync = loop.call_later(rpc_module.RESYNC_S, self.resync_due)
+        return True
 
     def resync_due(self):
         self.resync = None
@@ -225,7 +264,7 @@ class Station:
         self.proc = None
         self.log_file = None
         self.status = STOPPED
-        self.transport = None           # whether it forwards, as last read; None unknown
+        self.role = None                # what it does for the mesh, as its kind last read it
         # Whether this station had been through a first boot when it was last
         # started. Sampled at the fork, because the station writes `state/boot`
         # moments later and the answer the setup step needs is the one from
@@ -237,6 +276,10 @@ class Station:
         self.drain = None               # this start's reader, on the pty thread
         self.rpc = None                 # framed RPC on the pty, one per start
         self.outbox = bytearray()       # console bytes the pty has not taken yet
+        self.typed = 0                  # console bytes typed at it this start
+        self.syncing = False            # waiting for the ether before typing them
+        self.starts = 0                 # how many times the process has been started
+        self.cpu = None                 # the one CPU all its threads run on, kept across restarts
 
     # ---- identity --------------------------------------------------------
 
@@ -289,15 +332,22 @@ class Station:
         self.master = master
         if self.rpc is not None:
             self.rpc.close()
-        self.rpc = rpc_module.RpcClient(self.write)
+        self.rpc = rpc_module.RpcClient(
+            self.write, self.clock.sleep if self.clock is not None else None)
         self.outbox.clear()
+        self.typed = 0
+        self.syncing = False
+        self.starts += 1
         self.set_status(STARTING)
         if self.clock is not None:
             self.clock.expect(self.node_id)
+        if self.cpu is None:
+            self.cpu = next_cpu()
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 self.kind.elf, cwd=self.dir, env=self.env(),
-                stdin=slave, stdout=slave, stderr=slave)
+                stdin=slave, stdout=slave, stderr=slave,
+                preexec_fn=functools.partial(os.sched_setaffinity, 0, (self.cpu,)))
         except OSError:
             if self.clock is not None:
                 self.clock.leave(self.node_id)
@@ -344,20 +394,27 @@ class Station:
         What the pty will not take now waits for it, in order: a frame cut
         short would read as a corrupt one.
         """
-        if self.master is None:
+        if self.master is None or not data:
             return
-        if self.outbox:
-            self.outbox += data
+        self.outbox += data
+        if self.clock is not None:
+            # A virtual run: the ether holds T from now until the station has
+            # read these bytes, and they go out once the station has the T
+            # the run has, so a line typed at an instant is read at it.
+            self.typed += len(data)
+            self.clock.typed(self.node_id, self.typed)
+            if not self.syncing:
+                self.syncing = True
+                start = self.starts
+                self.clock.sync(self.node_id, lambda: self.synced(start))
             return
-        try:
-            sent = os.write(self.master, data)
-        except BlockingIOError:
-            sent = 0
-        except OSError:
-            return
-        if sent < len(data):
-            self.outbox += data[sent:]
-            asyncio.get_running_loop().add_writer(self.master, self.writable)
+        self.writable()
+
+    def synced(self, start):
+        if start != self.starts:
+            return          # a start that has ended
+        self.syncing = False
+        self.writable()
 
     def writable(self):
         if self.master is None:
@@ -365,12 +422,15 @@ class Station:
         try:
             sent = os.write(self.master, bytes(self.outbox))
         except BlockingIOError:
-            return
+            sent = 0
         except OSError:
             sent = len(self.outbox)
         del self.outbox[:sent]
-        if not self.outbox:
-            asyncio.get_running_loop().remove_writer(self.master)
+        loop = asyncio.get_running_loop()
+        if self.outbox:
+            loop.add_writer(self.master, self.writable)
+        else:
+            loop.remove_writer(self.master)
 
     def resize(self, cols, rows):
         """Tell the station's console how wide its terminal is."""

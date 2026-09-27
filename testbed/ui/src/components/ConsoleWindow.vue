@@ -21,11 +21,13 @@
  * would deliver them, so nothing a person can type is special to the
  * transport; the terminal's size goes the other way as a JSON text frame. */
 import { ref, watch, onUnmounted, nextTick } from 'vue'
-import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
+import FloatingWindow from './FloatingWindow.vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { useSim } from '../stores/sim'
 
+const sim = useSim()
 const props = defineProps<{ name: string; visible: boolean }>()
 defineEmits<{ 'update:visible': [value: boolean] }>()
 
@@ -52,8 +54,7 @@ function open() {
   fit.fit()
   term.focus()      // a console you just opened is one you want to type into
 
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  socket = new WebSocket(`${proto}//${location.host}/ws/console/${props.name}`)
+  socket = new WebSocket(sim.consoleUrl(props.name))
   socket.binaryType = 'arraybuffer'
   socket.onopen = () => sendSize()
   socket.onmessage = (event) => {

@@ -1,9 +1,8 @@
 """Sergeyculum, the Rust Reticulum stack at git.emcomm.cc/berlinmesh/reticulum,
 as its Linux station `fw/simesh`. The kind is named after the repository.
 
-Spec keys beyond the common ones:
-
-    tools: { rncfg: <path> }    its configuration tool; `rncfg` on PATH when absent
+Its device names its configuration tool among its tools, `tools: { rncfg:
+<path> }`; `rncfg` on PATH when it names none.
 
 A station of this kind has no text console and no web UI. Its host door is
 RNode KISS on a pty it makes itself and links as `kiss` in its directory; the
@@ -11,16 +10,30 @@ console (stdout) carries its log lines. It is configured with `rncfg`, one
 invocation per line, the way a person configures a Sergeyculum board over USB.
 Its key-value writes are synchronous, so there is nothing to flush.
 
-A setup line is `rncfg` without the program and the port: `<verb> <args…>`,
-and the port goes in after the verb, which is where `rncfg` has it
-(`rncfg <verb> <PORT> …`). So `set --freq-hz 869525000 --sf 8` runs
-`rncfg set <dir>/kiss --freq-hz 869525000 --sf 8`, and `name set {name}`
-names the station.
+A line is `rncfg` without the program and the port: `<verb> <args…>`, and
+the port goes in after the verb, which is where `rncfg` has it (`rncfg <verb>
+<PORT> …`). So `set --freq-hz 869525000 --sf 8` runs `rncfg set <dir>/kiss
+--freq-hz 869525000 --sf 8`, and `name set {name}` names the station.
+
+Its intents, in `rncfg`'s words:
+
+    name        name set {name}
+    radio       set --freq-hz --sf --bw-hz --cr --txpower-dbm, for the figures
+                the radio gives; sync word and preamble are the firmware's own
+                (0x12, 18) and not settable
+    role        transport on (transport) or off (client); the firmware keeps
+                this in RAM only, so it is said again at every boot, not only
+                at setup (`role_volatile`)
+    announce    announce now
+    message     send <dest> <text>
+
+and its address is the `lxmf.delivery` line of `rncfg addr`.
 
 What `rncfg` prints, read from tools/rncfg/src/main.rs:
 
     detect:           `DETECT   : ok (0x..)` when the station answers
     transport [get]:  `transport: on` | `transport: off`
+    addr:             `lxmf.delivery     : <32 hex digits>` among others
     a failure:        `error: …` on stderr, exit status 1
 """
 
@@ -34,6 +47,10 @@ from . import CommandError, Kind, run_tool
 
 DETECT_OK = re.compile(r"^DETECT\s*:\s*ok", re.MULTILINE)
 TRANSPORT = re.compile(r"^transport:\s*(on|off)\s*$", re.MULTILINE)
+DELIVERY = re.compile(r"^lxmf\.delivery\s*:\s*([0-9a-f]{32})", re.MULTILINE)
+# The radio's figures as `rncfg set` takes them, and the scale from the nodeset's units.
+RADIO_FLAGS = (("freq_mhz", "--freq-hz", 1e6), ("sf", "--sf", 1), ("bw_khz", "--bw-hz", 1e3),
+               ("cr", "--cr", 1), ("tx_dbm", "--txpower-dbm", 1))
 
 TOOL_TIMEOUT_S = 10.0       # one rncfg invocation, KISS round trips included
 TOOL_TRIES = 3              # in a virtual-time run, a line whose reply timed out is tried again
@@ -42,11 +59,11 @@ POLL_S = 0.5                # how often a booting station is asked whether it is
 
 class Berlinmesh(Kind):
     type_name = "berlinmesh"
+    role_volatile = True
 
-    def __init__(self, name, spec, scenario_dir):
-        super().__init__(name, spec, scenario_dir)
-        tools = self.spec.get("tools") or {}
-        self.rncfg = self.path(tools.get("rncfg")) or shutil.which("rncfg")
+    def __init__(self, device):
+        super().__init__(device)
+        self.rncfg = self.tools.get("rncfg") or shutil.which("rncfg")
         # One rncfg at a time per station: two on one pty interleave their
         # KISS frames and both read garbage.
         self.locks = {}
@@ -104,10 +121,32 @@ class Berlinmesh(Kind):
             raise CommandError(out.strip() or "rncfg exited %d" % code)
         return out
 
-    async def transport(self, station):
+    async def role(self, station):
+        """`transport` while `rncfg transport get` says on, else `client`."""
         code, out = await self.rncfg_run(station, "transport", ["get"])
         found = TRANSPORT.search(out) if code == 0 else None
-        return None if found is None else found.group(1) == "on"
+        if found is None:
+            return None
+        return "transport" if found.group(1) == "on" else "client"
+
+    async def address(self, station):
+        found = DELIVERY.search(await self.run(station, "addr"))
+        return found.group(1) if found else None
+
+    def lines(self, verb, **args):
+        if verb == "name":
+            return ["name set {name}"]
+        if verb == "radio":
+            flags = ["%s %d" % (flag, round(args[key] * scale)) for key, flag, scale in RADIO_FLAGS
+                     if args.get(key) is not None]
+            return ["set " + " ".join(flags)] if flags else []
+        if verb == "role":
+            return ["transport %s" % ("on" if args["role"] == "transport" else "off")]
+        if verb == "announce":
+            return ["announce now"]
+        if verb == "message":
+            return ["send %s %s" % (args["dest"], args["text"])]
+        return super().lines(verb, **args)
 
     def configured(self, station):
         state = os.path.join(station.dir, "state")

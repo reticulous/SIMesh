@@ -31,10 +31,15 @@ the shipping code, on both sides.
 """
 
 import asyncio
+import contextlib
+import json
 import re
 import socket
 import struct
 import time
+
+import aiohttp
+import aiohttp.web
 
 STUN_MAGIC = 0x2112A442
 STUN_USERNAME = 0x0006
@@ -162,6 +167,28 @@ class Relay(asyncio.DatagramProtocol):
     def forget(self, ufrag):
         self.stations.pop(ufrag, None)
 
+    def claim(self, text, station_host, station_port, learned):
+        """Point one signalling message at the relay, if it is an SDP answer.
+
+        The answer's ufrag is tied to where the DataChannel behind it really
+        is, and added to `learned` so the session can let go of it when the
+        signalling closes. Anything that is not an answer passes unchanged.
+        """
+        try:
+            message = json.loads(text)
+        except ValueError:
+            return text
+        if not isinstance(message, dict) or message.get("type") != "answer" \
+                or not message.get("sdp"):
+            return text
+        sdp = message["sdp"]
+        ufrag = answer_ufrag(sdp)
+        if ufrag:
+            self.learn(ufrag, station_host, station_port)
+            learned.append(ufrag)
+        message["sdp"] = rewrite_answer(sdp, self.advertise_host, self.advertise_port)
+        return json.dumps(message)
+
     # ---- the socket ----
 
     def connection_made(self, transport):
@@ -225,6 +252,80 @@ class Relay(asyncio.DatagramProtocol):
         self.flows.clear()
         if self.transport is not None:
             self.transport.close()
+
+
+# ---- signalling ----------------------------------------------------------
+
+async def bridge(request, upstream_url, relay, station_host, station_port, who,
+                 pass_host=False):
+    """Stand in the middle of one WebRTC signalling session.
+
+    Terminated on both sides rather than pumped as bytes, so the SDP answer
+    arrives as a parsed message and can be pointed at `relay`, which learns
+    that the session's DataChannel is at `station_host:station_port`.
+    Everything else is passed through exactly as it came: the relay is not a
+    participant, and the offer, the answer's fingerprint and the DTLS behind
+    it are all the station's own. `who` names the station in the log.
+
+    The browser's credentials go up with it. Signalling is behind the
+    station's own login, and a relay that dropped the session cookie would be
+    asking the station to talk to a stranger. `pass_host` sends the browser's
+    `Host` too, for an upstream that is another relay: the name is how it
+    knows which station is meant.
+    """
+    passed = {name: request.headers[name]
+              for name in ("Cookie", "Authorization", "Origin")
+              + (("Host",) if pass_host else ())
+              if name in request.headers}
+
+    browser = aiohttp.web.WebSocketResponse(heartbeat=30)
+    await browser.prepare(request)
+    learned = []
+    session = aiohttp.ClientSession()
+    try:
+        async with session.ws_connect(upstream_url, headers=passed) as upstream:
+
+            async def to_station():
+                async for message in browser:
+                    if message.type is aiohttp.WSMsgType.TEXT:
+                        await upstream.send_str(message.data)
+                    elif message.type is aiohttp.WSMsgType.BINARY:
+                        await upstream.send_bytes(message.data)
+
+            async def to_browser():
+                async for message in upstream:
+                    if message.type is aiohttp.WSMsgType.TEXT:
+                        await browser.send_str(relay.claim(
+                            message.data, station_host, station_port, learned))
+                    elif message.type is aiohttp.WSMsgType.BINARY:
+                        await browser.send_bytes(message.data)
+                if upstream.close_code not in (None, 1000, 1001):
+                    _log("signalling: %s closed upstream (%s)"
+                         % (who, upstream.close_code))
+
+            # Whichever side ends first ends the session: the station allows
+            # one at a time and frees its handle when the signalling closes,
+            # so a half that kept waiting on the other would leave the station
+            # busy for a browser that had already gone.
+            halves = [asyncio.ensure_future(to_station()),
+                      asyncio.ensure_future(to_browser())]
+            finished, pending = await asyncio.wait(
+                halves, return_when=asyncio.FIRST_COMPLETED)
+            for half in pending:
+                half.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await half
+            for half in finished:
+                if half.exception() is not None:
+                    _log("signalling for %s: %r" % (who, half.exception()))
+            await upstream.close()
+    except (aiohttp.ClientError, OSError) as err:
+        _log("signalling for %s: %s" % (who, err))
+    finally:
+        await session.close()
+        for ufrag in learned:
+            relay.forget(ufrag)
+    return browser
 
 
 async def serve(bind_host, bind_port, advertise_host, advertise_port):

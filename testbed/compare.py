@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Two runs of one scenario, side by side, from their records.
+"""Two runs of one nodeset and script, side by side, from their records.
 
-    compare.py A/record.tsv B/record.tsv --scenario A/scenario.yaml
-    compare.py A/record.tsv --scenario A/scenario.yaml          one run's figures
+    compare.py RUN_A RUN_B [--labels A,B] [--cli A.json B.json] [--logs]
+                           [--until S] [--starts S,S]
+    compare.py RUN_A                                            one run's figures
 
-A run in real time and a run in virtual time are the same network only if the
-same things happen in both. Frame for frame they cannot agree — the firmware
-draws its own random numbers — so this compares what a run achieves and when:
+Each RUN is a run directory: its `record.tsv` is read, and the first run's
+nodeset names the stations. A run in real time and a run in virtual time are
+the same network only if the same things happen in both. Frame for frame
+they cannot agree — the firmware draws its own random numbers — so this
+compares what a run achieves and when. What a frame is (an announce, its
+destination and hop count) is Reticulum's reading of it
+(`simesh.reticulum.frames`):
 
 - per station: when it joined the ether, when its radio first listened, the
   announces it originated and forwarded, its frames by type, and how many of
@@ -14,30 +19,30 @@ draws its own random numbers — so this compares what a run achieves and when:
 - per pair: the fewest hops at which one station heard the other's
   announces, which is the path the record shows it could have learned;
 - milestones on the run's own clock, from the first hello (or from the zero
-  `--starts` gives each run, such as the instant its scenario loaded): the
-  last station to join, the last radio to listen, the first announce of the
-  last station to announce, and the first path at each hop count.
+  `--starts` gives each run, such as the instant it was loaded): the last
+  station to join, the last radio to listen, the first announce of the last
+  station to announce, and the first path at each hop count.
 
 With `--cli A.json B.json`, each run's final `rnpath` answers (a JSON object,
 station name to what it printed) are compared too: paths known by hop count.
-With `--logs A B`, each run's directory, the messages its senders logged as
-delivered are counted as well. `--until S` keeps the first S seconds of each
-run, so a record that ran on while its run was being stopped does not count
-the extra.
+With `--logs`, the LXMF messages each run's senders logged as delivered
+(`simesh.reticulum.delivery.log_deliveries`) are counted as well. `--until S`
+keeps the first S seconds of each run, so a record that ran on while its run
+was being stopped does not count the extra.
 """
 
 import argparse
+import base64
 import collections
 import json
-import os
 import re
 import sys
 import time
 
-SIM_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SIM_DIR)
-
-import seq  # noqa: E402
+from simesh import record as record_module
+from simesh.reticulum import delivery
+from simesh.reticulum import frames as rframes
+from simesh.view import RunView
 
 KINDS = ("ANNOUNCE", "DATA", "LINKREQUEST", "PROOF")
 
@@ -69,7 +74,7 @@ class Run:
         self.read()
 
     def stamp(self, text):
-        return seq.parse_time(text)
+        return record_module.parse_time(text)
 
     def wall_of(self, text):
         """The wall-clock instant of a real run's stamp; None for T."""
@@ -81,8 +86,8 @@ class Run:
         return when.timestamp()
 
     def read(self):
-        halves = set()
-        arriving = {}                       # ether frame id -> (sender, payload, when)
+        halves = rframes.Halves()
+        arriving = {}                     # ether frame id -> (sender, payload, when)
         with open(self.path, encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("#"):
@@ -132,20 +137,15 @@ class Run:
             self.joined = {s: t - self.t0 for s, t in self.joined.items()}
 
     def transmitted(self, sid, msg, at, halves, arriving):
-        frame = seq.Frame(at, sid, msg)
-        payload = frame.payload
-        if payload and payload[0] & seq.RNODE_FLAG_SPLIT and payload[0] not in seq.SUPE_TYPE:
-            frame.part = 2 if sid in halves else 1
-            halves.symmetric_difference_update({sid})
-        label = frame.label
+        payload = base64.b64decode(msg.get("payload") or "")
+        part = halves.part(sid, payload)
+        label = rframes.read_frame(payload, part)
         kind = label.split()[0] if label else "?"
-        if kind == "SUPE":
-            kind = "SUPE"
-        elif kind not in KINDS:
+        if kind not in KINDS and kind != "SUPE":
             kind = "other"
         self.tx[sid] += 1
         self.types[sid][kind] += 1
-        info = self.announce(payload, frame.part)
+        info = rframes.announce(payload, part)
         if info is not None:
             dest, hops = info
             if hops == 0:
@@ -159,21 +159,6 @@ class Run:
         # this frame's.
         self.last_tx = (sid, info, at)
 
-    @staticmethod
-    def announce(payload, part):
-        """(destination, hops) of an announce frame, else None."""
-        if part == 2 or not payload or payload[0] in seq.SUPE_TYPE:
-            return None
-        body = payload[1:]
-        if len(body) < 19 or body[0] & 0x80:
-            return None
-        flags = body[0]
-        if flags & 0x03 != 1:
-            return None
-        hdr2 = bool(flags & 0x40)
-        dest = body[2 + (16 if hdr2 else 0):][:16]
-        return dest.hex(), body[1]
-
     def received(self, rsid, msg, at, arriving):
         verdict = msg.get("verdict")
         eid = msg.get("id")
@@ -184,7 +169,6 @@ class Run:
             self.rx_crc[rsid] += 1
         frame = arriving.get(eid)
         if frame is None:
-            import base64
             raw = base64.b64decode(payload)
             frame = (self.sender_of(eid), raw)
             arriving[eid] = frame
@@ -194,7 +178,7 @@ class Run:
                 arriving[(eid, "crc")] = True
                 self.collided[sender] += 1
             return
-        info = self.announce(raw, 0)
+        info = rframes.announce(raw, 0)
         if info is None:
             return
         dest, hops = info
@@ -250,43 +234,16 @@ def rx_senders(path):
     return senders
 
 
-LOG_STAMP = re.compile(r"(\w{3}) +(\d+) (\d\d):(\d\d):(\d\d\.\d+)")
-MONTHS = {m: i for i, m in enumerate(
-    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
-
-
 def log_deliveries(run_dir, run):
-    """Each reticulous sender's `DIRECT delivered` lines, on the run's clock.
+    """Each sender's delivered messages, on the run's clock.
 
     A station stamps its log from time(), which in a virtual-time run is the
     run's epoch plus node time and in a real one the wall clock, so either
     way the stamp less the first hello's wall-clock instant is run time.
     """
-    import calendar
-    out = {}
-    nodes = os.path.join(run_dir, "nodes")
-    if not os.path.isdir(nodes) or run.hello_wall is None:
-        return out
-    year = run.year
-    for name in sorted(os.listdir(nodes)):
-        path = os.path.join(nodes, name, "log")
-        if not os.path.isfile(path):
-            continue
-        times = []
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if "DIRECT delivered" not in line and "DIRECT resource delivered" not in line:
-                    continue
-                m = LOG_STAMP.search(line)
-                if not m:
-                    continue
-                mon, day, hh, mm, ss = m.groups()
-                wall = calendar.timegm((year, MONTHS.get(mon, 1), int(day), int(hh), int(mm), 0)) \
-                    + float(ss)
-                times.append(wall - run.hello_wall)
-        if times:
-            out[name] = times
-    return out
+    if run.hello_wall is None:
+        return {}
+    return delivery.log_deliveries(run_dir, run.hello_wall, run.year)
 
 
 def cli_paths(path):
@@ -409,22 +366,25 @@ def report(runs, labels, cli=None, deliveries=None):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="compare two runs of one scenario")
-    ap.add_argument("records", nargs="+", help="one or two record.tsv files")
-    ap.add_argument("--scenario", required=True, help="the scenario, to name the stations")
+    ap = argparse.ArgumentParser(description="compare two runs of one nodeset and script")
+    ap.add_argument("runs", nargs="+", help="one or two run directories")
     ap.add_argument("--labels", default="A,B")
-    ap.add_argument("--cli", nargs="*", help="gathered rnpath JSON, one per record")
+    ap.add_argument("--cli", nargs="*", help="gathered rnpath JSON, one per run")
     ap.add_argument("--until", type=float, help="only the first this many seconds of each run")
-    ap.add_argument("--logs", nargs="*",
-                    help="each record's run directory, for the stations' logs")
+    ap.add_argument("--logs", action="store_true",
+                    help="count the LXMF messages each run's senders logged as delivered")
     ap.add_argument("--starts", help="each run's zero, comma separated, in its record's "
                                      "stamps: T in seconds for a virtual run, the time of "
                                      "day in seconds for a real one (default: the first hello)")
     args = ap.parse_args(argv)
-    names = seq.read_scenario(args.scenario)
+    if len(args.runs) > 2:
+        ap.error("one or two runs")
+    views = [RunView(d) for d in args.runs]
+    names = views[0].names
     runs = []
     starts = [float(s) for s in args.starts.split(",")] if args.starts else []
-    for i, path in enumerate(args.records):
+    for i, view in enumerate(views):
+        path = view.record_path
         senders = rx_senders(path)
         run = Run.__new__(Run)
         run.sender_of = senders.get
@@ -437,8 +397,8 @@ def main(argv=None):
     deliveries = None
     if args.logs:
         deliveries = []
-        for run, run_dir in zip(runs, args.logs):
-            found = log_deliveries(run_dir, run)
+        for run, view in zip(runs, views):
+            found = log_deliveries(view.dir, run)
             if args.until is not None:
                 found = {k: [t for t in v if t <= args.until] for k, v in found.items()}
                 found = {k: v for k, v in found.items() if v}

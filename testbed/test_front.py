@@ -1,0 +1,540 @@
+"""The front's routing, its estimate, the WebRTC relay one level up, the
+loss tables before a child starts, the editors and imports over its own
+socket and HTTP, coverage through a planner of the test's own, and the
+planner sidecar behind /planner."""
+
+import asyncio
+import io
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import zipfile
+
+import aiohttp
+import pytest
+import yaml
+from aiohttp import web
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import coverage  # noqa: E402
+import devices  # noqa: E402
+import front  # noqa: E402
+import geodata  # noqa: E402
+import proxy  # noqa: E402
+import store  # noqa: E402
+import webrtc  # noqa: E402
+
+BERLIN_PACK = os.path.join(geodata.PACKS_DIR, "berlin-city")
+
+
+class Args:
+    public_port = "8800"
+    child_args = []
+    bind = "127.0.0.1:0"
+    relay_host = "127.0.0.1"
+    relay_port = 0
+
+
+def make_front():
+    return front.Front(Args())
+
+
+def make_child(f, name, state="running", port=9100):
+    child = front.Child(f, name, port, 7100, "127.16.0.0/22", "max", None)
+    child.state = state
+    f.children[name] = child
+    return child
+
+
+# ---- hostnames -------------------------------------------------------------
+
+def test_a_label_is_a_station_or_a_station_of_a_simulation():
+    assert proxy.label_of(b"alpha.sim.localhost:8800") == "alpha"
+    assert proxy.label_of(b"Alpha.Lora.sim.localhost") == "alpha.lora"
+    assert proxy.label_of(b"a.b.c.sim.localhost") is None
+    assert proxy.label_of(b"localhost:8800") is None
+    assert proxy.resolve_by_id("3.lora")[1] == proxy.STATION_PORT
+
+
+def test_the_second_label_picks_the_simulation():
+    async def go():
+        f = make_front()
+        f.control_port = 1234
+        make_child(f, "lora", port=9100)
+        make_child(f, "supe", port=9101)
+        assert f.resolve_host("alpha.supe", "/") == ("127.0.0.1", 9101)
+        assert f.resolve_host("alpha.lora", "/x") == ("127.0.0.1", 9100)
+        # Signalling stays with the front, which points the answer at itself.
+        assert f.resolve_host("alpha.lora", "/webrtc?x=1") == ("127.0.0.1", 1234)
+        assert f.resolve_host(None, "/") == ("127.0.0.1", 1234)
+        refused = f.resolve_host("alpha.nope", "/")
+        assert isinstance(refused, proxy.Refusal) and "nope" in refused.text
+        # Bare names are ambiguous with two running, and say which exist.
+        refused = f.resolve_host("alpha", "/")
+        assert isinstance(refused, proxy.Refusal) and "lora, supe" in refused.text
+        f.children["supe"].state = "exited"
+        assert f.resolve_host("alpha", "/") == ("127.0.0.1", 9100)
+        assert isinstance(f.resolve_host("alpha.supe", "/"), proxy.Refusal)
+    asyncio.run(go())
+
+
+def test_allocation_steps_around_live_children_and_reuses_exited_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(front, "NET_LOCK_DIR", str(tmp_path / "nets"))
+
+    async def go():
+        f = make_front()
+        first = f.allocate()
+        child = front.Child(f, "a", first[0], first[1], first[2], "real", None)
+        f.children["a"] = child
+        second = f.allocate()
+        assert second[0] != first[0] and second[1] != first[1] and second[2] != first[2]
+        child.state = "exited"
+        assert f.allocate()[2] == first[2]
+        assert f.free_name("City99 LoRa") == "city99-lora"
+        assert f.free_name("a") == "a-2"
+    asyncio.run(go())
+
+
+def test_two_fronts_on_one_host_never_give_out_the_same_network(tmp_path, monkeypatch):
+    """Neither front's stations have bound anything yet, so only the
+    host-wide lock keeps them apart; the block comes back when the
+    simulation holding it ends."""
+    monkeypatch.setattr(front, "NET_LOCK_DIR", str(tmp_path / "nets"))
+    monkeypatch.setattr(front, "bound_addresses", lambda: set())
+
+    async def go():
+        one, two = make_front(), make_front()
+        first = one.allocate()
+        child = front.Child(one, "a", first[0], first[1], first[2], "real", None)
+        one.children["a"] = child
+        second = two.allocate()
+        assert second[2] != first[2]
+        child.state = "exited"
+        one.children.pop("a")
+        one.child_gone(child)
+        two.release_net(second[2])
+        assert two.allocate()[2] == first[2]
+    asyncio.run(go())
+
+
+def test_a_network_with_a_bound_address_is_stepped_around(tmp_path, monkeypatch):
+    monkeypatch.setattr(front, "NET_LOCK_DIR", str(tmp_path / "nets"))
+    monkeypatch.setattr(front, "bound_addresses", lambda: {"127.16.0.1"})
+
+    async def go():
+        assert make_front().allocate()[2] != "127.16.0.0/22"
+    asyncio.run(go())
+
+
+# ---- the estimate ----------------------------------------------------------
+
+def test_the_estimate_follows_the_plan_at_the_pace_of_the_window():
+    async def go():
+        f = make_front()
+        child = make_child(f, "lora")
+        plan = {"t": 0, "phases": [{"name": "warm-up", "until": 600_000_000},
+                                   {"name": "traffic", "until": 4_200_000_000}]}
+        # Ten seconds of wall at 10x: T went 100 s.
+        wall = time.monotonic()
+        child.samples.extend([(wall - 10.0, 900_000_000)])
+        child.clocked({"mode": "virtual", "rate": 10, "t": 1_000_000_000, "plan": plan})
+        child.samples[-1] = (wall, 1_000_000_000)
+        assert abs(child.pace() - 10.0) < 1e-6
+        est = child.estimate()
+        assert est["phase"]["name"] == "traffic"
+        assert est["phase"]["from"] == 600_000_000
+        # 3200 s of T left at 10x is 320 s of wall.
+        assert abs(est["eta"] - (time.time() + 320.0)) < 2.0
+        assert not est["done"]
+        child.clocked({"mode": "virtual", "rate": 10, "t": 5_000_000_000, "plan": plan})
+        est = child.estimate()
+        assert est["phase"] is None and est["done"] and est["eta"] is None
+    asyncio.run(go())
+
+
+def test_no_plan_is_no_estimate_and_real_time_is_pace_one():
+    async def go():
+        child = make_child(make_front(), "lora")
+        child.clocked({"mode": "real", "rate": 1, "t": 5})
+        assert child.pace() == 1.0
+        assert child.estimate() == {"plan": None, "phase": None, "eta": None}
+        child.heard({"type": "snapshot", "run": {"geodata": "g", "nodeset": "n", "script": "s",
+                                                 "dir": "/r"}, "nodeset": {"dirty": True}})
+        row = child.summary()
+        assert (row["geodata"], row["nodeset"], row["script"], row["dirty"]) == ("g", "n", "s", True)
+    asyncio.run(go())
+
+
+# ---- WebRTC through two relays ---------------------------------------------
+
+def binding_request(username):
+    attr = username.encode()
+    body = struct.pack("!HH", webrtc.STUN_USERNAME, len(attr)) + attr
+    body += b"\0" * (-len(attr) % 4)
+    return struct.pack("!HHI", 0x0001, len(body), webrtc.STUN_MAGIC) + b"\1" * 12 + body
+
+
+ANSWER = ('{"type":"answer","sdp":"v=0\\r\\na=ice-lite\\r\\n'
+          'm=application 4433 UDP/DTLS/SCTP webrtc-datachannel\\r\\n'
+          'c=IN IP4 127.20.0.5\\r\\na=ice-ufrag:725D\\r\\n'
+          'a=candidate:1 1 UDP 2130706431 127.20.0.5 4433 typ host\\r\\n"}')
+
+
+def test_a_flow_crosses_the_front_and_the_child_to_the_station():
+    """The answer is claimed twice, as it passes each relay on its way out,
+    and the browser's first packet then finds the station through both."""
+    async def go():
+        loop = asyncio.get_running_loop()
+        station = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        station.bind(("127.0.0.1", 0))
+        station.setblocking(False)
+        station_port = station.getsockname()[1]
+
+        child = await webrtc.serve("127.0.0.1", 0, "127.0.0.1", 0)
+        child_port = child.transport.get_extra_info("sockname")[1]
+        child.advertise_port = child_port
+        outer = await webrtc.serve("127.0.0.1", 0, "127.0.0.1", 0)
+        outer_port = outer.transport.get_extra_info("sockname")[1]
+        outer.advertise_port = outer_port
+
+        learned = []
+        seen_by_front = child.claim(ANSWER, "127.0.0.1", station_port, learned)
+        seen_by_browser = outer.claim(seen_by_front, "127.0.0.1", child_port, learned)
+        assert "127.0.0.1 %d typ host" % outer_port in seen_by_browser
+        assert "127.20.0.5" not in seen_by_browser
+        assert learned == ["725D", "725D"]
+
+        browser = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        browser.bind(("127.0.0.1", 0))
+        browser.setblocking(False)
+        request = binding_request("725D:abcd")
+        await loop.sock_sendto(browser, request, ("127.0.0.1", outer_port))
+        data, via = await asyncio.wait_for(loop.sock_recvfrom(station, 2048), 2)
+        assert data == request
+        await loop.sock_sendto(station, b"reply", via)
+        data, sender = await asyncio.wait_for(loop.sock_recvfrom(browser, 2048), 2)
+        assert data == b"reply" and sender == ("127.0.0.1", outer_port)
+
+        for relay in (child, outer):
+            relay.close()
+        station.close()
+        browser.close()
+    asyncio.run(go())
+
+
+# ---- loss tables before a child starts -------------------------------------
+
+def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatch):
+    """losses.py runs as a subprocess on the repository's smoke4, its
+    progress goes out tagged with the simulation, and the run holds the
+    table, the script and the build it was given."""
+    monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+    build = tmp_path / "build.linux"
+    (build / "data_merged").mkdir(parents=True)
+    (build / "reticulous.elf").write_text("")
+
+    async def go():
+        f = make_front()
+        f.sidecars = front.Sidecars(None)
+        said = []
+        f.broadcast = said.append
+        tables = await f.compute_losses("plain-27", "smoke4", ["868"], None, {"sim": "t"})
+        path, cached = tables["868"]
+        assert os.path.isfile(path)
+        progress = [m for m in said if m["type"] == "losses_progress"]
+        assert cached or (progress[-1]["sim"] == "t"
+                          and progress[-1]["done"] == progress[-1]["total"] > 0)
+        spec = {"geodata": "plain-27", "nodeset": "smoke4", "script": "smoke4",
+                "build": str(build)}
+        run, sidecar = await f.prepare_run("t", spec)
+        assert sidecar is None and run.bands() == ["868"]
+        assert run.dir == str(tmp_path / "runs" / "t")
+        assert run.meta["builds"]["stable"]["elf"] == str(build / "reticulous.elf")
+        assert run.meta["nodeset"] == "smoke4" and run.meta["script"] == "smoke4"
+        assert run.script_path
+        again, _ = await f.prepare_run("t", spec)
+        assert again.dir == run.dir + "-2"
+        with pytest.raises(store.StoreError, match="no script"):
+            await f.prepare_run("u", dict(spec, script="nothere"))
+    asyncio.run(go())
+
+
+def test_a_pack_without_a_planner_is_refused_with_the_sentence(monkeypatch):
+    class Pack:
+        is_pack, pack_dir, name = True, "/nowhere/berlin-city", "berlin"
+
+    monkeypatch.setattr(front, "planner_web", lambda: None)
+
+    async def go():
+        cars = front.Sidecars(None)
+        with pytest.raises(store.StoreError) as err:
+            await cars.hold("conn:1", Pack())
+        assert str(err.value) == front.NO_PLANNER % "berlin"
+        assert not cars.by_pack
+    asyncio.run(go())
+
+
+def test_a_pack_is_refused_for_no_planner_before_its_manifest_is_read(tmp_path, monkeypatch):
+    """With no planner the pack is typically gone with it: the reason given
+    is the planner, not the manifest. With a planner, an unreadable manifest
+    is said as such, and synthetic ground works either way."""
+    ground = tmp_path / "geodata"
+    ground.mkdir()
+    (ground / "berlin.yaml").write_text("pack: %s\n" % (tmp_path / "gone"))
+    (ground / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
+    monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    monkeypatch.setattr(front, "planner_web", lambda: None)
+    with pytest.raises(store.StoreError) as err:
+        front.load_geodata("berlin")
+    assert str(err.value) == front.NO_PLANNER % "berlin"
+    with pytest.raises(store.StoreError) as err:
+        front.read_geodata(str(ground / "berlin.yaml"))
+    assert str(err.value) == front.NO_PLANNER % "berlin"
+    assert front.load_geodata("flat").kind == "synthetic"
+    monkeypatch.setattr(front, "planner_web", lambda: "/usr/bin/true")
+    with pytest.raises(store.StoreError, match="no readable manifest.json"):
+        front.load_geodata("berlin")
+
+
+# ---- the editors, over the front's own socket and HTTP ------------------------
+
+async def next_of(ws, kind, timeout=90):
+    while True:
+        msg = await ws.receive_json(timeout=timeout)
+        if msg.get("type") == kind:
+            return msg
+
+
+async def ask(ws, verb, **fields):
+    await ws.send_json({"type": verb, **fields})
+    return await next_of(ws, verb)
+
+
+@pytest.fixture
+def stores(tmp_path, monkeypatch):
+    for attr in ("GEODATA_DIR", "NODESETS_DIR", "SCRIPTS_DIR", "LOSSES_DIR", "RUNS_DIR",
+                 "SNAPSHOTS_DIR", "COVERAGE_DIR"):
+        path = tmp_path / attr.lower()
+        path.mkdir()
+        monkeypatch.setattr(store, attr, str(path))
+    monkeypatch.setattr(devices, "DEVICES_DIR", str(tmp_path / "devices"))
+    monkeypatch.setattr(devices, "BUILDS_DIR", str(tmp_path / "builds"))
+    monkeypatch.setattr(devices, "WEB_SOURCES", ())
+    monkeypatch.setattr(front, "planner_web", lambda: None)
+    monkeypatch.setattr(geodata, "PLANNER_DIR", str(tmp_path / "planner"))
+    monkeypatch.setattr(geodata, "PACKS_DIR", str(tmp_path / "packs"))
+    (tmp_path / "geodata_dir" / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
+    (tmp_path / "nodesets_dir" / "here.yaml").write_text(
+        "nodes:\n  a: { id: 1, lat: 0, lon: 0, tags: [x] }\n")
+    (tmp_path / "nodesets_dir" / "there.yaml").write_text(
+        "nodes:\n  a: { id: 1, lat: 52.5, lon: 13.4 }\n")
+    return tmp_path
+
+
+def running_front(check):
+    async def go():
+        f = make_front()
+        await f.open_sessions()
+        await f.start_http()
+        base = "http://127.0.0.1:%d" % f.control_port
+        try:
+            async with aiohttp.ClientSession() as session:
+                ws = await session.ws_connect(base + "/ws")
+                await check(f, session, base, ws)
+                await ws.close()
+        finally:
+            await f.shutdown()
+    asyncio.run(go())
+
+
+def test_the_editors_list_open_and_save(stores):
+    async def check(f, session, base, ws):
+        reply = await ask(ws, "geodata_list")
+        assert [g["name"] for g in reply["geodata"]] == ["flat"]
+        assert reply["geodata"][0]["kind"] == "synthetic"
+        reply = await ask(ws, "nodeset_list")
+        rows = {r["name"]: r for r in reply["nodesets"]}
+        assert rows["here"]["bbox"] == [0, 0, 0, 0] and rows["here"]["tags"] == {"x": 1}
+        reply = await ask(ws, "nodeset_list", geodata="flat")
+        rows = {r["name"]: r for r in reply["nodesets"]}
+        assert rows["here"]["inside"] and not rows["there"]["inside"]
+        reply = await ask(ws, "nodeset_save_as", name="copy",
+                          data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0}, "b": {"id": 2,
+                                "lat": 0.01, "lon": 0}}, "offsets": [
+                                    {"between": ["a", "b"], "db": 12, "note": "hill"}]})
+        assert reply["ok"] and reply["nodeset"]["offsets"][0]["note"] == "hill"
+        reply = await ask(ws, "nodeset_save_as", name="copy", data={"nodes": {}})
+        assert not reply["ok"] and "already" in reply["error"]
+        path = os.path.join(store.NODESETS_DIR, "here.yaml")
+        with open(path, "w") as handle:
+            handle.write("# the prose\n# kept\nnodes:\n  a: { id: 1, lat: 0, lon: 0 }\n")
+        reply = await ask(ws, "nodeset_save", name="here",
+                          data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0, "device": "dev"}}})
+        assert reply["ok"] and open(path).read().startswith("# the prose\n# kept\nnodes:\n")
+        reply = await ask(ws, "script_new", name="drive")
+        assert reply["ok"] and reply["script"]["main"] and "async def main" in reply["text"]
+        reply = await ask(ws, "script_save", name="drive", text="def (:\n")
+        assert not reply["ok"] and "line 1" in reply["error"]
+        reply = await ask(ws, "script_list")
+        assert [s["name"] for s in reply["scripts"]] == ["drive"]
+        reply = await ask(ws, "script_run", name="drive", sim="nothing")
+        assert not reply["ok"] and "not running" in reply["error"]
+        reply = await ask(ws, "geodata_new", name="hills",
+                          synthetic={"exponent": 3.3, "extent_m": 5000})
+        assert reply["ok"] and reply["geodata"]["extent_m"] == 5000
+        reply = await ask(ws, "coverage", geodata="flat", nodes=[])
+        assert not reply["ok"] and "synthetic" in reply["error"]
+        reply = await ask(ws, "device_list")
+        assert reply["ok"] and reply["devices"] == []
+        sims = await ask(ws, "sims")
+        assert "script_runs" in sims and sims["nodesets"] == ["copy", "here", "there"]
+    running_front(check)
+
+
+def device_zip(arch):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as zf:
+        zf.writestr("node.yaml", yaml.safe_dump({
+            "kind": "reticulous", "arch": arch, "stamp": "20260925035045",
+            "elf": "reticulous.elf", "stands_for": "ESP32"}))
+        zf.writestr("reticulous.elf", "x")
+    return out.getvalue()
+
+
+def test_a_device_and_a_pack_are_imported_over_http(stores):
+    arch = devices.machine_arch()
+
+    async def check(f, session, base, ws):
+        async with session.post(base + "/api/devices/import", params={"name": "mine.zip"},
+                                data=device_zip(arch)) as resp:
+            got = await resp.json()
+        assert got["ok"] and got["ref"] == \
+            "imported/reticulous_hw-simesh-%s_20260925035045" % arch
+        async with session.post(base + "/api/devices/import", params={"name": "x.zip"},
+                                data=device_zip(arch)) as resp:
+            got = await resp.json()
+        assert not got["ok"] and "already" in got["error"]
+        reply = await ask(ws, "device_list")
+        assert reply["devices"][0]["stands_for"] == "ESP32"
+
+        pack = io.BytesIO()
+        with zipfile.ZipFile(pack, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(
+                {"region": {"crs_epsg": 32633, "bbox": [13.3, 52.4, 13.5, 52.6]}}))
+        async with session.post(base + "/api/geodata/import", params={"name": "tiny"},
+                                data=pack.getvalue()) as resp:
+            got = await resp.json()
+        assert got["ok"] and got["geodata"]["kind"] == "pack"
+        assert os.path.isfile(os.path.join(geodata.packs_dir(), "tiny", "manifest.json"))
+        assert not [n for n in os.listdir(front.SIM_DIR) if n.startswith(".upload-")]
+    running_front(check)
+
+
+# ---- coverage, through a planner of the test's own ---------------------------
+
+def fake_planner(calls):
+    """/loss/start, /loss/status and /loss.bin as planner-web answers them:
+    one sweep, which is running for the first status and whole after."""
+    state = {"polls": 0, "radius": None}
+
+    async def start(request):
+        calls.append(("start", dict(request.query)))
+        state["radius"], state["polls"] = float(request.query["radius_km"]), 0
+        return web.json_response({"state": "running", "done": 0, "bands": 6})
+
+    async def status(request):
+        state["polls"] += 1
+        if state["polls"] < 2:
+            return web.json_response({"state": "running", "done": 3, "bands": 6})
+        return web.json_response({"state": "idle", "done": 6, "bands": 6,
+                                  "band_km": state["radius"]})
+
+    async def loss(request):
+        calls.append(("loss", dict(request.query)))
+        head = b"PLS2" + struct.pack("<II", 2, 1) + struct.pack("<4d", 0, 0, 1, 1)
+        return web.Response(body=head + struct.pack("<2H", 10000, 65535))
+
+    app = web.Application()
+    app.router.add_get("/loss/start", start)
+    app.router.add_get("/loss/status", status)
+    app.router.add_get("/loss.bin", loss)
+    return app
+
+
+def test_a_node_raster_is_swept_once_and_then_cached(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "COVERAGE_DIR", str(tmp_path / "coverage"))
+    monkeypatch.setattr(coverage, "POLL_S", 0.01)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "manifest.json").write_text(json.dumps(
+        {"region": {"crs_epsg": 32633, "bbox": [13.3, 52.4, 13.5, 52.6]}}))
+    gd = geodata.Geodata("berlin", {"pack": str(pack)})
+    node = {"name": "alex", "lat": 52.52, "lon": 13.41, "height_m": 20}
+    calls = []
+
+    async def go():
+        runner = web.AppRunner(fake_planner(calls))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        url = "http://127.0.0.1:%d" % site._server.sockets[0].getsockname()[1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                sweeps = coverage.Sweeps(session)
+                path = await sweeps.raster(url, gd, node)
+                assert open(path, "rb").read(4) == b"PLS2"
+                assert await sweeps.raster(url, gd, node) == path
+                moved = dict(node, height_m=25)
+                assert await sweeps.raster(url, gd, moved) != path
+        finally:
+            await runner.cleanup()
+    asyncio.run(go())
+    starts = [q for what, q in calls if what == "start"]
+    assert len(starts) == 2 and starts[0]["tx_h"] == "20" and starts[0]["rx_h"] == "2"
+    x, y = gd.to_xy(52.52, 13.41)
+    loss = [q for what, q in calls if what == "loss"][0]
+    assert float(loss["minx"]) == pytest.approx(x - 10000, abs=1e-3)
+    assert loss["w"] == str(coverage.CELLS)
+    assert coverage.key(gd, node) == coverage.key(gd, dict(node, tx_dbm=30))
+    with pytest.raises(store.StoreError):
+        coverage.cache_path("berlin", "../../etc/passwd")
+
+
+# ---- the planner behind /planner/<geodata>/ ----------------------------------
+
+def test_the_planner_is_started_for_a_pack_and_passed_through(tmp_path, monkeypatch):
+    if front.planner_web() is None or not os.path.isdir(BERLIN_PACK):
+        pytest.skip("no planner-web build in planner/ or no berlin-city pack in packs/")
+    ground = tmp_path / "geodata"
+    ground.mkdir()
+    (ground / "berlin.yaml").write_text("pack: %s\n" % BERLIN_PACK)
+    (ground / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
+    monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+
+    async def check(f, session, base, ws):
+        async with session.get(base + "/planner/berlin/api/pack") as resp:
+            assert resp.status == 404       # nobody holds the geodata yet
+        reply = await ask(ws, "geodata_open", name="flat")
+        assert reply["ok"] and reply["planner"] is None and not f.sidecars.by_pack
+        reply = await ask(ws, "geodata_open", name="berlin")
+        assert reply["ok"], reply
+        assert reply["planner"] == "/planner/berlin/"
+        assert reply["geodata"]["crs_epsg"] == 32633
+        async with session.get(base + "/planner/berlin/api/pack") as resp:
+            assert resp.status == 200
+            info = json.loads(await resp.text())
+        assert info["crs_epsg"] == 32633 and "extent" in info
+        car = next(iter(f.sidecars.by_pack.values()))
+        assert car.holders == {"conn:%d" % id(next(iter(f.conns)))}
+        await ws.close()
+        for _ in range(200):
+            if car.process.returncode is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert car.process.returncode is not None and not f.sidecars.by_pack
+    running_front(check)

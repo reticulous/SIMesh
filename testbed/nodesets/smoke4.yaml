@@ -1,0 +1,8 @@
+# smoke4: four stations
+# on plain-27; set up by script smoke4
+nodes:
+  n01: { id: 1, lat: 0.0077532, lon: -0.0459349, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: stable, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, tx_dbm: 14 }, tags: [lxmf] }
+  n02: { id: 2, lat: 0.0182173, lon: -0.022797, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: stable, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, tx_dbm: 14 }, tags: [supe, lxmf] }
+  n03: { id: 3, lat: -0.0761624, lon: 0.0220388, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: stable, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, tx_dbm: 14 }, tags: [rnode-tcp] }
+  n04: { id: 4, lat: 0.0591579, lon: -0.0853415, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: stable, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, tx_dbm: 14 }, tags: [supe, rnode-tcp] }
+offsets: []

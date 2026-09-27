@@ -1,0 +1,10 @@
+# mixed: three Reticulous stations and two berlinmesh ones on one channel
+# on plain-27; set up by script mixed
+nodes:
+  alpha: { id: 1, lat: 0, lon: 0, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: reticulous-workspace, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14, sync: 0x12, preamble: 18 }, tags: [] }
+  bravo: { id: 2, lat: 0, lon: 0.0090019, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: reticulous-workspace, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14, sync: 0x12, preamble: 18 }, tags: [] }
+  charlie: { id: 3, lat: 0, lon: 0.0180037, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: reticulous-workspace, role: transport, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14, sync: 0x12, preamble: 18 }, tags: [] }
+  sergey1: { id: 4, lat: 0, lon: -0.0004502, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: berlinmesh-workspace, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14 }, tags: [] }
+  sergey2: { id: 5, lat: 0, lon: 0.018454, height_m: 2, height_from: assumed, antenna: { gain_dbi: 0 }, device: berlinmesh-workspace, radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14 }, tags: [] }
+offsets:
+  - { between: [sergey1, sergey2], db: 80 }

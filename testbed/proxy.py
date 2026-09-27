@@ -19,6 +19,12 @@ same port as the stations it fronts: one listener, and the `Host` decides
 whether a request is for a station or for the map. Run alone, the proxy
 resolves station numbers and nothing else.
 
+A label may have two parts, `<station>.<simulation>`: the front routes on the
+second to a simulation's simd, and that simd's own proxy on the first.
+Everything without a label goes to the caller's own app, so the front's
+`/planner/<geodata>/…` pass-through to a planner sidecar is an ordinary route
+of that app, not this proxy's business.
+
 The request head is parsed only far enough to read `Host`; after it is
 forwarded the connection is a raw two-way byte pump, so keep-alive, chunked
 bodies and a WebSocket upgrade all pass through untouched.
@@ -32,7 +38,8 @@ import sys
 import stations as stations_module
 
 HOST_PATTERN = re.compile(rb"^host:[ \t]*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
-LABEL_PATTERN = re.compile(r"^([A-Za-z0-9-]{1,63})\.sim\.localhost$", re.IGNORECASE)
+LABEL_PATTERN = re.compile(r"^([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})?)\.sim\.localhost$",
+                           re.IGNORECASE)
 
 MAX_HEAD = 64 * 1024
 STATION_PORT = 80
@@ -44,7 +51,11 @@ def log(msg):
 
 
 def label_of(host_header):
-    """The `<label>` out of a `Host: <label>.sim.localhost[:port]`, or None."""
+    """The `<label>` out of a `Host: <label>.sim.localhost[:port]`, or None.
+
+    A label is one name, `alpha`, or a station and a simulation, `alpha.lora`,
+    which is how the front addresses a station of one of several simulations.
+    """
     name = host_header.decode("latin-1").strip()
     name = name.rsplit(":", 1)[0] if name.count(":") == 1 else name
     found = LABEL_PATTERN.match(name)
@@ -53,6 +64,7 @@ def label_of(host_header):
 
 def resolve_by_id(label, path=""):
     """The fallback resolver: a bare station number, and nothing else."""
+    label = label.split(".", 1)[0] if label else None
     if not label or not label.isdigit():
         return None
     node_id = int(label)
@@ -169,15 +181,17 @@ async def handle(client_reader, client_writer, resolve):
                     pass
 
 
-async def serve(host, port, resolve=resolve_by_id):
-    """Start the proxy and give back the server, for a caller to close."""
+async def serve(host, port, resolve=resolve_by_id, routes=None):
+    """Start the proxy and give back the server, for a caller to close.
+    `routes` says in the log where the resolver sends a station request."""
     async def on_client(reader, writer):
         await handle(reader, writer, resolve)
 
     server = await asyncio.start_server(on_client, host, port)
     bound = ", ".join("%s:%d" % s.getsockname()[:2] for s in server.sockets)
-    log("listening on %s, routing <name|id>.sim.localhost to the station's "
-        "own address in %s, port %d" % (bound, stations_module.NET, STATION_PORT))
+    log("listening on %s, routing %s" % (bound, routes or (
+        "<name|id>.sim.localhost to the station's own address in %s, port %d"
+        % (stations_module.NET, STATION_PORT))))
     return server
 
 
@@ -189,8 +203,8 @@ async def serve_forever(host, port, resolve=resolve_by_id):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="hostname-routing proxy for the stations")
-    ap.add_argument("--bind", default="0.0.0.0:9011",
-                    help="host:port to listen on (default 0.0.0.0:9011)")
+    ap.add_argument("--bind", default="0.0.0.0:8800",
+                    help="host:port to listen on (default 0.0.0.0:8800)")
     args = ap.parse_args(argv)
     host, _, port = args.bind.rpartition(":")
     try:

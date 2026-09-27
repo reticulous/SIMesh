@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Link geometry from an ether record and its scenario, and power by distance.
+"""Link geometry from a run's ether record, and power by distance.
 
-    links.py RECORD --scenario YAML [--from S] [--to S] [--min-clean N]
+    links.py RUN [--record PATH] [--from S] [--to S] [--min-clean N]
              [--calling HZ] [--all-carriers] [--power] [--json OUT]
 
 A **usable link** is an ordered pair (transmitter, receiver) with at least
 --min-clean (20) clean receptions inside [--from, --to), counted on the
-calling channel (--calling, 869.525 MHz by default) unless --all-carriers.
-For them:
+calling channel (--calling; by default the carrier most of the run's
+nodes declare) unless --all-carriers. For them:
 
 - distance of every usable one-way link: mean, minimum, p10, median, p90,
   maximum and a histogram in 200 m steps, and the share of links usable in
   both directions;
 - neighbours per station (the receivers of its usable links) with the
   nearest and farthest of them;
-- hop diameter over usable links both ways, and through transports only
-  (the stations whose last `transport_enabled` setup line is 1);
-- the scenario's own figures beside them: the range at which the ether's
-  formula puts a frame at the calling SF, bandwidth and power (from the
-  `lora 0 sf|bw|txp` setup lines) at the threshold, and the neighbour count
-  and diameter that range gives.
+- hop diameter over usable links both ways, and through forwarding
+  stations only (those whose declared role is transport);
+- the run's own medium beside them (`model`): the pairs the ether would
+  deliver on the calling channel by the run's loss table, offsets and
+  antenna gains, each transmitter at its declared power, SF and bandwidth, against the
+  noise figure the run's ether had; their count, distances, the neighbour
+  count and the diameter they give. A run with no table for the calling
+  channel's band has no model.
 
 --power adds, for frames off the calling channel (SUPE's traffic channels):
 transmit power by frame and by airtime (minimum, quartiles, maximum, a
@@ -31,8 +33,9 @@ the other station of its exchange when exactly two stations spoke in it,
 else the one station that received it cleanly; a frame with neither is left
 out of the distance table.
 
-Positions are projected as the ether projects them; distances are metres on
-that plane.
+Positions are the run's nodeset as it ended, in the geodata's metres
+(synthetic ground's nautical-mile metres, a pack's easting and northing);
+distances are metres on that plane.
 """
 import argparse
 import base64
@@ -40,15 +43,9 @@ import collections
 import hashlib
 import json
 import math
-import os
-import re
 import sys
 
-import yaml
-
-SIM_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SIM_DIR, "..", "ether"))
-import ether as E  # noqa: E402 - the path is set just above
+from simesh.view import RunView
 
 BIN_M = 200
 
@@ -62,40 +59,8 @@ def quantiles(values):
             "median": q(.5), "p75": q(.75), "p90": q(.9), "max": v[-1]}
 
 
-def radio_of(lines):
-    sf, bw, power = 8, 125_000, 14.0
-    for line in lines:
-        m = re.match(r"lora 0 (sf|bw|txp) (\d+(?:\.\d+)?)$", line.strip())
-        if m:
-            v = float(m.group(2))
-            if m.group(1) == "sf":
-                sf = int(v)
-            elif m.group(1) == "bw":
-                bw = int(v * 1000)
-            else:
-                power = v
-    return sf, bw, power
-
-
-def load_scenario(path):
-    if os.path.isdir(path):
-        path = os.path.join(path, "scenario.yaml")
-    data = yaml.safe_load(open(path))
-    origin = tuple(data["origin"])
-    pos, names, transport = {}, {}, set()
-    shared = list(data.get("setup") or [])
-    for name, node in data["nodes"].items():
-        sid = int(node["id"])
-        pos[sid] = E.project(origin, node["pos"][0], node["pos"][1])
-        names[sid] = name
-        t = [l for l in shared + list(node.get("setup") or []) if "transport_enabled" in l]
-        if t and t[-1].strip().endswith(" 1"):
-            transport.add(sid)
-    return data, pos, names, transport
-
-
 def dist(pos, a, b):
-    return max(E.MIN_DISTANCE_M, math.hypot(pos[a][0] - pos[b][0], pos[a][1] - pos[b][1]))
+    return math.hypot(pos[a][0] - pos[b][0], pos[a][1] - pos[b][1])
 
 
 def bfs(adj, src, via=None):
@@ -161,7 +126,7 @@ def read(args):
     return frames
 
 
-def geometry(frames, pos, names, transport, data, args):
+def geometry(frames, pos, names, forwarders, args):
     tol = 125_000 // 4
     on_call = lambda f: abs(f["freq"] - args.calling) <= tol
     clean = collections.Counter()
@@ -194,31 +159,37 @@ def geometry(frames, pos, names, transport, data, args):
         if (b, a) in lset:
             both[a].add(b)
     out["diameter_both_ways"] = diameter(both, nodes)
-    out["diameter_both_ways_through_transports"] = diameter(both, nodes, transport)
+    out["diameter_both_ways_through_forwarders"] = diameter(both, nodes, forwarders)
     out["per_station"] = {names[n]: {"neighbours": len(heard_by[n]),
                                      "nearest_m": round(min(dist(pos, n, m) for m in heard_by[n]))
                                      if heard_by[n] else None,
                                      "farthest_m": round(max(dist(pos, n, m) for m in heard_by[n]))
                                      if heard_by[n] else None}
                           for n in nodes}
-
-    # The formula's own view of the same map.
-    sf, bw, power = radio_of(data.get("setup") or [])
-    e = E.Ether.__new__(E.Ether)
-    e.physics = E.Physics.from_dict(data.get("physics"))
-    need = e.noise(bw) + e.sensitivity(sf)
-    reach = 10 ** ((power - need - E.fspl_1m_db(args.calling)) / (10 * e.physics.exponent))
-    model = collections.defaultdict(set)
-    for a in nodes:
-        for b in nodes:
-            if a != b and dist(pos, a, b) <= reach:
-                model[a].add(b)
-    out["model"] = {"sf": sf, "bw": bw, "power_dbm": power, "reach_m": reach,
-                    "neighbours_per_station": quantiles([len(model[n]) for n in nodes]),
-                    "diameter": diameter(model, nodes),
-                    "diameter_through_transports": diameter(model, nodes, transport),
-                    "links_one_way": sum(len(v) for v in model.values())}
     return out
+
+
+def model(view, nodes, forwarders, args):
+    """The run's medium's own view of the same map: who would decode whom on
+    the calling channel, by the run's loss table. None without a table."""
+    if not view.has_table(args.calling):
+        return None
+    pos = view.positions()
+    heard = view.radio_graph(args.calling)          # transmitter -> its receivers
+    pairs = [(a, b) for a in nodes for b in heard.get(a, ()) if b in pos]
+    radios = collections.Counter((r["sf"], r["bw_hz"], r["power_dbm"])
+                                 for r in (view.radio(view.names[n]) for n in nodes))
+    sf, bw, power = radios.most_common(1)[0][0] if radios else (None, None, None)
+    e = view.medium()
+    return {"sf": sf, "bw": bw, "power_dbm": power,
+            "noise_figure_db": e.physics.noise_figure_db,
+            "threshold_dbm": e.noise(bw) + e.sensitivity(sf) if sf else None,
+            "links_one_way": len(pairs),
+            "distance_m": quantiles([dist(pos, a, b) for a, b in pairs]),
+            "neighbours_per_station": quantiles([
+                sum(1 for a in nodes if n in heard.get(a, ())) for n in nodes]),
+            "diameter": diameter(heard, nodes),
+            "diameter_through_forwarders": diameter(heard, nodes, forwarders)}
 
 
 def power(frames, pos, args):
@@ -290,21 +261,28 @@ def power(frames, pos, args):
     }
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("record")
-    ap.add_argument("--scenario", required=True)
+    ap.add_argument("run", help="the run directory")
+    ap.add_argument("--record", help="the record to read (default: the run's record.tsv)")
     ap.add_argument("--from", dest="frm", type=float)
     ap.add_argument("--to", type=float)
     ap.add_argument("--min-clean", type=int, default=20)
-    ap.add_argument("--calling", type=int, default=869_525_000)
+    ap.add_argument("--calling", type=int,
+                    help="the calling channel in Hz (default: the run's most declared carrier)")
     ap.add_argument("--all-carriers", action="store_true")
     ap.add_argument("--power", action="store_true")
     ap.add_argument("--json")
-    args = ap.parse_args()
-    data, pos, names, transport = load_scenario(args.scenario)
+    args = ap.parse_args(argv)
+    view = RunView(args.run)
+    args.record = args.record or view.record_path
+    if args.calling is None:
+        args.calling = view.calling_hz()
+    pos = view.positions()
+    forwarders = view.forwarders()
     frames = read(args)
-    out = geometry(frames, pos, names, transport, data, args)
+    out = geometry(frames, pos, view.names, forwarders, args)
+    out["model"] = model(view, sorted(pos), forwarders, args)
     if args.power:
         out["power_traffic_channels"] = power(frames, pos, args)
     if args.json:
@@ -312,7 +290,8 @@ def main():
             json.dump(out, f, indent=1)
     brief = {k: v for k, v in out.items() if k != "per_station"}
     print(json.dumps(brief, indent=1))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

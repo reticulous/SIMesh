@@ -1,0 +1,6 @@
+# The workspace's own Linux build of Reticulous, run in place: the developer loop.
+name: Reticulous workspace build
+kind: reticulous
+stands_for: ESP32
+elf: ../../../reticulous/esp-idf/build.linux/reticulous.elf
+fixed: ../../../reticulous/esp-idf/build.linux/data_merged

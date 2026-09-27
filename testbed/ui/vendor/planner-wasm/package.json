@@ -1,0 +1,22 @@
+{
+  "name": "planner-wasm",
+  "version": "0.0.1",
+  "description": "Sergey's planner-wasm, as wasm-pack builds it for the web: copied here by update-planner-wasm.mjs.",
+  "type": "module",
+  "main": "planner_wasm.js",
+  "types": "planner_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./planner_wasm.d.ts",
+      "default": "./planner_wasm.js"
+    },
+    "./planner_wasm_bg.wasm": "./planner_wasm_bg.wasm"
+  },
+  "files": [
+    "planner_wasm.js",
+    "planner_wasm_bg.wasm",
+    "planner_wasm.d.ts",
+    "planner_wasm_bg.wasm.d.ts"
+  ],
+  "sideEffects": false
+}

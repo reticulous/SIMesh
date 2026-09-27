@@ -1,0 +1,5 @@
+# flat synthetic ground, path-loss exponent 3.5 (built-up), 20 km across
+synthetic:
+  terrain: flat
+  exponent: 3.5
+  extent_m: 20000

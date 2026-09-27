@@ -4,6 +4,8 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
     "jsx": "preserve",
     "lib": ["esnext", "dom"],
     "types": ["quasar", "vite/client"],

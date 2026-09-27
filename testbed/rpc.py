@@ -42,7 +42,7 @@ MARKER = re.compile(rb"serial(?:\]|:) framed rpc v1")
 MARKER_TAIL = 64                    # bytes of text kept to match a marker split across reads
 
 RESYNC_S = 1.0          # a frame with no progress for this long was not a frame
-EXEC_BOUND_S = 5.0      # the device's own bound on one command
+EXEC_BOUND_S = 5.0      # the station's own bound on one command
 QUERY_TIMEOUT_S = EXEC_BOUND_S + 3.0
 PROBE = "show s.net.hostname"
 PROBE_PAUSE_S = 0.1     # between probes of a station whose command line is not up yet
@@ -229,12 +229,18 @@ class RpcClient:
 
     `write` puts bytes on the station's console. The station's drain hands
     this `on_text` and `on_frame` for what it read. One frame is in flight at
-    a time: the device runs frames one after another, and two queries whose
+    a time: the station runs frames one after another, and two queries whose
     ids collided would each take the other's answer.
+
+    `sleep` waits on the run's clock (`Ether.sleep`), and is what a query's
+    timeout runs on when given: in a virtual-time run the station's own bound
+    on a command is on T, and a timeout on the wall would give up after a
+    number of T's seconds that depends on the host.
     """
 
-    def __init__(self, write):
+    def __init__(self, write, sleep=None):
         self.write = write
+        self.sleep = sleep
         self.lock = asyncio.Lock()
         self.waiters = {}           # id -> the future of the query waiting for it
         self.late = {}              # id -> a reply that arrived with nobody waiting
@@ -294,13 +300,29 @@ class RpcClient:
                 self.waiters[frame_id] = waiter
                 self.write(frame(frame_id, payload))
                 try:
-                    return await asyncio.wait_for(waiter, timeout)
+                    return await self.answer(waiter, timeout)
                 except asyncio.TimeoutError:
                     self.waiters.pop(frame_id, None)
                     late = self.late.pop(frame_id, None)
                     if late is not None:
                         return late
         raise RpcError("no answer to %r in %.0fs" % (command, timeout * tries))
+
+    async def answer(self, waiter, timeout):
+        """The reply `waiter` gets, or TimeoutError after `timeout` seconds on
+        the run's clock."""
+        if self.sleep is None:
+            return await asyncio.wait_for(waiter, timeout)
+        timer = asyncio.ensure_future(self.sleep(timeout))
+        try:
+            await asyncio.wait((waiter, timer), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            timer.cancel()
+            if not waiter.done():
+                waiter.cancel()
+        if waiter.cancelled():
+            raise asyncio.TimeoutError
+        return waiter.result()
 
     async def wait_ready(self, timeout, marker_wait, pause=asyncio.sleep):
         """True once the station answers a frame.
@@ -322,10 +344,13 @@ class RpcClient:
         except asyncio.TimeoutError:
             return await self.probe_once()
         while loop.time() < deadline and not self.closed:
+            # A probe's own timeout is on the run's clock when there is one,
+            # so the instants the probes go out at do not depend on the host.
+            wait = QUERY_TIMEOUT_S
+            if self.sleep is None:
+                wait = min(wait, max(0.1, deadline - loop.time()))
             try:
-                reply = await self.query(PROBE, timeout=min(QUERY_TIMEOUT_S,
-                                                            max(0.1, deadline - loop.time())),
-                                         tries=1)
+                reply = await self.query(PROBE, timeout=wait, tries=1)
                 if reply.strip():
                     return True
             except RpcError:

@@ -1,22 +1,8 @@
 import { configure } from 'quasar/wrappers';
-import { readFileSync } from 'node:fs';
-import { linkedDepsHmr } from 'spangap-browser/vite/linked-deps-hmr';
 
-// spangap-browser is pulled in as a `file:` dep and npm-linked. It IS code
-// under development, so Vite must NOT pre-bundle it — a stale optimized chunk
-// is why an edit to it wouldn't show up until the cache was blown away.
-// Excluding it from optimizeDeps serves it as live source; the other half of
-// that is the linkedDepsHmr plugin below, which watches where it really lives.
-const pkg = JSON.parse(
-  readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
-) as { dependencies?: Record<string, string> };
-const linkedStraddles = Object.entries(pkg.dependencies ?? {})
-  .filter(([, v]) => typeof v === 'string' && v.startsWith('file:'))
-  .map(([name]) => name);
-
-// Where `quasar dev` sends /ws and /api: simd, run beside it in the container
-// (`npm run dev` in this directory while simd.py runs).
-const SIMD = process.env.SIMESH_SIMD || 'http://127.0.0.1:9011';
+// Where `quasar dev` sends /ws, /api and /planner: the front, run beside it
+// (`npm run dev` in this directory while `simesh` runs).
+const FRONT = process.env.SIMESH_FRONT || 'http://127.0.0.1:8800';
 
 export default configure(() => {
   return {
@@ -26,16 +12,13 @@ export default configure(() => {
     build: {
       target: { browser: ['es2022'] },
       vueRouterMode: 'history',
-      vitePlugins: [[linkedDepsHmr, {}]],
       extendViteConf(viteConf) {
-        // spangap-browser is a file: dep — vite must resolve its peers (vue,
-        // pinia, quasar, vue-router) from this consumer's node_modules, not
-        // from the symlinked package's location. preserveSymlinks keeps the
-        // resolution context anchored to the symlink site.
-        viteConf.resolve = { ...viteConf.resolve, preserveSymlinks: true };
+        // planner-wasm finds its .wasm beside its own module; pre-bundled, it
+        // would look for it in Vite's cache instead. The page passes the URL
+        // explicitly as well, so this only keeps `quasar dev` honest.
         viteConf.optimizeDeps = {
           ...viteConf.optimizeDeps,
-          exclude: [...(viteConf.optimizeDeps?.exclude ?? []), ...linkedStraddles],
+          exclude: [...(viteConf.optimizeDeps?.exclude ?? []), 'planner-wasm'],
         };
         if (viteConf.build) {
           viteConf.build.chunkSizeWarningLimit = Infinity;
@@ -44,11 +27,12 @@ export default configure(() => {
     },
     devServer: {
       open: false,
-      // Same-origin with simd, so the websocket and the station links behave
-      // exactly as when simd serves the built page itself.
+      // Same-origin with the front, so the websocket, the sidecar and the
+      // station links behave exactly as when the front serves the built page.
       proxy: {
-        '/ws': { target: SIMD, changeOrigin: true, ws: true },
-        '/api': { target: SIMD, changeOrigin: true },
+        '/ws': { target: FRONT, changeOrigin: true, ws: true },
+        '/api': { target: FRONT, changeOrigin: true },
+        '/planner': { target: FRONT, changeOrigin: true },
       },
     },
     framework: {

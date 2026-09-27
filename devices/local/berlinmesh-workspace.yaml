@@ -1,0 +1,7 @@
+# Sergeyculum's fw/simesh, built in the reticulum repository beside SIMesh, with its rncfg.
+name: Sergeyculum workspace build
+kind: berlinmesh
+stands_for: nRF52840
+elf: ../../../sergey/reticulum/fw/simesh/target/release/simesh
+tools:
+  rncfg: ../../../sergey/reticulum/target/release/rncfg
