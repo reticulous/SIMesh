@@ -1,0 +1,13 @@
+[package]
+name = "planner-terrain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raster grids and path-profile extraction (COG windowed reads to follow)"
+
+[dependencies]
+planner-core.workspace = true
+thiserror.workspace = true
+tiff.workspace = true
+flate2 = "1"
+weezl = "0.1"

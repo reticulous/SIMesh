@@ -1,0 +1,54 @@
+# SIMesh's planner: the ground, propagation and coverage code behind a pack.
+#
+#   planner-web       the sidecar the front runs per pack in use
+#   planner-wasm      the page's base-map compositor (testbed/ui/vendor/planner-wasm)
+#   planner-coverage  the point-to-area sweep
+#   planner-propag    P.1812 and the near-field model
+#   planner-terrain   rasters and profiles
+#   planner-pack      a pack's manifest and layers
+#   planner-render    base-map rendering
+#   planner-core      shared types and link parameters
+#   planner-opt       what the coverage code draws on for siting
+#
+# The crates keep the names they had in Sergey's planner, where they came from.
+[workspace]
+resolver = "2"
+members = [
+    "crates/planner-core",
+    "crates/planner-terrain",
+    "crates/planner-propag",
+    "crates/planner-opt",
+    "crates/planner-coverage",
+    "crates/planner-pack",
+    "crates/planner-render",
+    "crates/planner-web",
+    "crates/planner-wasm",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+tiff = "0.11"
+proj4rs = "0.1"
+quick-xml = "0.37"
+rayon = "1"
+
+planner-core = { path = "crates/planner-core" }
+planner-terrain = { path = "crates/planner-terrain" }
+planner-propag = { path = "crates/planner-propag" }
+planner-opt = { path = "crates/planner-opt" }
+planner-pack = { path = "crates/planner-pack" }
+planner-coverage = { path = "crates/planner-coverage" }
+planner-render = { path = "crates/planner-render" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

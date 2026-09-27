@@ -1,0 +1,28 @@
+[package]
+name = "planner-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal local web UI: one Rust binary serving rendered pack views to the browser you already have"
+
+[[bin]]
+name = "planner-web"
+path = "src/main.rs"
+
+[dependencies]
+planner-core.workspace = true
+planner-terrain.workspace = true
+planner-render.workspace = true
+planner-coverage.workspace = true
+planner-propag.workspace = true
+planner-pack.workspace = true
+proj4rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+png = "0.17"
+rayon.workspace = true
+# Minimal axum: no macros, no multipart, no ws — this may run on the 2-core
+# VPS one day, so every feature is opt-in.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "sync"] }

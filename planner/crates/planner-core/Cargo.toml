@@ -1,0 +1,10 @@
+[package]
+name = "planner-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Schema and traits for the mesh deployment planner: profiles, path-loss model interface, cell-first scenarios"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

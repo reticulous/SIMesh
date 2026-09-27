@@ -1,0 +1,16 @@
+[package]
+name = "planner-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline data-pack manifest; the pack compiler runs on the build server, packs are static artifacts"
+
+[dependencies]
+planner-core.workspace = true
+planner-terrain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+proj4rs.workspace = true
+quick-xml.workspace = true
+rayon.workspace = true

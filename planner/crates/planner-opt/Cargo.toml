@@ -1,0 +1,8 @@
+[package]
+name = "planner-opt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Site-placement optimization: weighted k-coverage greedy with CELF lazy evaluation"
+
+[dependencies]

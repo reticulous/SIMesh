@@ -1,0 +1,32 @@
+[package]
+name = "planner-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser-side renderer: the pack's own layers rendered in WASM, so navigation costs no network"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# planner-render WITHOUT rayon (no threads in plain wasm32). Declared by path
+# rather than `workspace = true`: cargo ignores `default-features = false` on a
+# workspace-inherited dependency unless the workspace entry also spells it out,
+# so the inherited form silently pulled rayon into the wasm build.
+planner-render = { path = "../planner-render", default-features = false }
+planner-core.workspace = true
+planner-terrain.workspace = true
+wasm-bindgen = "0.2"
+
+# NOTE: a `[profile.release]` here would be IGNORED — cargo only honours
+# profiles at the workspace root, and says so on every build. This crate
+# carried one claiming `opt-level = "z"`, which read as "the wasm is optimised
+# for size" when the workspace root's profile (opt-level 3, thin LTO) was in
+# force the whole time. Removing it deletes the warning and the wrong claim;
+# the wasm-pack block below is a different mechanism and does take effect.
+
+# The bundled wasm-opt predates bulk-memory being on by default in LLVM's wasm
+# backend, so it rejects the memory.copy/memory.fill our resample emits.
+# Enabling the feature explicitly keeps the optimiser (and the size win).
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int']

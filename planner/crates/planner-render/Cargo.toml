@@ -1,0 +1,20 @@
+[package]
+name = "planner-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turns pack layers into RGBA images: hillshade basemap, population and coverage overlays"
+
+[features]
+# Multi-threaded rendering. On by default for native; wasm builds turn it
+# off (no threads in plain wasm32-unknown-unknown).
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+planner-core.workspace = true
+planner-terrain.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+png = "0.17"

@@ -1,0 +1,3568 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>planner</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!--
+  One file, no framework, no CDN, no fonts, no network beyond this server.
+
+  ARCHITECTURE: the browser renders the map itself, in WASM, from compact
+  data tiles. The server's job is to supply data and to run P.1812 — never
+  to draw a frame per interaction.
+
+    pan / zoom / layer / budget  →  local WASM render, no request
+    view leaves the tile         →  one /tile.bin fetch at the current LOD
+    transmitter moved/changed    →  one /loss.bin fetch (the only heavy work)
+
+  Tiles are LOD-matched to the canvas, so bytes scale with SCREEN size, not
+  with area: zooming out fetches coarser cells over more ground for the same
+  cost. A loaded tile keeps rendering if the server goes away.
+-->
+<style>
+  :root { color-scheme: light; --bg:#f4f3ef; --panel:#fbfaf7; --line:#d9d5cc;
+          --ink:#22262b; --muted:#6b7280; --accent:#1f7a63; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; overflow:hidden; background:var(--bg); color:var(--ink);
+              font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; }
+  #app { display:flex; height:100%; }
+  #map { position:relative; flex:1; overflow:hidden; cursor:grab; background:#eeece7; }
+  #map.drag { cursor:grabbing; }
+  #map.place { cursor:crosshair; }
+  /* Scoped to the MAP canvas by id, not to every <canvas>. A bare `canvas`
+     selector also caught the terrain-profile chart in the sidebar, which has
+     no positioned ancestor — so it anchored to the viewport at 0,0 and painted
+     the profile straight across the whole page, over the map. */
+  #cv { position:absolute; left:0; top:0; display:block; }
+  aside { width:352px; flex:none; background:var(--panel); border-left:1px solid var(--line);
+          display:flex; align-items:stretch; overflow:hidden; }
+  #panel { flex:1; padding:14px; overflow-y:auto; min-width:0; }
+  h1 { font-size:14px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11px; margin-bottom:14px; word-break:break-all; }
+  fieldset { border:1px solid var(--line); border-radius:6px; padding:10px; margin:0 0 12px; }
+  legend { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; padding:0 4px; }
+  label { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:6px 0; }
+  label span { color:var(--muted); }
+  /* `.num` are text inputs on purpose (see readField): a type=number field
+     reports value "" for anything it dislikes, including the decimal comma a
+     German keyboard produces, so the operator's "18,5" would silently become
+     no edit at all. */
+  input[type=number], input.num { width:76px; background:#fff; color:var(--ink);
+                       border:1px solid var(--line); border-radius:4px; padding:3px 5px; font:inherit; }
+  input.num:disabled { background:#efece6; color:var(--muted); }
+  input[type=range] { width:100%; }
+  select, button { width:100%; background:#fff; color:var(--ink); border:1px solid var(--line);
+                   border-radius:5px; padding:6px; font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  .row { display:flex; gap:6px; }
+  #stat { font:11px/1.5 ui-monospace,Consolas,monospace; color:var(--muted); white-space:pre-wrap; }
+  #legend { display:flex; align-items:center; gap:6px; margin-top:8px; font-size:11px; color:var(--muted); }
+  #ramp { flex:1; height:8px; border-radius:2px;
+          background:linear-gradient(90deg,#28aa5a,#f0c83c,#c83232); }
+  #hud { position:absolute; left:10px; bottom:10px; background:#ffffffd9; border:1px solid var(--line);
+         border-radius:5px; padding:5px 8px; font:11px ui-monospace,Consolas,monospace; color:var(--muted); }
+  #busy { position:absolute; right:10px; top:10px; padding:3px 7px; border-radius:4px;
+          background:#ffffffd9; border:1px solid var(--line); font:11px ui-monospace,monospace;
+          color:var(--muted); opacity:0; transition:opacity .12s; }
+  #busy.on { opacity:1; }
+  /* Anchored inside #map, which IS positioned — unlike the profile canvas,
+     which had no positioned ancestor and escaped to the viewport. */
+  #tip { position:absolute; z-index:5; pointer-events:none; opacity:0;
+         max-width:280px; padding:6px 8px; border-radius:5px;
+         background:#ffffffee; border:1px solid var(--line);
+         box-shadow:0 2px 8px #0002; color:var(--ink);
+         font:11px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap;
+         word-break:break-word; transition:opacity .08s; }
+  #tip.on { opacity:1; }
+  #tip b { font-size:12px; }
+  #tip .warn { color:#b0202f; }
+  /* The overlay parity report (?selftest=overlay). Over the map rather than
+     in the sidebar: it is read once, by whoever is checking the shader, and
+     it must not push the controls around when it is not there. */
+  #selftest { position:absolute; z-index:6; left:10px; top:10px; margin:0;
+              max-width:min(560px,calc(100% - 20px)); max-height:calc(100% - 20px);
+              overflow:auto; padding:8px 10px; border-radius:5px;
+              background:#ffffffee; border:1px solid var(--line); color:var(--ink);
+              font:11px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap; }
+  #selftest.fail { border-color:#b0202f; box-shadow:0 0 0 2px #b0202f55; }
+  #q { width:100%; background:#fff; color:var(--ink); border:1px solid var(--line);
+       border-radius:5px; padding:6px 8px; font:inherit; }
+  #hits { list-style:none; margin:6px 0 0; padding:0; max-height:210px; overflow-y:auto; }
+  #hits li { padding:5px 7px; border-radius:4px; cursor:pointer; display:flex;
+             justify-content:space-between; gap:8px; align-items:baseline; }
+  #hits li:hover { background:#eceae4; }
+  #hits .k { color:var(--muted); font-size:10px; text-transform:uppercase;
+             letter-spacing:.06em; flex:none; }
+  #hits .n { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #hits .c { color:var(--muted); font-size:11px; }
+  #none { color:var(--muted); font-size:11px; padding:4px 2px; }
+  #budgetwhy { color:var(--muted); font:10.5px/1.5 ui-monospace,Consolas,monospace;
+               margin-top:7px; white-space:pre-wrap; }
+  /* Says what a control MEANS, next to the control. Every height on this page
+     belongs to one end of a link or the other, and a label alone never made
+     clear which — so the sentence lives beside the input, not in a tooltip. */
+  .hint { color:var(--muted); font:10.5px/1.55 -apple-system,system-ui,sans-serif;
+          margin-top:7px; }
+  .hint b { color:var(--ink); font-weight:600; }
+  /* The receiver-height scrubber. Vertical because the quantity is vertical —
+     the same reason a slicer puts its layer control up the side of the model
+     rather than in a form field. */
+  #zbar { flex:none; width:52px; display:flex; flex-direction:column;
+          align-items:center; justify-content:center; gap:8px; padding:14px 4px;
+          border-right:1px solid var(--line); background:#f2f0ea;
+          user-select:none; touch-action:none; }
+  #zbar.off { opacity:.35; }
+  #zbar input[type=range] { writing-mode:vertical-lr; direction:rtl;
+                            width:24px; flex:1; min-height:120px;
+                            accent-color:var(--accent); touch-action:none; }
+  #zval { font:600 12px/1 ui-monospace,Consolas,monospace; color:var(--ink);
+          min-width:44px; text-align:center; }
+  #zcap { font:9px/1.25 ui-monospace,Consolas,monospace; color:var(--muted);
+          text-align:center; }
+  #zcap span { font-size:8px; }
+  #linkout { margin-top:8px; font:11px/1.6 ui-monospace,Consolas,monospace; }
+  #linkout .ok { color:#1f7a4b; font-weight:700; }
+  #linkout .no { color:#b0202f; font-weight:700; }
+  /* The actionable half of a link answer. Deliberately not styled as a
+     warning list: most links need nothing done, and a first row saying so is
+     as much of an answer as a row telling you to climb a roof. */
+  #linkopts { margin-top:10px; }
+  #linkopts .oh { font:600 10px/1.4 -apple-system,system-ui,sans-serif;
+                  letter-spacing:.06em; text-transform:uppercase;
+                  color:var(--muted); margin-bottom:5px; }
+  #linkopts .opt { border-left:2px solid var(--accent); padding:3px 0 3px 8px;
+                   margin-bottom:6px; }
+  #linkopts .opt.hard { border-left-color:#c9c4b8; opacity:.68; }
+  #linkopts .oa { font:600 11px/1.4 -apple-system,system-ui,sans-serif; color:var(--ink); }
+  #linkopts .og { font:10px/1.4 ui-monospace,Consolas,monospace;
+                  color:var(--accent); margin-left:6px; }
+  #linkopts .od { font:10.5px/1.5 -apple-system,system-ui,sans-serif;
+                  color:var(--muted); margin-top:1px; }
+  /* Stays inside the sidebar: static position, never wider than its column. */
+  #prof { position:static; display:none; width:100%; max-width:100%;
+          height:120px; margin-top:6px; }
+  #prof.on { display:block; }
+  #fres { margin-top:5px; font:10.5px/1.5 ui-monospace,Consolas,monospace;
+          color:var(--muted); }
+  #fres b { color:var(--ink); }
+  #nodestat { margin-top:6px; font:10.5px/1.5 ui-monospace,Consolas,monospace;
+              color:var(--muted); }
+  #netstat { margin-top:7px; font:10.5px/1.55 ui-monospace,Consolas,monospace;
+             color:var(--muted); white-space:pre-wrap; }
+  #netstat b { color:var(--ink); }
+  #netstat .warn { color:#8a5300; }
+  #netkey { margin-top:5px; font-size:10.5px; color:var(--muted); }
+  #netkey i { display:inline-block; width:9px; height:9px; margin-right:3px;
+              border-radius:2px; vertical-align:-1px; }
+  #fres .bad { color:#b0202f; }
+  #fres .ok { color:#1f7a4b; }
+  /* --- per-node inspector: lives in the sidebar column, never over the map --- */
+  #nodepanel[hidden] { display:none; }
+  #nodename { font-weight:600; word-break:break-word; }
+  /* Built with textContent and newlines rather than innerHTML: node names and
+     ids come from scraped adverts, i.e. from strangers. */
+  #nodemeta { color:var(--muted); font:10.5px/1.5 ui-monospace,Consolas,monospace;
+              margin:3px 0 8px; white-space:pre-wrap; word-break:break-word; }
+  #nodewarn { color:#b0202f; font-size:11px; margin-top:4px; }
+  /* A note, not a refusal: the value is accepted and kept, but the operator is
+     told what it implies. Amber so it does not read as an error. */
+  #nodenote { color:#8a5300; font-size:11px; margin-top:4px; white-space:pre-line; }
+  /* pre-line: the dropped-override warning is a second line, and it is the one
+     line an operator must not miss before exporting. */
+  #ovstat { font:10.5px/1.5 ui-monospace,Consolas,monospace; color:var(--muted);
+            white-space:pre-line; }
+  #ovstat.on { color:#8a5300; }
+  #nodekey { margin-top:6px; font-size:10.5px; color:var(--muted); line-height:1.7; }
+  #nodekey i { display:inline-block; width:9px; height:9px; margin-right:4px;
+               vertical-align:-1px; }
+  #nodekey .known { background:#1c4f8f; border-radius:50%; }
+  #nodekey .unk { background:#fff; border:1.5px solid #1c4f8f; border-radius:50%; }
+  #nodekey .ed { background:#e08a00; border:1px solid #4a2d00; transform:rotate(45deg); }
+  #nodekey .edunk { background:#fff; border:1.5px solid #e08a00; transform:rotate(45deg); }
+</style>
+
+<div id="app">
+  <div id="map">
+    <canvas id="cv"></canvas>
+    <div id="busy">working…</div>
+    <div id="hud">loading…</div>
+    <div id="tip"></div>
+    <pre id="selftest" hidden></pre>
+  </div>
+  <aside>
+    <!-- Receiver height, as a thing you SCRUB rather than a number you type.
+         Nobody knows how high the listeners are — not one of the 258 deployed
+         nodes advertises its antenna height — so a single typed value is a
+         guess presented as a fact. Sweeping it shows how much the answer
+         depends on it, which is the honest thing to look at. It lives on the
+         sidebar's edge rather than over the map because a control floating on
+         the canvas competes with panning for the same drag.
+         Range stops at 40 m: the pack's own 1 026 069 LoD2 heights put only
+         0.37% of Berlin's buildings above that. -->
+    <div id="zbar" title="listener height above ground">
+      <div id="zval">2 m</div>
+      <input id="zslider" type="range" min="1" max="40" step="0.5" value="2">
+      <div id="zcap">40 m<br><span>p99.6<br>of roofs</span></div>
+    </div>
+    <div id="panel">
+    <h1 id="name">planner</h1>
+    <div class="sub" id="dir"></div>
+
+    <fieldset>
+      <legend>find a place</legend>
+      <input id="q" type="search" placeholder="street, town or postcode"
+             autocomplete="off" spellcheck="false">
+      <ul id="hits"></ul>
+    </fieldset>
+
+    <fieldset>
+      <legend>base layer</legend>
+      <select id="layer">
+        <option value="0">terrain (hillshade)</option>
+        <option value="1" selected>population</option>
+        <option value="2">clutter height</option>
+      </select>
+      <label style="margin-top:8px"><span>roads</span>
+        <input id="roads" type="checkbox" checked style="width:auto"></label>
+      <!-- On by default: since the terminal correction reads the building a
+           node stands on, placing one without seeing the footprints is
+           guesswork, and a wrong roof changes the whole pattern. -->
+      <label><span>buildings</span>
+        <input id="showbldg" type="checkbox" checked style="width:auto"></label>
+      <div id="bldgnote" class="hint"></div>
+      <label><span>deployed nodes</span>
+        <input id="shownodes" type="checkbox" checked style="width:auto"></label>
+      <div id="nodestat"></div>
+      <!-- Shape = edited here; fill = height known. The two are independent,
+           so a tx-power-only edit still reads as "height unknown". -->
+      <div id="nodekey">
+        <i class="known"></i>height known &nbsp;
+        <i class="unk"></i>height unknown<br>
+        <i class="ed"></i>edited, height known &nbsp;
+        <i class="edunk"></i>edited, height still unknown
+      </div>
+    </fieldset>
+
+    <!-- Antenna height and TX power are the two inputs that decide every
+         coverage answer, and a MeshCore advert carries NEITHER. Over the same
+         263 Berlin sites, changing only the assumed height moved the census
+         from 3.09 M residents / 117 backbone edges (8 m) to 4.08 M / 10 342
+         edges (25 m): an 88x swing in edge count from a number nobody
+         measured. A surveyor who knows one real value has to be able to type
+         it in, and it has to leave here as data. -->
+    <fieldset id="nodepanel" hidden>
+      <legend>deployed node</legend>
+      <div id="nodename"></div>
+      <div id="nodemeta"></div>
+      <label><span>height AGL m</span>
+        <input id="nh" class="num" type="text" inputmode="decimal" autocomplete="off"
+               spellcheck="false" placeholder="unknown"></label>
+      <!-- CONDUCTED, at the radio. SiteSpec::tx_power_dbm is differenced
+           against GapParams::ref_tx_power_dbm, and the preset ladder adds
+           antenna gain separately (max_path_loss_for(tx_dbm, gain_dbi, ...)),
+           so this is the number in the node's own config — not the 27 dBm ERP
+           figure the EU 869.4-869.65 rules are quoted in. An operator typing
+           their ERP allowance here would hand the planner an extra 2 dBi it
+           then adds again. -->
+      <label><span>tx dBm conducted</span>
+        <input id="ntx" class="num" type="text" inputmode="decimal" autocomplete="off"
+               spellcheck="false" placeholder="unknown"></label>
+      <div id="nodewarn"></div>
+      <div id="nodenote"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="nrevert">revert this node</button>
+        <button id="nclose">close</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>survey overrides</legend>
+      <div id="ovstat"></div>
+      <!-- export -> operators fill in what they know -> planner pack build
+           --nodes nodes.csv -> the guessed height is replaced by fact. -->
+      <button id="expnodes" style="margin-top:7px">export nodes.csv</button>
+      <div class="row" style="margin-top:6px"><button id="clearov">clear overrides</button></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>coverage</legend>
+      <!-- ONE map, TWO incompatible questions. Before this selector both
+           overlays could be on at once, and neither the colours nor the
+           legend said which one you were looking at — a single what-if site
+           and a census of 253 deployed repeaters are not comparable, and
+           reading one as the other is the most expensive mistake this page
+           can cause. Picking a mode hides the other question's controls
+           entirely, so there is nothing to misread. -->
+      <label><span>what to map</span>
+        <select id="covmode" style="width:150px">
+          <option value="tx" selected>one transmitter</option>
+          <option value="net">the whole mesh</option>
+        </select></label>
+      <div id="covwhat" class="hint"></div>
+    </fieldset>
+
+    <fieldset id="txpanel">
+      <legend>one transmitter — a site that does not exist yet</legend>
+      <!-- Two heights, and they belong to OPPOSITE ends of the link. The old
+           labels ("height AGL" / "rx height") did not say whose height either
+           one was, and the network panel below then used "assume height" for a
+           TRANSMITTER quantity directly beneath a receiver one. -->
+      <label><span>transmitter AGL</span><input id="txh" type="number" value="20" min="1" max="300" step="1"></label>
+      <label><span>listener AGL</span><input id="rxh" type="number" value="2" min="1" max="100" step="1"></label>
+      <div class="hint">The map answers: could somebody standing anywhere on
+        it, holding a radio at <b id="rxhecho">2</b> m, hear this one
+        transmitter? Every coloured pixel is a listener, not a site.</div>
+      <!-- A COMPUTE CAP, not a range. 8 km silently hid every link longer
+           than itself; 20 km sits past the radio horizon for these heights
+           (~4.12(√h_t+√h_r) km), so radials now end where the budget closes. -->
+      <label><span>sweep cap km</span><input id="rad" type="number" value="20" min="1" max="30" step="1"></label>
+      <button id="place" class="primary">place transmitter</button>
+      <div class="row" style="margin-top:6px"><button id="clear">clear</button></div>
+    </fieldset>
+
+    <fieldset id="netpanel" hidden>
+      <legend>the whole mesh — what the deployed repeaters already reach</legend>
+      <!-- The census of what the DEPLOYED repeaters reach, as opposed to the
+           single-transmitter what-if above. Minutes of work, so it is started
+           explicitly and the page polls. -->
+      <label><span>listener is</span>
+        <select id="situation" style="width:150px">
+          <option value="street" selected>street, outdoor 1.5 m</option>
+          <option value="balcony">balcony/window 8 m</option>
+          <option value="indoor-traditional">indoor, Altbau</option>
+          <option value="indoor-efficient">indoor, modern</option>
+        </select></label>
+      <!-- A TRANSMITTER height, despite sitting under a receiver control.
+           Not one deployed node advertises its antenna height, so this single
+           number stands in for every repeater on the map and the answer moves
+           tens of points with it. The label has to say so. -->
+      <label><span>repeater AGL if unknown</span>
+        <input id="netah" type="number" value="8" min="1" max="100" step="1"></label>
+      <div class="hint">Green means a listener there hears <b>at least k</b> of
+        the repeaters. It says nothing about whether those repeaters can hear
+        <em>each other</em> — that is the backbone line below.</div>
+      <label><span>redundancy k</span>
+        <input id="netk" type="number" value="1" min="1" max="4" step="1"></label>
+      <button id="netrun">compute network coverage</button>
+      <label style="margin-top:6px"><span>show overlay</span>
+        <input id="netshow" type="checkbox" style="width:auto"></label>
+      <div id="netstat"></div>
+      <div id="netkey" hidden>
+        <i style="background:#289a5a"></i>reached by k+ ·
+        <i style="background:#ebaa2d"></i>below k ·
+        <i style="background:#c82832"></i>nobody
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>radio / link budget</legend>
+      <select id="radio"></select>
+      <label style="margin-top:8px"><span>tx power</span>
+        <select id="pwr" style="width:110px"></select></label>
+      <!-- The threshold is DERIVED from the radio, and the derivation is
+           shown: a bare dB number is not interpretable on its own. -->
+      <div id="budgetwhy"></div>
+      <label style="margin-top:8px"><span>max path loss</span><b id="budval">147.5 dB</b></label>
+      <input id="bud" type="range" min="110" max="185" step="0.5" value="147.5">
+      <div id="legend"><span>strong</span><div id="ramp"></div><span>marginal</span></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>point-to-point link</legend>
+      <!-- The coverage raster answers "who hears me at rx height above
+           ground". It cannot show a link to an elevated repeater, which is
+           the normal case for a hilltop site. -->
+      <label><span>far-end height</span>
+        <input id="bh" type="number" value="30" min="1" max="300" step="1"></label>
+      <button id="measure">measure link…</button>
+      <div id="linkout"></div>
+      <canvas id="prof"></canvas>
+      <div id="fres"></div>
+      <div id="linkopts"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>status</legend>
+      <div id="stat">—</div>
+    </fieldset>
+    </div>
+  </aside>
+</div>
+
+<script type="module">
+import init, { Tile } from '/planner_wasm.js';
+
+const el = id => document.getElementById(id);
+// Heights for people, not for f64: a terminal raised to its clutter height
+// arrives as 18.658531188964844 and was printed as such. One decimal under
+// 10 m (1.5 m and 2 m are different antennas), whole metres above -- nobody
+// mounts to a tenth of a metre at 20 m.
+const fmtM = v => { const x = +v; return !isFinite(x) ? '—' : (Math.abs(x) < 10 ? x.toFixed(1) : String(Math.round(x))) + ' m'; };
+const mapEl = el('map'), cv = el('cv'), ctx = cv.getContext('2d', { alpha:false });
+const hud = el('hud'), busy = el('busy'), stat = el('stat');
+
+let pack = null, view = null, tile = null, tileBounds = null, tileRes = 0;
+let tx = null, placing = false, drag = null, highlight = null, pin = null, press = null;
+// The deployed network: fetched once, kept in the page, drawn locally like
+// everything else. `selected` is the node open in the sidebar inspector.
+let nodes = [], nodesNoHeight = 0, nodesEdited = 0, lastNodesShown = -1, selected = null;
+// Drawables on screen (clusters count as one). Shown in the status line
+// because a number that churns while panning is exactly the symptom of an
+// unstable clustering, and it should be visible rather than felt.
+let lastMarkersShown = 0, lastMarkersReported = -1;
+// A single coarse tile over the WHOLE pack, fetched once and never replaced.
+// It is what the map falls back to while a detail tile is in flight, so
+// panning degrades in resolution instead of going blank for seconds.
+let overview = null, overviewHolder = null, tileHolder = null;
+// One radius for the drawn marker AND for the hit test, so a click can never
+// land on nothing where a dot clearly is.
+// Marker radius scales with ZOOM, not just canvas size. At city scale 269
+// dots at a fixed radius merge into a smear that says nothing; zoomed into a
+// street the same radius is a speck you cannot aim at. Log-interpolated
+// between 8 px at 1 km across and 2.6 px at 80 km, which is the range this
+// pack actually spans.
+const markerRadius = (s, v) => {
+  const km = Math.max(0.3, (v ? vw(v) : 25000) / 1000);
+  const t = Math.min(1, Math.log10(km) / Math.log10(80));
+  return (2.6 + (8 - 2.6) * (1 - t)) * Math.min(1, s.w / s.cw);
+};
+
+// The markers as LAID OUT for the current frame, clustered. Cached because
+// draw() and the hit-test must agree exactly: hit-testing against raw node
+// positions while the screen shows clusters means clicking a cluster selects
+// whichever member happens to be nearest, which is not what the operator
+// aimed at.
+let markerLayout = [];
+
+/// Bin visible nodes and collapse each bin to one drawable.
+///
+/// The grid is anchored in WORLD coordinates, not screen coordinates. Binning
+/// by pixel position looks equivalent and is not: the screen grid stays put
+/// while the map slides under it, so on every drag frame nodes cross bin
+/// boundaries and a cluster of 3 flickers to 2+1 and back. Anchoring the grid
+/// to the pack CRS makes the grouping depend only on ZOOM, so a pan moves the
+/// clusters with the map instead of reshuffling them.
+///
+/// The cell size is quantised to a power-of-two ladder for the same reason:
+/// derived continuously from the view width it would drift by a fraction of a
+/// metre per frame and re-partition nodes mid-gesture.
+///
+/// Grid binning rather than a real clustering algorithm because it is O(n) and
+/// 269 nodes has to fit in a ~13 ms frame.
+function layoutMarkers(s) {
+  markerLayout = [];
+  if (!nodes.length || !view || !el('shownodes').checked) return markerLayout;
+  const r = markerRadius(s, view);
+  const kx = s.w / vw(view), ky = s.h / vh(view);
+  // Target a bin a little over twice the marker, so two nodes in one bin would
+  // have overlapped had they been drawn separately; then convert to world
+  // metres and quantise.
+  const targetPx = Math.max(24, r * 4.5);
+  const worldPerPx = vw(view) / s.w;
+  const cell = Math.pow(2, Math.round(Math.log2(Math.max(1, targetPx * worldPerPx))));
+  // Bin over the view EXPANDED by one cell, then clip afterwards. Clipping
+  // first makes a bin's membership depend on the viewport edge, so a cluster
+  // near the border gains and loses members as you pan toward it and its label
+  // flickers — the same class of instability as screen-space binning, just at
+  // the edges. With the margin, every bin that touches the screen is complete.
+  const pad = cell;
+  const bins = new Map();
+  for (const n of nodes) {
+    if (n.x < view.minx - pad || n.x > view.maxx + pad ||
+        n.y < view.miny - pad || n.y > view.maxy + pad) continue;
+    const gx = Math.floor(n.x / cell), gy = Math.floor(n.y / cell);
+    const key = gx + ',' + gy;
+    let b = bins.get(key);
+    if (!b) { b = { sx: 0, sy: 0, list: [] }; bins.set(key, b); }
+    // Averaged in WORLD space, so the cluster's anchor is a property of the
+    // nodes rather than of where the viewport happens to sit.
+    b.sx += n.x; b.sy += n.y; b.list.push(n);
+  }
+  for (const b of bins.values()) {
+    const c = b.list.length;
+    const wx = b.sx / c, wy = b.sy / c;
+    const fx = (wx - view.minx) * kx, fy = (view.maxy - wy) * ky;
+    // Now drop what the screen cannot show, by the marker's own position.
+    const slack = 24;
+    if (fx < -slack || fy < -slack || fx > s.w + slack || fy > s.h + slack) continue;
+    if (c === 1) {
+      markerLayout.push({ fx, fy, r, count: 1, node: b.list[0], list: b.list });
+    } else {
+      markerLayout.push({
+        fx, fy,
+        // Area-ish growth so 40 nodes does not draw a disc across the city.
+        r: Math.min(20, r + 3 + Math.log2(c) * 2.6),
+        count: c, node: null, list: b.list,
+      });
+    }
+  }
+  return markerLayout;
+}
+let lastRenderMs = 0, lastFetchMs = 0, lastComputeMs = null, lossLoaded = false;
+let tileReq = null, lossReq = null, tileTimer = null;
+
+const DPR_CAP = 1.5;
+function size() {
+  const r = mapEl.getBoundingClientRect();
+  const d = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+  return { cw: Math.max(1, Math.round(r.width)), ch: Math.max(1, Math.round(r.height)),
+           w: Math.max(1, Math.round(r.width * d)), h: Math.max(1, Math.round(r.height * d)) };
+}
+const vw = v => v.maxx - v.minx, vh = v => v.maxy - v.miny;
+
+function screenToWorld(px, py) {
+  const s = size();
+  return { x: view.minx + (px / s.cw) * vw(view),
+           y: view.maxy - (py / s.ch) * vh(view) };
+}
+
+// ---- local render: the whole point. No network, no PNG, no decode. -------
+// Scratch canvas for compositing the detail tile over the overview. One
+// canvas, resized in place — allocating per frame would undo the point.
+// ---- composite once, blit per frame -------------------------------------
+//
+// The camera used to be applied in WASM: every frame resampled the baked image
+// to the viewport and composited the overlays per screen pixel. Measured on a
+// 1997x1000 tile against a 1248x1000 canvas, that is 48.5 ms a frame for the
+// base alone and 129.5 ms with the census on — and draw() ran it for the
+// overview AND the detail tile, while `pointermove` calls draw() on every
+// event of a drag. The main thread never got back to the input queue, which is
+// exactly the state a browser reports as "this page is slow: wait or exit".
+//
+// Nothing in that work depended on the camera except the resample, and
+// resampling an image into a rectangle is what the 2D canvas does in hardware.
+// So each tile is composed ONCE per change — new tile, layer switch, roads
+// toggle, new sweep band, budget move — into an offscreen canvas at the tile's
+// own resolution, and a frame becomes two drawImage calls.
+//
+// The key is what a recompose must depend on. Miss a term and the map silently
+// shows a stale overlay; add the camera to it and the whole point is lost.
+const composeKey = (L, showLoss, B, R, NET, gen) =>
+  `${L}|${showLoss ? 1 : 0}|${B}|${R ? 1 : 0}|${NET ? 1 : 0}|${gen}`;
+
+function makeSurface() {
+  const c = document.createElement('canvas');
+  return { cv: c, cx: c.getContext('2d'), key: null, ext: null };
+}
+const tileSurf = makeSurface(), ovSurf = makeSurface(), bldgSurf = makeSurface(), bldgFillSurf = makeSurface();
+// Bumped whenever a raster INSIDE a Tile changes without any of the key's
+// inputs changing — a new loss band, a census arriving, a highlight. Without
+// it the key compares equal and the surface keeps the old pixels.
+let composeGen = 0;
+const invalidateCompose = () => { composeGen++; };
+/// A new overlay WINDOW arrived — a sweep band, a census, a pan's refetch.
+///
+/// Under the shader that is a texture upload and the base surfaces are
+/// untouched, so bumping the key here would throw away a still-correct base
+/// on every band. Under the CPU path the window IS baked into the surface and
+/// the key has to move. One call site either way.
+const invalidateOverlay = () => { if (!glo.active()) composeGen++; };
+
+/// Bring `surf` up to date for `holder`, if anything it depends on moved.
+///
+/// `holder` is `{ t, w, h }` — the Tile plus its size in cells, which the
+/// caller already has from decoding it. The image `compose()` returns is
+/// exactly w x h, and the world rectangle it covers is the Tile's OUTER
+/// extent, which the Tile reports rather than JS re-deriving it: the half-cell
+/// term belongs in one place or it drifts.
+function refresh(surf, holder, L, showLoss, B, R, NET, feather) {
+  if (!holder) { surf.ext = null; return; }
+  // The budget is keyed in only while a budget-dependent layer is drawn;
+  // otherwise a slider tick over a map with no sweep threw away a valid
+  // surface for a byte-identical recompose (~32 ms of clone, copy and
+  // putImageData, measured).
+  //
+  // With the shader drawing them, the overlays are not IN the surface, so
+  // they must not be in its key either: a budget tick would otherwise discard
+  // a still-correct base for a byte-identical recompose, which is most of
+  // what the tick used to cost.
+  const glOn = glo.active();
+  const sL = glOn ? false : showLoss, sN = glOn ? false : NET;
+  const key = composeKey(L, sL, sL ? B : 0, R, sN, composeGen);
+  if (surf.key === key && surf.owner === holder.t) return;
+  const { t, w, h } = holder;
+  const rgba = glOn ? t.compose_base(L, R, feather) : t.compose(L, showLoss, B, R, NET, feather);
+  if (surf.cv.width !== w || surf.cv.height !== h) { surf.cv.width = w; surf.cv.height = h; }
+  surf.cx.putImageData(
+    new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.length), w, h), 0, 0);
+  surf.owner = t;
+  surf.key = key;
+  surf.ext = t.outer_bounds();
+}
+
+/// Draw the footprints ONCE into their own surface.
+///
+/// This layer is up to 900 000 vertices in ~90 000 rings, and `draw()` used to
+/// path every one of them TWICE a frame — once for the loss-coloured fills,
+/// once for the outlines — which is order 1.8 M Canvas2D calls per frame. It
+/// is the same mistake the base map had: geometry that does not depend on the
+/// camera, redrawn for every camera move. Below 9 km the layer is on and
+/// `pointermove` fires per event, so a drag over a city block was re-pathing a
+/// district each time.
+///
+/// The surface is sized to the CANVAS and covers the box the footprints were
+/// fetched for, so a stroke is about a pixel at the zoom it was drawn at and
+/// stays within a zoom notch of that until the next fetch replaces it.
+let bldgGen = 0;
+// Two surfaces, because they change for different reasons. The OUTLINES change
+// only when the cache does; the FILLS also change with the budget, the
+// census, k and the mode. Drawn on one surface, a budget tick re-pathed every
+// outline for nothing -- measured 42-45 ms per settled pan at 3 km with the
+// census fill on, against 11-14 ms for outlines alone. With two surfaces an
+// outline-only pan never pays for fills, and a budget move never re-strokes.
+function bldgBoxNow() {
+  return tileBounds
+    ? { minx: tileBounds[0], miny: tileBounds[1], maxx: tileBounds[2], maxy: tileBounds[3] }
+    : { minx: view.minx, miny: view.miny, maxx: view.maxx, maxy: view.maxy };
+}
+// Rings are closed with an explicit lineTo back to the first vertex, NOT with
+// closePath(): closePath() on a path holding many subpaths is O(subpaths) in
+// Chrome, so closing n rings is O(n squared). Measured on a real 3 km city
+// view -- 12 589 rings, 126 507 vertices: 5.9 ms open, 3211 ms with
+// closePath() per ring. Same geometry, 550x the time.
+function bldgPather(bx, box, s) {
+  const sx = s.w / (box.maxx - box.minx), sy = s.h / (box.maxy - box.miny);
+  const ox = bldgOrigin[0], oy = bldgOrigin[1];
+  return r => {
+    const n = r.length >> 1;
+    if (n < 3) return;
+    const x0 = (ox + r[0] - box.minx) * sx, y0 = (box.maxy - (oy + r[1])) * sy;
+    bx.moveTo(x0, y0);
+    for (let i = 1; i < n; i++)
+      bx.lineTo((ox + r[i*2] - box.minx) * sx, (box.maxy - (oy + r[i*2+1])) * sy);
+    bx.lineTo(x0, y0);
+  };
+}
+const bldgInBox = (e, box) => !(e.x1 < box.minx || e.x0 > box.maxx || e.y1 < box.miny || e.y0 > box.maxy);
+
+function refreshBuildingOutlines(s, colouring) {
+  const box = bldgBoxNow();
+  const key = `${bldgGen}|${colouring ? 1 : 0}|${s.w}x${s.h}|${box.minx},${box.miny},${box.maxx},${box.maxy}`;
+  if (bldgSurf.key === key) return;
+  const cvb = bldgSurf.cv, bx = bldgSurf.cx;
+  if (cvb.width !== s.w || cvb.height !== s.h) { cvb.width = s.w; cvb.height = s.h; }
+  bx.clearRect(0, 0, s.w, s.h);
+  const path = bldgPather(bx, box, s);
+  // Outlines always, so the geometry is legible with or without a fill -- this
+  // layer exists so a transmitter can be dropped on a specific roof.
+  bx.beginPath();
+  for (const e of bldgInBoxIter(box)) for (const r of e.rings) path(r);
+  bx.lineWidth = 1;
+  bx.strokeStyle = colouring ? '#00000044' : '#3a3f4633';
+  bx.stroke();
+  bldgSurf.key = key;
+  bldgSurf.ext = [box.minx, box.miny, box.maxx, box.maxy];
+}
+
+// COVERAGE BY BUILDING. The raster answers per 5 m cell, and on this pack 66%
+// of every cell that touches a building straddles a facade -- so most of the
+// built city is drawn as a blend of the roof and the street beside it,
+// describing neither. A building is one receiver, so it gets one colour, and
+// the edge of the colour is the edge of the building rather than the edge of a
+// cell. Courtyards stay uncoloured because they are rings of the same building
+// and the even-odd fill leaves them out -- correct: an Innenhof is open sky.
+//
+// Two questions, two palettes, never both. 'loss' ramps by margin against the
+// budget for ONE candidate site. 'census' uses the whole-mesh palette: reached
+// by nobody, reached but below the redundancy target k, reached by k or more
+// -- deepening with the count, because "one repeater" and "four repeaters"
+// are different operational facts even though both clear k=1.
+function refreshBuildingFills(s, colour, B, netK) {
+  const box = bldgBoxNow();
+  const key = `${bldgGen}|${colour}|${colour === 'loss' ? B : 0}|${colour === 'census' ? netK : 0}` +
+              `|${s.w}x${s.h}|${box.minx},${box.miny},${box.maxx},${box.maxy}`;
+  if (bldgFillSurf.key === key) return;
+  const cvb = bldgFillSurf.cv, bx = bldgFillSurf.cx;
+  if (cvb.width !== s.w || cvb.height !== s.h) { cvb.width = s.w; cvb.height = s.h; }
+  bx.clearRect(0, 0, s.w, s.h);
+  const path = bldgPather(bx, box, s);
+  const buckets = new Map();
+  const LOSS_RAMP = ['#b0202f', '#d4622a', '#e0a129', '#b7c334', '#4fa03c', '#1f7a4b'];
+  const NET_RAMP  = ['#c82832', '#ebaa2d', '#5fae63', '#3f9a54', '#2b8447', '#1f6e3c'];
+  const ramp = colour === 'loss' ? LOSS_RAMP : NET_RAMP;
+  for (const e of bldgInBoxIter(box)) {
+    let k;
+    if (colour === 'loss') {
+      if (!isFinite(e.loss)) continue;
+      const m = B - e.loss;                       // margin, dB
+      k = Math.max(0, Math.min(5, Math.floor((m + 10) / 6)));
+    } else {
+      if (!isFinite(e.census)) continue;
+      const n = e.census, kk = Math.max(1, netK || 1);
+      k = n <= 0 ? 0 : n < kk ? 1 : Math.min(5, 2 + Math.min(3, Math.round(n - kk)));
+    }
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(e);
+  }
+  for (const [k, es] of buckets) {
+    bx.beginPath();
+    for (const e of es) for (const r of e.rings) path(r);
+    bx.fillStyle = ramp[k] + 'cc';
+    bx.fill('evenodd');
+  }
+  bldgFillSurf.key = key;
+  bldgFillSurf.ext = [box.minx, box.miny, box.maxx, box.maxy];
+}
+
+/// Paint a composed surface under the camera. One hardware-accelerated blit.
+///
+/// `drawImage` clips the destination proportionally when the source rectangle
+/// runs off the image, which is what makes panning past a tile's edge simply
+/// reveal whatever was drawn underneath instead of needing a code path.
+function paint(surf, s) {
+  if (!surf.ext) return;
+  const [minx, miny, maxx, maxy] = surf.ext;
+  const px = surf.cv.width / (maxx - minx), py = surf.cv.height / (maxy - miny);
+  const sx = (view.minx - minx) * px, sw = vw(view) * px;
+  const sy = (maxy - view.maxy) * py, sh = vh(view) * py;
+  if (sw <= 0 || sh <= 0) return;
+  ctx.drawImage(surf.cv, sx, sy, sw, sh, 0, 0, s.w, s.h);
+}
+
+// ---- the two overlays, on the GPU ---------------------------------------
+//
+// WHY THEY LEFT THE TILE COMPOSITE. `compose()` painted the coverage ramp and
+// the census into the tile surface at the TILE's cell resolution, so every
+// budget tick was a full re-composite. Measured on the Berlin 5 m pack over a
+// 1248x1000 canvas, budget tick to pixels, as the page's own render counter
+// reports it:
+//
+//                          25.6 km view      3.1 km view
+//   before / CPU path      57-83 ms          25-34 ms   (footprints off)
+//   GL path                 0-1  ms           0-1  ms
+//
+// and the composite underneath it, in the same runs (median of 5, including
+// the putImageData that follows):
+//
+//                          25.6 km (1997x1600)   3.1 km (1005x805)
+//   compose + coverage      49-60 ms              12.9 ms
+//   compose + census        75-82 ms              18.3 ms
+//   compose_base             5.7 ms                1.4 ms
+//
+// That composite is what the 140 ms trailing debounce on the slider was
+// buying: the readout moved and the map followed a seventh of a second later.
+//
+// But neither overlay is camera-independent the way the base is. Each is one
+// point sample of a raster window per output pixel plus a colour ramp, which
+// is exactly what a fragment shader does for free. So the surface now carries
+// the base ALONE (`compose_base`), the overlays are drawn into an offscreen
+// WebGL2 canvas sized to the visible one, and the page blits that over the
+// base. Still one visible canvas, still the same draw order.
+//
+// It also moves WHERE the overlays are sampled: at screen pixels rather than
+// at tile cells, so they are no longer resampled along with the base. On a
+// smooth patch the two paths agree to under a count (mean 0.83/255 where the
+// local 3x3 luminance range is under 4); on rough ground they diverge in
+// proportion to the contrast (mean 20/255 where that range is over 36),
+// because the CPU path was upsampling an already-coloured overlay. The
+// difference is a resolution, not a colour: `?selftest=overlay` compares the
+// COLOURS against planner_render and finds them identical.
+//
+// The CPU path stays, entire. WebGL2 can be absent, and a context is lost
+// whenever a laptop switches GPUs or the driver resets. `glo.active()` decides
+// at boot and again on every context event, and every caller asks it rather
+// than assuming. `?gl=0` forces the CPU path, which is how the "before"
+// column above was measured against this same build.
+
+// The overlay windows exactly as the server sent them, kept in the page
+// because the shader samples them directly. The INTEGER wire form is what
+// gets uploaded: "not evaluated" is 65535 (loss) and 255 (census) in it, and
+// an explicit sentinel is the only portable way to say that to a texture --
+// a float texture would have to carry NaN, and NaN through a sampler is not
+// portable. The f32 copies stay too, because the CPU fallback needs them.
+let lossWin = null, netWin = null, ovNetWin = null;
+
+const lossF32 = win => {
+  const f = new Float32Array(win.w * win.h);
+  for (let i = 0; i < f.length; i++) { const v = win.u16[i]; f[i] = v === 65535 ? NaN : v / 100; }
+  return f;
+};
+const netF32 = win => {
+  const f = new Float32Array(win.w * win.h);
+  for (let i = 0; i < f.length; i++) { const v = win.u8[i]; f[i] = v === 255 ? NaN : v; }
+  return f;
+};
+
+const OVERLAY_VERT = `#version 300 es
+// One triangle covering the clip cube. No attributes, no buffers, no VAO
+// state to get wrong -- every fragment is generated from gl_VertexID.
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// A transcription of planner_render::overlay_coverage and overlay_network,
+// with planner_terrain::Grid's two samplers. Every constant here has a twin
+// in crates/planner-render/src/lib.rs; the browser self-test (?selftest=
+// overlay) is what holds the two together, because nothing else can.
+const OVERLAY_FRAG = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+
+uniform usampler2D u_loss;   // R16UI, decibels x100, 65535 = not evaluated
+uniform usampler2D u_net;    // R8UI, repeaters reaching the cell, 255 = ditto
+
+// This fragment's position in the ACTIVE window's cell coordinates:
+//   fx = u_map.x + gl_FragCoord.x * u_map.y
+//   fy = u_map.z + gl_FragCoord.y * u_map.w
+// The page folds camera and window into those four numbers in f64 and rounds
+// once. Handing the camera rectangle in directly would not survive single
+// precision: this pack's northings are ~5.8e6 m, where one f32 step is 0.5 m
+// -- a fifth of a pixel at a 3 km view, and worse the further you zoom in.
+uniform vec4 u_map;
+uniform ivec2 u_size;        // the active window's cell counts
+uniform int u_mode;          // 0 = coverage ramp, 1 = census
+uniform float u_budget;      // dB
+uniform float u_k;           // redundancy target, >= 1
+uniform vec4 u_fade;         // tile box in framebuffer px: x0, y0, x1, y1
+uniform float u_fadew;       // feather width in px; 0 = no feather
+
+out vec4 o;
+
+// planner_render::lerp
+float ramp(float a, float b, float t) { return a + (b - a) * clamp(t, 0.0, 1.0); }
+
+vec4 shade() {
+  // Transparent is the default answer, and it is the RIGHT one wherever the
+  // window has no data: the CPU path leaves the base untouched there, and
+  // "we did not look" must not paint the same as "nothing is there".
+  float fx = u_map.x + gl_FragCoord.x * u_map.y;
+  float fy = u_map.z + gl_FragCoord.y * u_map.w;
+  // Grid's domain: half a cell beyond the outer cell CENTRES. Its 1e-9 slack
+  // is omitted because at these magnitudes it is far below one f32 step and
+  // could not change any comparison; it costs a boundary pixel at most.
+  if (fx < -0.5 || fy < -0.5 ||
+      fx > float(u_size.x) - 0.5 || fy > float(u_size.y) - 0.5) return vec4(0.0);
+
+  if (u_mode == 1) {
+    // sample_nearest. Counts, not levels: averaging 0 and 2 into 1 would
+    // invent a redundancy tier that no site actually provides.
+    //
+    // floor(f + 0.5), not round(): GLSL leaves round()'s tie direction to the
+    // implementation while Rust's f64::round is half-away-from-zero, and over
+    // this domain (f >= -0.5) floor(f + 0.5) is exactly that.
+    int c = clamp(int(floor(fx + 0.5)), 0, u_size.x - 1);
+    int r = clamp(int(floor(fy + 0.5)), 0, u_size.y - 1);
+    uint n = texelFetch(u_net, ivec2(c, r), 0).r;
+    if (n == 255u) return vec4(0.0);
+    vec4 c4 = n == 0u        ? vec4(200.0,  40.0, 50.0, 150.0)   // reached by nobody
+            : float(n) < u_k ? vec4(235.0, 170.0, 45.0, 135.0)   // below the target
+                             : vec4( 40.0, 150.0, 90.0, 120.0);  // k or more
+    return c4 / 255.0;
+  }
+
+  // sample_bilinear, tap for tap and weight for weight.
+  float cx = clamp(fx, 0.0, float(u_size.x - 1));
+  float cy = clamp(fy, 0.0, float(u_size.y - 1));
+  int c0 = int(floor(cx)), r0 = int(floor(cy));
+  int c1 = min(c0 + 1, u_size.x - 1), r1 = min(r0 + 1, u_size.y - 1);
+  float tx = cx - float(c0), ty = cy - float(r0);
+  uvec4 q = uvec4(texelFetch(u_loss, ivec2(c0, r0), 0).r,
+                  texelFetch(u_loss, ivec2(c1, r0), 0).r,
+                  texelFetch(u_loss, ivec2(c0, r1), 0).r,
+                  texelFetch(u_loss, ivec2(c1, r1), 0).r);
+  // On the CPU an unevaluated tap is NaN, and NaN poisons the sample whatever
+  // its weight. Dropping the tap and renormalising instead would paint a
+  // level over ground the sweep never reached.
+  if (q.x == 65535u || q.y == 65535u || q.z == 65535u || q.w == 65535u) return vec4(0.0);
+  vec4 v = vec4(q) / 100.0;
+  float top = v.x * (1.0 - tx) + v.y * tx;
+  float bot = v.z * (1.0 - tx) + v.w * tx;
+  float lb  = top * (1.0 - ty) + bot * ty;
+
+  // planner_render::coverage_colour: green (strong) to red (marginal),
+  // transparent beyond the budget, 30 dB of headroom spanning the ramp.
+  if (lb > u_budget) return vec4(0.0);
+  float t = clamp((u_budget - lb) / 30.0, 0.0, 1.0);
+  vec3 c3;
+  if (t > 0.5) { float u = (t - 0.5) * 2.0;
+                 c3 = vec3(ramp(240.0, 40.0, u), ramp(200.0, 170.0, u), ramp(60.0, 90.0, u)); }
+  else         { float u = t * 2.0;
+                 c3 = vec3(ramp(200.0, 240.0, u), ramp(50.0, 200.0, u), ramp(50.0, 60.0, u)); }
+  // Rust's cast to u8 truncates; floor() is that, and dividing by 255 into an
+  // RGBA8 target lands each channel back on exactly that byte.
+  return vec4(floor(c3) / 255.0, 165.0 / 255.0);
+}
+
+void main() {
+  o = shade();
+  // planner-wasm's feather, applied to the overlay the way the CPU path
+  // applies it to the surface the overlay used to be part of: alpha scaled
+  // by distance-to-edge over the fade width. Off (u_fadew = 0) for a tile
+  // that covers the view, for the overview pass and for the self-test, whose
+  // parity reference has no feather.
+  if (u_fadew > 0.0 && o.a > 0.0) {
+    vec2 p = gl_FragCoord.xy;
+    float d = min(min(p.x - u_fade.x, u_fade.z - p.x), min(p.y - u_fade.y, u_fade.w - p.y));
+    o.a *= clamp(d / u_fadew, 0.0, 1.0);
+  }
+}`;
+
+const glo = (() => {
+  const cvg = document.createElement('canvas');
+  let gl = null, prog = null, u = {}, dummyL = null, dummyN = null, ok = false, maxTex = 0;
+  // window object -> { tex, bytes }. Keyed by IDENTITY, because a decode
+  // produces a new object per fetch and the same object is never re-uploaded.
+  const cache = new Map();
+  let lastUpload = { bytes: 0, ms: 0 };
+
+  function shader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error('overlay shader: ' + gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  function newTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    // Integer textures are not filterable at all, which is the point: every
+    // tap in the shader is an explicit texelFetch, so the interpolation is
+    // ours and is the same arithmetic the CPU does.
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+
+  function build() {
+    prog = gl.createProgram();
+    gl.attachShader(prog, shader(gl.VERTEX_SHADER, OVERLAY_VERT));
+    gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, OVERLAY_FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      throw new Error('overlay program: ' + gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    for (const n of ['u_map', 'u_size', 'u_mode', 'u_budget', 'u_k', 'u_loss', 'u_net',
+                     'u_fade', 'u_fadew'])
+      u[n] = gl.getUniformLocation(prog, n);
+    gl.uniform1i(u.u_loss, 0);
+    gl.uniform1i(u.u_net, 1);
+    // Rows are 1- and 2-byte wide and windows have odd cell counts.
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    // BOTH samplers belong to the linked program whatever the mode, and
+    // sampling a texture that was never given storage is undefined. One
+    // sentinel cell each makes the idle one complete and unmistakably empty.
+    dummyL = newTex();
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, 1, 1, 0, gl.RED_INTEGER,
+                  gl.UNSIGNED_SHORT, new Uint16Array([65535]));
+    dummyN = newTex();
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, 1, 1, 0, gl.RED_INTEGER,
+                  gl.UNSIGNED_BYTE, new Uint8Array([255]));
+    maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+  }
+
+  /// Upload a window if this context has not seen it, and return its texture.
+  function texFor(win, mode) {
+    let e = cache.get(win);
+    if (!e) {
+      const t0 = performance.now();
+      const tex = newTex();
+      const bytes = win.w * win.h * (mode === 1 ? 1 : 2);
+      if (mode === 1)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, win.w, win.h, 0,
+                      gl.RED_INTEGER, gl.UNSIGNED_BYTE, win.u8);
+      else
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, win.w, win.h, 0,
+                      gl.RED_INTEGER, gl.UNSIGNED_SHORT, win.u16);
+      e = { tex, bytes };
+      cache.set(win, e);
+      lastUpload = { bytes, ms: +(performance.now() - t0).toFixed(2) };
+      // Only the windows the page still holds are worth keeping. Without this
+      // every pan would leak a few megabytes of GPU memory for a window
+      // nothing can ask for again.
+      for (const [k, v] of cache)
+        if (k !== lossWin && k !== netWin && k !== ovNetWin && k !== win) {
+          gl.deleteTexture(v.tex);
+          cache.delete(k);
+        }
+    }
+    return e.tex;
+  }
+
+  /// Camera and window folded into the shader's `u_map`, in f64, rounded to
+  /// f32 exactly once. Exported so the parity reference samples the same
+  /// points the GPU does rather than a second derivation of them.
+  function mapOf(win, v, s) {
+    const dx = win.rx, dy = -win.ry;   // set_loss/set_network negate res_y
+    return new Float32Array([
+      (v.minx - win.ox) / dx,
+      (v.maxx - v.minx) / (s.w * dx),
+      (v.miny - win.oy) / dy,
+      (v.maxy - v.miny) / (s.h * dy),
+    ]);
+  }
+
+  /// Draw `passes` (in order) into the offscreen canvas and return it.
+  ///
+  /// A pass is `{ win, mode, budget, k, scissor }`. Blending is OFF and each
+  /// pass writes final RGBA, including the transparent pixels: that is how a
+  /// scissored second pass REPLACES the first over the ground it owns instead
+  /// of tinting it twice, which mirrors the opaque tile blit replacing the
+  /// overview blit underneath.
+  function render(s, v, passes) {
+    if (!ok || !passes.length) return null;
+    if (cvg.width !== s.w || cvg.height !== s.h) { cvg.width = s.w; cvg.height = s.h; }
+    gl.viewport(0, 0, s.w, s.h);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    let drew = 0;
+    for (const p of passes) {
+      const w = p.win;
+      // A window larger than the driver's limit is not a broken map, it is a
+      // pass that does not run; the base underneath is still correct.
+      if (!w || w.w > maxTex || w.h > maxTex) continue;
+      const tex = texFor(w, p.mode);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, p.mode === 1 ? dummyL : tex);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, p.mode === 1 ? tex : dummyN);
+      if (p.scissor) { gl.enable(gl.SCISSOR_TEST); gl.scissor(...p.scissor); }
+      else gl.disable(gl.SCISSOR_TEST);
+      gl.uniform4fv(u.u_map, mapOf(w, v, s));
+      gl.uniform2i(u.u_size, w.w, w.h);
+      gl.uniform1i(u.u_mode, p.mode);
+      gl.uniform1f(u.u_budget, p.budget || 0);
+      gl.uniform1f(u.u_k, Math.max(1, p.k || 1));
+      if (p.fade) { gl.uniform4fv(u.u_fade, p.fade.box); gl.uniform1f(u.u_fadew, p.fade.width); }
+      else gl.uniform1f(u.u_fadew, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drew++;
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    return drew ? cvg : null;
+  }
+
+  /// The drawing buffer, bottom row first — the order readPixels uses.
+  function read(w, h) {
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return px;
+  }
+
+  cvg.addEventListener('webglcontextlost', e => {
+    // Without preventDefault the context is never restored.
+    e.preventDefault();
+    ok = false;
+    cache.clear();                      // the objects died with the context
+    // Every tile surface holds the base alone. The CPU path expects the
+    // overlays baked into it, so all of them are now wrong.
+    invalidateCompose();
+    scheduleDraw();
+  });
+  cvg.addEventListener('webglcontextrestored', () => {
+    try { build(); ok = true; } catch (e) { ok = false; }
+    invalidateCompose();
+    scheduleDraw();
+  });
+
+  try {
+    // `gl=0` forces the CPU path — for a machine where the shader misbehaves,
+    // and for measuring the two paths against one build.
+    if (new URLSearchParams(location.search).get('gl') !== '0') {
+      gl = cvg.getContext('webgl2', {
+        alpha: true, premultipliedAlpha: false, antialias: false,
+        depth: false, stencil: false,
+      });
+      if (gl) { build(); ok = true; }
+    }
+  } catch (e) { ok = false; }
+
+  return {
+    active: () => ok,
+    render, read, mapOf,
+    lastUpload: () => lastUpload,
+    textureBytes: () => { let n = 0; for (const e of cache.values()) n += e.bytes; return n; },
+    // The self-test's fallback drill. A lost context is the failure mode this
+    // whole path has to survive on a laptop that switches GPUs, and the only
+    // honest way to know the CPU path really comes back is to take the
+    // context away and look.
+    loseContextExtension: () => (ok ? gl.getExtension('WEBGL_lose_context') : null),
+  };
+})();
+
+/// The detail tile's box in framebuffer pixels (origin BOTTOM-left, which is
+/// where GL's scissor counts from), plus the feather that box gets, or null
+/// when there is no tile.
+///
+/// The box is the one the tile SURFACE is painted into -- `paint` uses
+/// `surf.ext`, the Tile's `outer_bounds()` -- not the requested box. The
+/// server clips a tile to the pack, and where the two differ the requested box
+/// would let this pass paint overlay over ground the detail tile does not own.
+/// (`tileBounds` stays what `covered` and the refetch box are judged by.)
+///
+/// The feather mirrors planner-wasm's: a tile that does not cover the view has
+/// its outer twelve cells (a quarter of the smaller side on a tiny tile) faded
+/// out, so its edge reads as "the detail stops here" and not as a boundary in
+/// the data. The overlay used to live inside that surface and fade with it;
+/// drawn separately it has to fade by the same rule, or the coverage ends in a
+/// hard square over a base that is dissolving into the overview.
+function tileScissor(s) {
+  const ext = (tileSurf.ext && tileSurf.owner === tile) ? tileSurf.ext : tileBounds;
+  if (!ext) return null;
+  const kx = s.w / vw(view), ky = s.h / vh(view);
+  const fx0 = (ext[0] - view.minx) * kx, fx1 = (ext[2] - view.minx) * kx;
+  const fy0 = (ext[1] - view.miny) * ky, fy1 = (ext[3] - view.miny) * ky;
+  const x0 = Math.round(fx0), x1 = Math.round(fx1);
+  const y0 = Math.round(fy0), y1 = Math.round(fy1);
+  const cw = tileHolder ? tileHolder.w : 0, ch = tileHolder ? tileHolder.h : 0;
+  const fCells = cw && ch ? Math.min(12, Math.min(cw, ch) / 4) : 0;
+  const width = fCells >= 1 ? fCells * ((fx1 - fx0) / cw) : 0;
+  return { scissor: [x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0)],
+           fade: width > 0 ? { box: new Float32Array([fx0, fy0, fx1, fy1]), width } : null };
+}
+
+/// Which windows this frame draws, in the order the base blits go down.
+///
+/// The overview's census only shows where the detail tile does not reach,
+/// exactly as its base blit does — and the tile's pass is then scissored to
+/// the tile's own box so it replaces that census rather than compounding
+/// with it. There is no overview coverage pass because there is no overview
+/// loss raster: a sweep is fetched for the tile's window alone.
+function overlayPasses(s, covered, showLoss, NET, B) {
+  const passes = [];
+  if (!covered && NET && ovNetWin)
+    passes.push({ win: ovNetWin, mode: 1, k: ovNetWin.k });
+  const win = showLoss ? lossWin : NET ? netWin : null;
+  if (win)
+    // k off the WINDOW, not off the page's `netK`: it is the number that went
+    // into the Tile alongside this raster, and a census fetched before the
+    // operator changed k must be drawn with the k it was computed for.
+    passes.push({ win, mode: showLoss ? 0 : 1, budget: B, k: win.k,
+                  ...(covered ? {} : (tileScissor(s) || {})) });
+  return passes;
+}
+
+/// One draw per frame at most, for inputs that force a RECOMPOSE.
+///
+/// setTimeout rather than requestAnimationFrame: rAF is throttled to a
+/// standstill whenever the page is not being painted (a hidden pane, a
+/// background tab), and this file has already been bitten twice by that.
+let drawQueued = false;
+function scheduleDraw() {
+  if (drawQueued) return;
+  drawQueued = true;
+  setTimeout(() => { drawQueued = false; draw(); }, 16);
+}
+
+function draw() {
+  if ((!tile && !overview) || !view) return;
+  const s = size();
+  if (cv.width !== s.w || cv.height !== s.h) {
+    cv.width = s.w; cv.height = s.h;
+    cv.style.width = s.cw + 'px'; cv.style.height = s.ch + 'px';
+  }
+  const t0 = performance.now();
+  const L = +el('layer').value, B = +el('bud').value, R = el('roads').checked;
+  // Exactly one coverage overlay, decided by the mode — never both, never
+  // neither-because-a-checkbox-was-left-off. `lossLoaded` below is gated the
+  // same way, so a census does not sit underneath a candidate site's reach.
+  const mode = el('covmode') ? el('covmode').value : 'tx';
+  const NET = mode === 'net' && netReady && el('netshow').checked;
+  const showLoss = mode === 'tx' && lossLoaded;
+
+  // Does the detail tile cover the whole view? When it does — the common
+  // case — the overview underneath cannot show, so it is not even blitted.
+  const covered = tile && tileBounds &&
+    view.minx >= tileBounds[0] && view.miny >= tileBounds[1] &&
+    view.maxx <= tileBounds[2] && view.maxy <= tileBounds[3];
+
+  // Recompose only what actually changed; then the frame is two blits.
+  // The overview is never feathered — its edge IS the pack edge, and fading
+  // that would suggest the data trails off where in fact it stops.
+  if (overview && !covered) refresh(ovSurf, overviewHolder, L, false, B, false, NET, false);
+  if (tile) refresh(tileSurf, tileHolder, L, showLoss, B, R, NET, true);
+
+  ctx.fillStyle = '#eeece7';
+  ctx.fillRect(0, 0, s.w, s.h);
+  if (!covered) paint(ovSurf, s);
+  paint(tileSurf, s);
+  // The overlays, at SCREEN resolution, over the base and under everything
+  // else — the same place the CPU path puts them, since it composites them
+  // into the surface that was just blitted. One drawImage of one offscreen
+  // canvas, so this is still a single visible canvas with an unchanged order.
+  //
+  // This blend is the 2D canvas's source-over of an unpremultiplied canvas,
+  // not planner_render's trunc(c*a + base*(1-a)). Measured in the browser
+  // (5 palette colours x 4 bases): 0 or +1 per channel against the Rust
+  // arithmetic, never negative, never more — so an overlaid pixel can be one
+  // count brighter than on the CPU path. Closing that would mean uploading the
+  // base as a texture and blending in the shader, which costs the single
+  // blit; it is left as the known residual of this path.
+  if (glo.active()) {
+    const g = glo.render(s, view, overlayPasses(s, covered, showLoss, NET, B));
+    if (g) ctx.drawImage(g, 0, 0);
+  }
+  // Markers drawn in 2D so they stay crisp and cost nothing.
+  const toPx = p => [((p.x - view.minx) / vw(view)) * s.w,
+                     ((view.maxy - p.y) / vh(view)) * s.h];
+
+  // Building footprints, UNDER everything else.
+  //
+  // These exist because the terminal correction reads the building a node is
+  // standing on, so a transmitter dropped ten metres off lands on a different
+  // roof — or in the street — and the whole coverage pattern changes.
+  // Placing a node used to be a click on a hillshade; it now has to be a
+  // click on a specific building, and that is only possible if the buildings
+  // are visible. Outlines rather than fills: a filled block hides the
+  // courtyard, and the courtyard is where a node is NOT.
+  // Footprints, composed like the base map rather than re-pathed per frame.
+  // See `refreshBuildings`.
+  if (bldgCache.size && el('showbldg') && el('showbldg').checked
+      && vw(view) <= BLDG_MAX_VIEW_M) {
+    // Fill below the colour cut-off, by whichever question the map is
+    // answering; outlines alone between there and the outline cut-off.
+    const colour = vw(view) > BLDG_COLOUR_VIEW_M ? ''
+      : showLoss ? 'loss' : NET ? 'census' : '';
+    if (colour) { refreshBuildingFills(s, colour, B, netK); paint(bldgFillSurf, s); }
+    refreshBuildingOutlines(s, !!colour);
+    paint(bldgSurf, s);
+  } else {
+    bldgSurf.ext = null; bldgFillSurf.ext = null;
+  }
+
+  // The network already on the air. Drawn UNDER the transmitter and link
+  // markers: it is context for the decision, not the decision.
+  if (nodes.length && el('shownodes').checked) {
+    let shown = 0;
+    const laid = layoutMarkers(s);
+    lastMarkersShown = laid.length;
+    for (const mk of laid) {
+      const { fx, fy, r } = mk;
+      shown += mk.count;
+      if (mk.count > 1) {
+        // A CLUSTER. It keeps the hollow/solid language of the single markers:
+        // hollow means every node in it has an unmeasured antenna height, which
+        // is the fact that decides whether its coverage means anything.
+        const allUnknown = mk.list.every(n => n.hUnknown);
+        const anyEdited = mk.list.some(n => n.edited);
+        ctx.beginPath(); ctx.arc(fx, fy, r, 0, 6.284);
+        ctx.fillStyle = allUnknown ? '#ffffffe6' : '#1c4f8fe6';
+        ctx.fill();
+        ctx.lineWidth = anyEdited ? 2.4 : 1.8;
+        ctx.strokeStyle = anyEdited ? '#e08a00' : '#1c4f8f';
+        ctx.stroke();
+        const label = mk.count > 999 ? '999+' : String(mk.count);
+        ctx.font = `600 ${Math.max(9, Math.round(r * 1.05))}px ui-monospace,Consolas,monospace`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = allUnknown ? '#1c4f8f' : '#fff';
+        ctx.fillText(label, fx, fy + 0.5);
+        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+        continue;
+      }
+      const n = mk.node;
+      // TWO independent facts, so two independent channels. SHAPE says whether
+      // somebody edited this node here (diamond vs circle); FILL says whether
+      // its antenna height is known (solid vs hollow). Colour alone cannot
+      // carry either at 3-6 px, and folding them into one three-way style —
+      // which is what this did — made a tx-power-only edit repaint an
+      // unmeasured node as a solid "surveyed" diamond. That is the exact
+      // laundering this panel exists to prevent: over the same 263 Berlin
+      // sites, the assumed height alone moves the census by 23 points of
+      // population and 88x in backbone edges, and a tx edit changes none of it.
+      // Both flags are stamped on the node, so neither costs a lookup here.
+      if (n.edited) {
+        const d = r + 1.5;
+        ctx.beginPath();
+        ctx.moveTo(fx, fy - d); ctx.lineTo(fx + d, fy);
+        ctx.lineTo(fx, fy + d); ctx.lineTo(fx - d, fy); ctx.closePath();
+        ctx.fillStyle = n.hUnknown ? '#fff' : '#e08a00';
+        ctx.fill();
+        ctx.lineWidth = n.hUnknown ? 1.8 : 1.4;
+        ctx.strokeStyle = n.hUnknown ? '#e08a00' : '#4a2d00';
+        ctx.stroke();
+      } else {
+        // Nodes whose height nobody has measured are drawn hollow: the coverage
+        // they are credited with rests on an assumption, and that should be
+        // visible on the map rather than buried in a report footnote.
+        ctx.beginPath(); ctx.arc(fx, fy, r, 0, 6.284);
+        if (n.hUnknown) {
+          ctx.fillStyle = '#fff'; ctx.fill();
+          ctx.lineWidth = 1.6; ctx.strokeStyle = '#1c4f8f'; ctx.stroke();
+        } else {
+          ctx.fillStyle = '#1c4f8f'; ctx.fill();
+          ctx.lineWidth = 1.2; ctx.strokeStyle = '#fff'; ctx.stroke();
+        }
+      }
+      if (n === selected) {
+        ctx.beginPath(); ctx.arc(fx, fy, r + 4.5, 0, 6.284);
+        ctx.lineWidth = 2; ctx.strokeStyle = '#be1e78'; ctx.stroke();
+      }
+    }
+    // Refresh on a change to EITHER count: the marker count is the one that
+    // would churn if the clustering were unstable under panning.
+    if (shown !== lastNodesShown || lastMarkersShown !== lastMarkersReported) {
+      lastNodesShown = shown; lastMarkersReported = lastMarkersShown; updateNodeStat();
+    }
+  }
+  if (tx && tx.xy && linkB) {
+    const [x0, y0] = toPx(tx.xy), [x1, y1] = toPx(linkB);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
+    ctx.setLineDash([7, 5]); ctx.lineWidth = 2.5;
+    ctx.strokeStyle = '#1c4f8f'; ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(x1, y1, 5, 0, 6.284);
+    ctx.fillStyle = '#1c4f8f'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+  if (pin) {
+    const [fx, fy] = toPx(pin);
+    ctx.beginPath(); ctx.moveTo(fx, fy);
+    ctx.bezierCurveTo(fx - 9, fy - 12, fx - 7, fy - 24, fx, fy - 24);
+    ctx.bezierCurveTo(fx + 7, fy - 24, fx + 9, fy - 12, fx, fy);
+    ctx.fillStyle = '#be1e78'; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = '#fff'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(fx, fy - 16, 3.2, 0, 6.284);
+    ctx.fillStyle = '#fff'; ctx.fill();
+  }
+  if (tx && tx.xy) {
+    const [fx, fy] = toPx(tx.xy);
+    ctx.beginPath(); ctx.arc(fx, fy, 6, 0, 6.284);
+    ctx.fillStyle = '#c81e2d'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+  lastRenderMs = Math.round(performance.now() - t0);
+  showStat();
+}
+
+function showStat() {
+  const km = (vw(view)/1000);
+  stat.textContent =
+    `view    ${km.toFixed(1)} km wide\n` +
+    `render  ${lastRenderMs} ms (local)\n` +
+    `tile    ${tileRes ? tileRes.toFixed(0)+' m/cell, '+lastFetchMs+' ms' : '—'}\n` +
+    (lastComputeMs !== null ? `p.1812  ${lastComputeMs} ms\n` : '') +
+    (tx && tx.lat !== null ? `tx      ${tx.lat.toFixed(5)}, ${tx.lon.toFixed(5)}` : '');
+  hud.textContent = `${km.toFixed(1)} km · ${lastRenderMs} ms local`;
+}
+
+// ---- data: fetched only when the view outgrows what we hold -------------
+function needTile() {
+  if (!tile || !tileBounds) return true;
+  const b = tileBounds;
+  if (view.minx < b[0] || view.miny < b[1] || view.maxx > b[2] || view.maxy > b[3]) return true;
+  const wantRes = vw(view) / size().w;
+  // Asymmetric on purpose. Zooming IN past the tile's own cell size cannot
+  // reveal detail the tile does not carry, so refetch as soon as the screen
+  // out-resolves it (1.15 ≈ one wheel notch). Zooming OUT only wastes
+  // resolution we already paid for, so it can drift much further before a
+  // coarser tile is worth another round trip.
+  // 1.35 ≈ one wheel notch of slack: a single notch reuses the tile we hold
+  // (bilinear resampling makes 1.35x acceptable), two notches refetch. Tighter
+  // than this pays a full tile fetch for every notch; looser is what made
+  // zooming in stop revealing detail.
+  // Zoom-out was allowed to drift 3x, which leaves the detail tile covering
+  // barely a third of the view — a sharp island on the coarse overview. It is
+  // no longer a blank hole (the overview fills it), but a hard-edged patch of
+  // detail reads as a data boundary, and this pack HAS real ones. 1.6 keeps
+  // the mismatch small and brief; the tile is fetched 1.6x oversized anyway,
+  // so at this threshold it still covers the view.
+  // ...but never demand finer than the PACK has. Once the tile is at native
+  // resolution (tile_dims caps it there), zooming in cannot reveal detail the
+  // pack does not carry, and the test below could never be satisfied -- so
+  // every settled pan at a 3 km view on a 5 m pack refetched the tile, the
+  // basemap, both overlays and the footprints (measured: five requests for a
+  // 220 px pan, all for ground the held tile already covered).
+  const canRefine = !(pack && pack.res_m > 0) || tileRes > pack.res_m * 1.01;
+  return (canRefine && wantRes < tileRes / 1.35) || wantRes > tileRes * 1.6;
+}
+
+/// Decode one `PTL2` tile into a WASM Tile. Shared by the detail tile and the
+/// resident overview so the two can never drift apart in format handling.
+function decodeTile(buf) {
+  const dv = new DataView(buf);
+  if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PTL2')
+    throw new Error('bad tile');
+  const w = dv.getUint32(4, true), h = dv.getUint32(8, true);
+  const ox = dv.getFloat64(12, true), oy = dv.getFloat64(20, true);
+  // Both axes: one square cell size derived from the width silently
+  // stretches the raster whenever view and pixel aspect disagree.
+  const rx = dv.getFloat64(28, true), ry = dv.getFloat64(36, true);
+  const flags = dv.getUint8(44);
+  let off = 45;
+  const n = w * h;
+  // Decode through typed-array views over a copied slice, not per-element
+  // DataView reads: a screen-sized tile is ~1.8 M cells across four layers,
+  // and 7 M individual getUint16 calls dominated the fetch time. slice()
+  // costs one memcpy and buys the JIT a straight loop over aligned data.
+  const i16 = new Int16Array(buf.slice(off, off + n*2));
+  const terr = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const v = i16[i]; terr[i] = v === -32768 ? NaN : v * 0.1; }
+  off += n * 2;
+  const t = new Tile(ox, oy, rx, ry, w, h, terr);
+  if (flags & 1) {
+    t.set_classes(Float32Array.from(new Uint8Array(buf, off, n)));
+    off += n; }
+  if (flags & 2) { const u = new Uint16Array(buf.slice(off, off + n*2));
+    const p = new Float32Array(n);
+    for (let i = 0; i < n; i++) p[i] = u[i] * 0.1;
+    off += n * 2; t.set_population(p); }
+  if (flags & 4) { const u = new Uint16Array(buf.slice(off, off + n*2));
+    const c = new Float32Array(n);
+    for (let i = 0; i < n; i++) c[i] = u[i] * 0.1;
+    off += n * 2; t.set_clutter(c); }
+  return { t, res: rx, w, h };
+}
+
+/// One coarse tile over the whole pack, fetched once at boot.
+///
+/// 480 cells across a Berlin-sized pack is ~110 m/cell — useless for planning
+/// and exactly right for "where am I". It costs one ~1 MB request and removes
+/// every blank frame from panning, which was measured at 1-10 s.
+async function loadOverview() {
+  if (!pack) return;
+  const e = pack.extent;
+  const w = 480, h = Math.max(64, Math.round(480 * (e.maxy - e.miny) / (e.maxx - e.minx)));
+  const q = new URLSearchParams({ minx:e.minx, miny:e.miny, maxx:e.maxx, maxy:e.maxy, w, h });
+  try {
+    const r = await fetch(`/tile.bin?${q}`);
+    if (!r.ok) return;                       // no overview is survivable
+    const ov = decodeTile(await r.arrayBuffer());
+    overview = ov.t; overviewHolder = { t: ov.t, w: ov.w, h: ov.h };
+    ovNetWin = null;                         // a fresh Tile carries no census
+    draw();
+  } catch (e) { overview = null; overviewHolder = null; ovNetWin = null; }
+}
+
+async function fetchTile() {
+  const s = size();
+  // Never request a tile against a degenerate box. The cell size is derived
+  // from width/pixels, so a 6 px measurement asks for kilometre cells and the
+  // map renders as flat colour. Boxes can lose their size after boot too (a
+  // collapsed or hidden pane), so this is checked here, not only at startup.
+  if (s.cw < 40) { setTimeout(() => { if (needTile()) fetchTile(); }, 200); return; }
+  if (tileReq) tileReq.abort();
+  const ctrl = new AbortController(); tileReq = ctrl;
+  // A deadline on the whole update. Interaction must never be held hostage by
+  // one request that never answers: if anything in this update is still
+  // pending after 20 s, the update is abandoned and the next gesture starts a
+  // fresh one. Twenty seconds is far above the ~0.3 s a warm update takes and
+  // above a cold-cache tile from disk; it is a tripwire, not a budget.
+  const deadline = setTimeout(() => ctrl.abort(), 20000);
+  // Fetch 1.6× the viewport so small pans need no new data.
+  const padx = vw(view) * 0.3, pady = vh(view) * 0.3;
+  const b = { minx: view.minx - padx, maxx: view.maxx + padx,
+              miny: view.miny - pady, maxy: view.maxy + pady };
+  const q = new URLSearchParams({ minx:b.minx, miny:b.miny, maxx:b.maxx, maxy:b.maxy,
+                                  w: Math.round(s.w * 1.6), h: Math.round(s.h * 1.6) });
+  // Terrain only: the base map is baked on the server now, so the land-cover,
+  // population and clutter blocks would be four bytes a cell this page never
+  // reads — and three more windowed reads contending with the basemap request
+  // beside it for the same layer locks.
+  q.set('terrain_only', '1');
+  busy.classList.add('on');
+  const t0 = performance.now();
+  // Everything a tile update needs, in flight at once. None of the basemap,
+  // loss or census windows depends on the DECODED tile — only on the box and
+  // the cell count, both of which are known here — so serialising them just
+  // added their latencies together. The server recomputes the same cell count
+  // from the same query, so asking with the pre-cap numbers is the same
+  // request.
+  const bmPromise = fetchWithBackoff(`/basemap.bin?${q}&layer=${el('layer').value}` +
+                                     `&roads=${el('roads').checked ? 1 : 0}`, ctrl.signal)
+                      .catch(e => { if (e.name === 'AbortError') throw e; return null; });
+  // On failure the applier still has to RETURN an object: the adoption below
+  // reads `.loss` and `.net` off it after the new Tile is already installed,
+  // and an applier that returned undefined threw there -- leaving the tile
+  // adopted with the old box, no footprints fetch and no redraw (reproduced
+  // by rejecting /loss.bin: "tile error: Cannot read properties of undefined").
+  const ovPromise = startOverlays(b, Math.round(s.w * 1.6), Math.round(s.h * 1.6), ctrl.signal)
+                      .catch(e => { if (e.name === 'AbortError') throw e; return () => ({}); });
+  try {
+    // The server sheds load with 429 rather than queueing (it may share a
+    // 2-core VPS). That is the right server behaviour, but a client that
+    // treats it as fatal leaves the map stale with an error, so back off and
+    // retry a few times before giving up.
+    const [tr, rr] = await Promise.all([
+      fetchWithBackoff(`/tile.bin?${q}`, ctrl.signal),
+      fetch(`/roads.bin?${q}`, { signal: ctrl.signal })
+    ]);
+    if (!tr.ok) throw new Error('tile ' + tr.status);
+    const { t, res, w: tcw, h: tch } = decodeTile(await tr.arrayBuffer());
+    // From here until `tile = t` the new Tile is owned by NOBODY: it holds its
+    // terrain in WASM linear memory (tens of MB at a full-screen tile) and
+    // linear memory never shrinks, so any path out that does not free it leaks
+    // for the life of the page. There are THREE awaits in that window and a pan
+    // aborts through any of them, so the release is a finally that opens
+    // immediately -- it used to open after the basemap await, which is the
+    // longest of the three.
+    let adopted = false, got = {};
+    try {
+      // The base image is baked on the SERVER, across every core, and arrives
+      // as a fetch -- which does not block input. Baking it here costs
+      // 1.1-1.5 s on the one thread the browser also processes pointer events
+      // with, and it lands mid-drag. If the fetch fails the Tile still bakes
+      // locally, so a server without the endpoint degrades to slow, not blank.
+      await applyBasemap(t, await bmPromise);
+      if (rr.ok) {
+        const rbuf = await rr.arrayBuffer();
+        if (rbuf.byteLength) t.set_roads(new Float32Array(rbuf));
+      }
+      // Overlays for the SAME window and the SAME cell grid, before the tile is
+      // swapped in — so a pan never shows the new terrain with the old tile's
+      // coverage stretched across it.
+      got = (await ovPromise)(t);
+      if (ctrl.signal.aborted) return;
+      adopted = true;
+    } finally {
+      if (!adopted) t.free();
+    }
+    if (tile) tile.free();
+    tile = t; tileRes = res; tileHolder = { t, w: tcw, h: tch };
+    // A fresh Tile holds NO overlay raster, so the windows the shader samples
+    // start empty and take only what the installers actually put in. Assigned
+    // here, at adoption, and not before the aborts above: a pan that discards
+    // this tile must leave the one on screen with its overlays intact.
+    lossWin = (got && got.loss) || null;
+    netWin = (got && got.net) || null;
+    tileBounds = [b.minx, b.miny, b.maxx, b.maxy];
+    lastFetchMs = Math.round(performance.now() - t0);
+    fetchBuildings();
+    const bn = el('bldgnote');
+    if (bn) {
+      bn.textContent = !el('showbldg').checked ? ''
+        : vw(view) > BLDG_MAX_VIEW_M
+          ? `footprints appear below ${(BLDG_MAX_VIEW_M/1000).toFixed(0)} km across`
+          : bldgTruncated ? 'too many to draw them all — zoom in' : '';
+    }
+    if (highlight) { tile.set_highlight(highlight); invalidateCompose(); }
+    draw();
+  } catch (e) {
+    if (e.name !== 'AbortError') { stat.textContent = 'tile error: ' + e.message; }
+  } finally {
+    clearTimeout(deadline);
+    if (tileReq === ctrl) { tileReq = null; busy.classList.remove('on'); }
+  }
+}
+
+/// GET with back-off on 429.
+///
+/// The server sheds load with 429 rather than queueing (it may share a
+/// 2-core VPS). That is the right server behaviour, but a client that treats
+/// it as final leaves the map stale — or, for the basemap, silently falls
+/// back to a 1.1-1.5 s bake on the main thread, which is the stall the
+/// server-side bake exists to remove. Measured: a burst of six zoom notches
+/// puts six basemap renders in flight, two of which are refused at once.
+async function fetchWithBackoff(url, signal) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(url, { signal });
+    if (r.status !== 429 || attempt >= 6) return r;
+    await new Promise(res => setTimeout(res, 150 * (attempt + 1)));
+    if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+  }
+}
+
+/// Install an already-fetched base image into `t`.
+///
+/// Returns false when there is nothing usable, which leaves the Tile to bake
+/// locally — so a server without the endpoint degrades to slow rather than to
+/// blank.
+async function applyBasemap(t, r) {
+  if (!r || !r.ok) return false;
+  try {
+    const buf = await r.arrayBuffer(), dv = new DataView(buf);
+    if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PBM1')
+      return false;
+    const bw = dv.getUint32(4, true), bh = dv.getUint32(8, true);
+    return t.set_baked(bw, bh, new Uint8Array(buf, 44, bw * bh * 4));
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    return false;
+  }
+}
+
+/// Fetch the server-baked base image for `box` and install it in `t`.
+async function installBasemap(t, b, w, h, signal) {
+  const q = new URLSearchParams({ minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy,
+    w, h, layer: el('layer').value, roads: el('roads').checked ? 1 : 0 });
+  try {
+    return await applyBasemap(t, await fetch(`/basemap.bin?${q}`, { signal }));
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    return false;
+  }
+}
+
+/// The layer and the roads toggle are baked IN, so changing either needs a new
+/// image rather than a recompose. Coalesced, and it repaints when it lands.
+let basemapReq = null;
+async function refetchBasemap() {
+  if (!tile || !tileBounds || !tileHolder) { draw(); return; }
+  if (basemapReq) basemapReq.abort();
+  const ctrl = new AbortController(); basemapReq = ctrl;
+  const b = { minx: tileBounds[0], miny: tileBounds[1], maxx: tileBounds[2], maxy: tileBounds[3] };
+  try {
+    if (await installBasemap(tile, b, tileHolder.w, tileHolder.h, ctrl.signal)) {
+      invalidateCompose();
+    }
+  } catch (e) { /* superseded */ }
+  finally { if (basemapReq === ctrl) basemapReq = null; }
+  draw();
+}
+
+function scheduleTile() {
+  clearTimeout(tileTimer);
+  // Long enough that a burst of wheel notches issues ONE fetch at the zoom
+  // level the user settled on, short enough to feel immediate.
+  // 300 ms, up from 180. A wheel gesture delivers notches 100-300 ms apart
+  // on many mice, and at 180 each notch aborted the previous fetch — whose
+  // basemap render the server then finished anyway, for nobody. Six notches
+  // put six renders in flight; measured, two were refused with 429 and the
+  // rest took 1.6-2.0 s each instead of 0.2 s. The cost of the extra 120 ms
+  // is paid once per settled gesture, on top of a map that already redraws
+  // from the held tile per notch.
+  tileTimer = setTimeout(() => { if (needTile()) fetchTile(); }, 300);
+}
+
+// ---- overlay rasters: fetched FOR THE VIEW, never whole -----------------
+//
+// The loss raster and the deployed-network census used to arrive complete and
+// live in the tab. Measured on the Berlin 5 m pack: a 20 km sweep is 64 M
+// cells = 128 MB on the wire and ~4.1 s of frozen main thread to decode, paid
+// once per BAND (six of them, growing as r², ~7 s per sweep); the census is
+// the whole pack, 98 MB on the wire, 392 MB as a Float32Array and another
+// 392 MB inside each WASM tile it is pushed into — measured 1 -> 786 MB of
+// linear memory across the detail tile and the overview, re-copied on every
+// pan.
+//
+// Not one of those bytes could be seen. Both overlays are drawn by sampling
+// once per screen pixel, so everything finer than a pixel and everything
+// off-screen was transferred in order to be sampled away. The server now does
+// that sampling — same sampler, same points — and sends the window at the
+// tile's own cell count, so the overlay is exactly as fine as the terrain it
+// sits on. The full-resolution raster stays on the server; nothing about the
+// model changed, only which of it crosses the wire.
+function decodeLoss(buf) {
+  const dv = new DataView(buf);
+  if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PLS2')
+    throw new Error('bad loss raster');
+  const w = dv.getUint32(4, true), h = dv.getUint32(8, true);
+  const ox = dv.getFloat64(12, true), oy = dv.getFloat64(20, true);
+  const rx = dv.getFloat64(28, true), ry = dv.getFloat64(36, true);
+  const n = w * h;
+  // Typed-array view over a copied slice, not per-element DataView reads —
+  // the same lesson decodeTile records, measured here at 138 ms against
+  // 259 ms for 4 M cells.
+  //
+  // The u16 is KEPT, not discarded once `data` exists: it is what the shader
+  // uploads, sentinel and all. The f32 copy is what the CPU fallback needs,
+  // and both are cheap next to the window itself.
+  const win = { ox, oy, rx, ry, w, h, u16: new Uint16Array(buf.slice(44, 44 + n * 2)) };
+  win.data = lossF32(win);
+  return win;
+}
+
+function decodeNet(buf) {
+  const dv = new DataView(buf);
+  if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PNT2')
+    throw new Error('bad census raster');
+  const w = dv.getUint32(4, true), h = dv.getUint32(8, true);
+  const ox = dv.getFloat64(12, true), oy = dv.getFloat64(20, true);
+  const rx = dv.getFloat64(28, true), ry = dv.getFloat64(36, true);
+  const k = dv.getUint8(44);
+  const n = w * h;
+  // As in decodeLoss: the u8 is the shader's copy (255 is "not evaluated"),
+  // the f32 is the CPU fallback's, where the same cell becomes NaN so the
+  // overlay leaves it clear rather than colouring it as a gap.
+  const win = { ox, oy, rx, ry, w, h, k, u8: new Uint8Array(buf.slice(45, 45 + n)) };
+  win.f = netF32(win);
+  return win;
+}
+
+const boxQuery = (b, w, h) => new URLSearchParams({
+  minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy, w, h });
+
+/// Pull whichever overlays are live into `target` for the box it covers.
+///
+/// Called for every tile, so the overlays and the base map are always the same
+/// window and one `needTile()` governs all three. A failure here leaves the
+/// base map drawn rather than throwing the tile away: a missing overlay is a
+/// worse map, a missing tile is no map.
+/// Start every overlay fetch NOW and return a function that installs them.
+///
+/// Split from the install so a tile update is ONE round trip rather than three
+/// in series. The overlay windows depend only on the box and the cell count —
+/// not on the decoded tile — so there is no reason to wait for it, and waiting
+/// was most of the "tile updates take seconds" the operator reported.
+function startOverlays(b, w, h, signal) {
+  const box = boxQuery(b, w, h);
+  const jobs = [];
+  if (tx && tx.sweepQ) {
+    const q = new URLSearchParams(tx.sweepQ);
+    for (const [k, v] of box) q.set(k, v);
+    jobs.push(fetch(`/loss.bin?${q}`, { signal }).then(async r => {
+      if (r.status === 204 || !r.ok) return null;
+      const L = decodeLoss(await r.arrayBuffer());
+      const ms = +(r.headers.get('x-compute-ms') || lastComputeMs || 0);
+      return t => { t.set_loss(L.ox, L.oy, L.rx, L.ry, L.w, L.h, L.data);
+                    lossLoaded = true; lastComputeMs = ms; return { loss: L }; };
+    }));
+  }
+  if (netReady) {
+    jobs.push(fetch(`/network.bin?${box}`, { signal }).then(async r => {
+      if (!r.ok) return null;
+      const N = decodeNet(await r.arrayBuffer());
+      return t => { t.set_network(N.ox, N.oy, N.rx, N.ry, N.w, N.h, N.k, N.f);
+                    return { net: N }; };
+    }));
+  }
+  // The applier RETURNS the windows it installed rather than publishing them.
+  // The shader samples those windows directly, so they have to mirror what
+  // the Tile now holds — and only the caller knows whether the Tile it just
+  // filled is the one the page is about to adopt or the one it already has.
+  return Promise.all(jobs).then(installers => target => {
+    const got = {};
+    for (const f of installers) if (f) Object.assign(got, f(target));
+    if (got.loss || got.net) invalidateOverlay();
+    return got;
+  });
+}
+
+/// Fetch and install in one step, for callers that already hold the tile.
+async function attachOverlays(target, b, w, h, signal) {
+  try {
+    const got = (await startOverlays(b, w, h, signal))(target);
+    // Replace, never clear: the Tile keeps its previous raster when the
+    // server had nothing new to send, and the window must do the same.
+    if (got.loss) lossWin = got.loss;
+    if (got.net) netWin = got.net;
+  } catch (e) { if (e.name === 'AbortError') throw e; }
+}
+
+// ---- the only heavy call: one P.1812 sweep per transmitter change -------
+async function fetchLoss() {
+  if (!tx) return;
+  if (lossReq) lossReq.abort();
+  const ctrl = new AbortController(); lossReq = ctrl;
+  busy.classList.add('on'); busy.textContent = 'starting sweep…';
+  const qo = { x:tx.xy.x, y:tx.xy.y, tx_h:el('txh').value,
+    rx_h:el('rxh').value, radius_km:el('rad').value, budget_db:el('bud').value };
+  const q = new URLSearchParams(qo);
+  // Remember what this sweep was asked for, so every later window fetch (each
+  // pan, each new tile) asks the server for the same one.
+  tx.sweepQ = qo;
+  invalidateBuildingValues('loss');
+
+  // Paint whatever band has finished. Each band is a COMPLETE sweep at its
+  // own radius, not a coarse preview, so nothing drawn here is a number that
+  // will later change — the map only ever grows outward.
+  //
+  // Only the CURRENT VIEW is fetched. The band that matters visually is the
+  // outer one, and that is precisely the one that used to cost 128 MB and
+  // four seconds of frozen page to deliver cells that were off-screen.
+  async function paintLatest() {
+    if (!tileBounds) return 0;
+    const b = { minx: tileBounds[0], miny: tileBounds[1],
+                maxx: tileBounds[2], maxy: tileBounds[3] };
+    const s = size();
+    const wq = new URLSearchParams(q);
+    for (const [k, v] of boxQuery(b, Math.round(s.w * 1.6), Math.round(s.h * 1.6)))
+      wq.set(k, v);
+    const r = await fetch(`/loss.bin?${wq}`, { signal: ctrl.signal });
+    if (r.status === 204) return 0;              // no band yet
+    if (!r.ok) throw new Error('loss ' + r.status);
+    lastComputeMs = +(r.headers.get('x-compute-ms') || 0);
+    const bandKm = +(r.headers.get('x-band-km') || 0);
+    const ll = (r.headers.get('x-lonlat') || '').split(',');
+    if (ll.length === 2) { tx.lon = +ll[0]; tx.lat = +ll[1]; }
+    const L = decodeLoss(await r.arrayBuffer());
+    if (tile) { tile.set_loss(L.ox, L.oy, L.rx, L.ry, L.w, L.h, L.data);
+                lossWin = L; invalidateOverlay(); }
+    lossLoaded = true;
+    // The per-building values come from the server's copy of this raster, so
+    // they are stale until refetched -- 12 bytes per building, not the
+    // outlines again.
+    refreshBuildingValues();
+    draw();
+    return bandKm;
+  }
+
+  try {
+    // A 20 km sweep at the geometric azimuth count is 170-255 s. Asking for
+    // it on one request meant the button appeared to do nothing for four
+    // minutes. The server now computes it as bands growing outward -- cost
+    // goes as r-squared, so the innermost is ~1/400th of the total -- and
+    // this polls for each one and repaints.
+    await fetch(`/loss/start?${q}`, { signal: ctrl.signal });
+    let lastBand = -1;
+    for (;;) {
+      if (ctrl.signal.aborted) return;
+      const s = await (await fetch('/loss/status', { signal: ctrl.signal })).json();
+      if (s.state === 'failed') throw new Error(s.error || 'sweep failed');
+      const ready = s.ready_km || s.band_km || 0;
+      if (ready > lastBand) { lastBand = await paintLatest(); }
+      if (s.state !== 'running') break;
+      busy.textContent = `sweeping… ${(s.band_km||0).toFixed(1)} km of `
+        + `${(+el('rad').value).toFixed(0)} km  (${s.done}/${s.bands}, ${s.elapsed_s||0} s)`;
+      await new Promise(res => setTimeout(res, 700));
+    }
+    await paintLatest();
+  } catch (e) {
+    if (e.name !== 'AbortError') stat.textContent = 'coverage error: ' + e.message;
+  } finally {
+    if (lossReq === ctrl) { lossReq = null; busy.classList.remove('on'); busy.textContent = 'working…'; }
+  }
+}
+
+// ---- interaction: every frame is a local render -------------------------
+mapEl.addEventListener('pointerdown', e => {
+  const r = mapEl.getBoundingClientRect();
+  if (measuring) {
+    measuring = false; mapEl.classList.remove('place');
+    el('measure').textContent = 'measure link…';
+    measureLink(screenToWorld(e.clientX - r.left, e.clientY - r.top));
+    return;
+  }
+  if (placing) {
+    // The click is already in pack-CRS metres — the frame the sweep runs in.
+    // Interpolating it into lat/lon across the pack bbox (as this used to do)
+    // is not a projection: it is only exact at the corners, so the sweep
+    // landed metres-to-hundreds-of-metres away from the pin. Send x/y and let
+    // the server, which has the real projection, report the lat/lon back.
+    tx = { xy: screenToWorld(e.clientX - r.left, e.clientY - r.top), lat: null, lon: null };
+    placing = false; mapEl.classList.remove('place'); el('place').textContent = 'place transmitter';
+    draw(); fetchLoss();
+    return;
+  }
+  // A node click and a pan both begin as a press on the map, so the choice is
+  // made on RELEASE. Swallowing the press here instead would make it
+  // impossible to start a pan wherever a marker sits, and in a city view most
+  // of the map is within a few pixels of one of the 269 markers.
+  press = { x:e.clientX, y:e.clientY,
+            marker: markerAt(e.clientX - r.left, e.clientY - r.top) };
+  drag = { x:e.clientX, y:e.clientY, view:{...view} };
+  mapEl.classList.add('drag'); mapEl.setPointerCapture(e.pointerId);
+});
+
+/// Hit-test in SCREEN space against the markers as drawn — same projection,
+/// same radius. Called once per click, never per frame.
+/// Hit-test against the markers AS DRAWN — the cached cluster layout, not the
+/// raw node positions. Testing against raw positions while the screen shows
+/// clusters picks whichever member happens to be nearest the cursor, which is
+/// never what the operator aimed at.
+///
+/// Returns a layout entry (`{count, node, list}`), so callers can tell a single
+/// repeater from a cluster.
+function markerAt(cssX, cssY) {
+  if (!view || !markerLayout.length || !el('shownodes').checked) return null;
+  const s = size();
+  // The canvas backing store is device pixels and the event is CSS pixels;
+  // markers were laid out in the former.
+  const k = s.w / s.cw, px = cssX * k, py = cssY * k;
+  let best = null, bestD2 = Infinity;
+  for (const mk of markerLayout) {
+    // A 3 px dot is not a 3 px target. Grab generously, but never wider than
+    // the cluster itself for a big bubble.
+    const grab = Math.max(mk.r + 5, 11);
+    const dx = mk.fx - px, dy = mk.fy - py;
+    const d2 = dx * dx + dy * dy;
+    if (d2 <= grab * grab && d2 < bestD2) { bestD2 = d2; best = mk; }
+  }
+  return best;
+}
+
+/// The single node under the cursor, or null if it is empty space OR a cluster.
+function nodeAt(cssX, cssY) {
+  const mk = markerAt(cssX, cssY);
+  return mk && mk.count === 1 ? mk.node : null;
+}
+
+/// Zoom to a cluster's members so they separate. Framed on the members' own
+/// extent rather than a fixed step, so one click always resolves the cluster
+/// instead of needing several.
+function zoomToCluster(mk) {
+  const xs = mk.list.map(n => n.x), ys = mk.list.map(n => n.y);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const s = size();
+  // Enough width that the members land further apart than one cluster cell,
+  // with a floor so a pile of co-located nodes does not zoom to millimetres.
+  const spread = Math.max(Math.max(...xs) - Math.min(...xs),
+                          (Math.max(...ys) - Math.min(...ys)) * (s.cw / s.ch));
+  const w = Math.max(300, Math.min(vw(view) * 0.6, spread * 3.2));
+  const h = w * (s.ch / s.cw);
+  view = { minx: cx - w/2, maxx: cx + w/2, miny: cy - h/2, maxy: cy + h/2 };
+  draw(); scheduleTile();
+}
+
+// ---- hover tooltip: read a repeater without losing your place ------------
+//
+// Checking a scraped network by name means passing over dozens of markers.
+// Clicking each one moves the selection and scrolls the sidebar; hovering
+// costs nothing and leaves the inspector where it was.
+let tipNode = null, tipQueued = false, tipPos = { x: 0, y: 0 };
+
+function tipText(n) {
+  // Same honesty as the inspector: UNKNOWN (nobody measured it) and CORRUPT
+  // (the pack holds a non-finite value) are different facts.
+  const say = (v, bad, unit) =>
+    bad ? 'CORRUPT' : v == null ? 'unknown' : v + unit;
+  const o = n.id ? overrides[n.id] : null;
+  const hLine = o && o.h != null
+    ? `${o.h} m  (your override)`
+    : say(n.h, n.h_bad, ' m');
+  const txLine = o && o.tx != null
+    ? `${o.tx} dBm  (your override)`
+    : say(n.tx_dbm, n.tx_bad, ' dBm');
+  return { name: n.name || '(unnamed)',
+           body: `${n.kind} · last advert ${fmtSeen(n.last_seen)}\n`
+               + `height ${hLine}\n`
+               + `tx power ${txLine}\n`
+               + `${fmtDeg(n.lat)}, ${fmtDeg(n.lon)}`,
+           // The two fields that decide every coverage answer; if both are
+           // guesses, say so on the marker rather than in a footnote.
+           warn: (n.h == null && !(o && o.h != null))
+                 ? 'height unmeasured — coverage for this node is an assumption'
+                 : null };
+}
+
+/// What a cluster says on hover. Names first — checking a scraped network by
+/// name is the whole reason the tooltip exists — then the fact that decides
+/// whether any of it means anything.
+function clusterTipText(mk) {
+  const names = mk.list.slice(0, 6).map(n => n.name || '(unnamed)');
+  const more = mk.count - names.length;
+  const unknown = mk.list.filter(n => n.hUnknown).length;
+  return {
+    name: `${mk.count} repeaters here`,
+    body: names.join('\n')
+        + (more > 0 ? `\n+${more} more` : '')
+        + '\nclick to zoom in',
+    warn: unknown === mk.count ? 'none has a measured antenna height'
+        : unknown > 0 ? `${unknown} of ${mk.count} have no measured height` : null,
+  };
+}
+
+function showTip(mk, cssX, cssY) {
+  const t = el('tip');
+  if (!mk) { t.classList.remove('on'); tipNode = null; return; }
+  if (mk !== tipNode) {
+    const { name, body, warn } = mk.count > 1 ? clusterTipText(mk) : tipText(mk.node);
+    t.textContent = '';
+    const b = document.createElement('b');
+    b.textContent = name;                       // textContent: advert names
+    t.append(b, document.createTextNode('\n' + body));
+    if (warn) {
+      const w = document.createElement('div');
+      w.className = 'warn';
+      w.textContent = warn;
+      t.append(w);
+    }
+    tipNode = mk;
+  }
+  // Flip around the cursor near the edges so the tip never leaves the map.
+  const r = mapEl.getBoundingClientRect();
+  const tw = t.offsetWidth || 220, th = t.offsetHeight || 60;
+  let x = cssX + 14, y = cssY + 14;
+  if (x + tw > r.width - 4) x = cssX - tw - 14;
+  if (y + th > r.height - 4) y = cssY - th - 14;
+  t.style.left = Math.max(4, x) + 'px';
+  t.style.top = Math.max(4, y) + 'px';
+  t.classList.add('on');
+}
+
+mapEl.addEventListener('pointerleave', () => showTip(null));
+
+mapEl.addEventListener('pointermove', e => {
+  // Hover first, and only while not dragging or placing — during a pan the
+  // pointer is doing something else and a tooltip chasing it is noise.
+  if (!drag && !placing && !measuring) {
+    const r = mapEl.getBoundingClientRect();
+    tipPos = { x: e.clientX - r.left, y: e.clientY - r.top };
+    if (!tipQueued) {
+      // Coalesce to roughly one hit-test per frame: nodeAt is a linear scan
+      // over every node and pointermove fires far faster than the display.
+      // setTimeout, NOT requestAnimationFrame: rAF is throttled to a
+      // standstill whenever the page is not being painted (a hidden pane, a
+      // background tab), and this file has already been bitten twice by that
+      // — once leaving the map stuck on "loading" forever.
+      tipQueued = true;
+      setTimeout(() => {
+        tipQueued = false;
+        showTip(markerAt(tipPos.x, tipPos.y), tipPos.x, tipPos.y);
+      }, 16);
+    }
+  } else if (tipNode) {
+    showTip(null);
+  }
+  if (!drag) return;
+  const s = size();
+  const dx = -( (e.clientX - drag.x) / s.cw) * vw(drag.view);
+  const dy =  ( (e.clientY - drag.y) / s.ch) * vh(drag.view);
+  view = { minx: drag.view.minx + dx, maxx: drag.view.maxx + dx,
+           miny: drag.view.miny + dy, maxy: drag.view.maxy + dy };
+  draw();                       // full redraw every frame — nothing goes blank
+});
+
+function endDrag(e) {
+  if (press) {
+    // 4 px of slop: a trackpad press never lands on exactly one pixel, and a
+    // pan that moved further than that was a pan, not a click.
+    const moved = Math.hypot(e.clientX - press.x, e.clientY - press.y);
+    if (moved < 4) {
+      const mk = press.marker;
+      // A cluster is not a node: clicking it resolves it instead of picking an
+      // arbitrary member. One click always separates it, because the zoom is
+      // framed on the members' own extent.
+      if (mk && mk.count > 1) { press = null; zoomToCluster(mk); return; }
+      selectNode(mk ? mk.node : null);       // null closes the inspector
+    }
+    press = null;
+  }
+  if (!drag) return;
+  drag = null; mapEl.classList.remove('drag'); scheduleTile();
+}
+mapEl.addEventListener('pointerup', endDrag);
+mapEl.addEventListener('pointercancel', endDrag);
+
+mapEl.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = mapEl.getBoundingClientRect();
+  const a = screenToWorld(e.clientX - r.left, e.clientY - r.top);
+  const f = e.deltaY > 0 ? 1.3 : 1/1.3;
+  const nw = vw(view) * f, nh = vh(view) * f;
+  if (nw > 1_200_000 || nw < 300) return;
+  const ax = (a.x - view.minx) / vw(view), ay = (a.y - view.miny) / vh(view);
+  view = { minx: a.x - ax*nw, maxx: a.x + (1-ax)*nw,
+           miny: a.y - ay*nh, maxy: a.y + (1-ay)*nh };
+  draw();                       // instant, from the tile we already hold
+  scheduleTile();               // finer/coarser data only if the LOD drifted
+}, { passive:false });
+
+// ---- the deployed network ----------------------------------------------
+function updateNodeStat() {
+  if (!nodes.length) { el('nodestat').textContent = 'no deployed nodes in this pack'; return; }
+  const shown = lastNodesShown >= 0 ? lastNodesShown : 0;
+  el('nodestat').innerHTML =
+    `${nodes.length} deployed · ${shown} in view · ${lastMarkersShown} marker(s)<br>` +
+    (nodesNoHeight
+      ? `<span title="drawn hollow">${nodesNoHeight} with UNKNOWN antenna height</span>`
+      : 'all heights known') +
+    // The unknown count above is against the EFFECTIVE height, so supplying
+    // one visibly retires that node from the column the census turns on. This
+    // line counts nodes with EITHER field overridden, which is why it says
+    // "edited" and not "supplied": a tx-only edit changes no height.
+    (nodesEdited ? `<br>${nodesEdited} edited here` : '');
+}
+
+// ---- per-node overrides: the survey path -------------------------------
+//
+// A scraped advert has no antenna height and no TX power, and those two
+// numbers dominate every answer this tool gives: over the same 263 Berlin
+// sites, moving the ASSUMED height from 8 m to 25 m took the census from
+// 3.09 M residents / 117 backbone edges / 176 components to 4.08 M / 10 342
+// edges / 1 component. An operator who knows one real value must be able to
+// enter it, and it must stay visibly distinct from the scraped record rather
+// than being laundered into it.
+//
+// The values live here as OVERRIDES keyed by node id (a MeshCore public key —
+// stable across pack rebuilds, and the same key parse_csv merges rows on).
+// `n.h` / `n.tx_dbm` remain exactly what the pack said.
+const OV_KEY = 'planner.node_overrides.v1';
+// Null prototype: the key is a node id, i.e. an arbitrary string out of a
+// community CSV. On a plain object an id of "__proto__" would set the
+// prototype instead of storing a value (the edit then vanishes on save), and
+// "constructor" would read back a truthy non-override.
+let overrides = Object.create(null);   // id -> { h, tx }; either field may be null
+let ovSaveTimer = null;
+// How many stored overrides failed to load. Reported, never swallowed.
+let ovDropped = 0;
+
+// The two bands the inspector enforces, named once so the load path and the
+// edit path cannot drift. 300 m matches the server's own tx_h clamp; 40 dBm
+// is past anything a LoRa node does even behind an amplifier.
+const H_BAND = [0, 300], TX_BAND = [-30, 40];
+
+/// Accept one stored field only if it is a finite number inside the band the
+/// inspector would have enforced when it was typed.
+///
+/// Storage is a trust boundary, not an extension of this page's memory: the
+/// value comes back days later, possibly from a different build of this file,
+/// possibly hand-edited. Before this check a stored "18.5" (a STRING, which is
+/// what a hand-edit or an older schema produces) reached the exporter and threw
+/// `v.toPrecision is not a function` inside the click handler — the button
+/// simply did nothing, with no message. A stored 5000 was worse: it sailed past
+/// the 0..300 band that exists precisely because a mistyped height dominates
+/// every answer, and went into nodes.csv as a 5000 m antenna.
+function cleanOv(v, [lo, hi]) {
+  return (typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi) ? v : null;
+}
+
+function loadOverrides() {
+  // A private window throws on the very first localStorage touch. An
+  // afternoon of survey work is worth more than the persistence, so degrade
+  // to in-memory edits and say so rather than failing the page.
+  let raw = null;
+  try { raw = localStorage.getItem(OV_KEY); } catch (e) { raw = null; }
+  overrides = Object.create(null);
+  ovDropped = 0;
+  let v = null;
+  try { v = raw ? JSON.parse(raw) : null; } catch (e) { v = null; }
+  // Arrays are rejected rather than accepted as objects: `typeof [] === 'object'`,
+  // and assigning string keys to an array survives in memory but serialises
+  // back as "[]" — every edit made in that session would disappear on reload,
+  // silently.
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return;
+  for (const id of Object.keys(v)) {
+    const e = v[id];
+    if (!id || !e || typeof e !== 'object' || Array.isArray(e)) { ovDropped++; continue; }
+    const h = cleanOv(e.h, H_BAND), tx = cleanOv(e.tx, TX_BAND);
+    // Count a partial drop too: half a restored override is still a lost
+    // measurement, and the operator has to know before they export.
+    if ((e.h != null && h == null) || (e.tx != null && tx == null)) ovDropped++;
+    if (h != null || tx != null) overrides[id] = { h, tx };
+  }
+}
+
+function saveOverridesSoon() {
+  // Debounced: the inspector commits on every keystroke so nothing is lost to
+  // a click on another node, but serialising the table per character is not
+  // work worth doing.
+  clearTimeout(ovSaveTimer);
+  ovSaveTimer = setTimeout(() => {
+    try { localStorage.setItem(OV_KEY, JSON.stringify(overrides)); }
+    catch (e) {
+      el('ovstat').textContent = 'edits are NOT being saved (' + e.name +
+        ') — export nodes.csv before closing this tab';
+      el('ovstat').classList.add('on');
+    }
+  }, 250);
+}
+
+// Resolve the override table onto the node objects. The marker loop reads
+// n.edited / n.oh / n.otx directly: a per-node table lookup in a per-frame
+// loop over 269 markers is exactly the cost this page exists to avoid, and a
+// localStorage read there would be far worse.
+function stampNode(n) {
+  const o = n.id ? overrides[n.id] : null;
+  n.oh  = (o && o.h  != null) ? o.h  : null;
+  n.otx = (o && o.tx != null) ? o.tx : null;
+  n.edited = n.oh != null || n.otx != null;
+  // The marker has to keep saying "nobody has measured this height" even for a
+  // node somebody has edited. Stamped rather than recomputed in the draw loop
+  // for the same reason n.edited is.
+  n.hUnknown = (n.oh ?? n.h) == null;
+}
+
+function recountNodes() {
+  nodesNoHeight = 0; nodesEdited = 0;
+  for (const n of nodes) {
+    // n.hUnknown is `(n.oh ?? n.h) == null` — `??` and not `||`, because 0 m
+    // AGL is a legitimate height (a node on the ground) and 0 dBm is a
+    // legitimate power (1 mW). Read from the same stamp the marker uses so the
+    // count and the map can never tell different stories.
+    if (n.hUnknown) nodesNoHeight++;
+    if (n.edited) nodesEdited++;
+  }
+  updateNodeStat();
+  // Any edit invalidates an armed "discard N edits?" — the N it named is
+  // no longer the number that would be thrown away.
+  if (clearArmed) disarmClear();
+  el('ovstat').classList.toggle('on', nodesEdited > 0 || ovDropped > 0);
+  el('ovstat').textContent =
+    (nodesEdited
+      ? `${nodesEdited} node${nodesEdited === 1 ? '' : 's'} edited in this browser · ` +
+        'export to get them into a pack'
+      : 'no local edits — export writes the pack values unchanged') +
+    // Saying so is the whole point: a dropped override is a measurement the
+    // operator believes is still in the file they are about to export.
+    (ovDropped
+      ? `\n${ovDropped} stored override${ovDropped === 1 ? ' was' : 's were'} ` +
+        'unreadable or out of range and did NOT load — re-enter them'
+      : '');
+}
+
+async function loadNodes() {
+  try {
+    const r = await fetch('/nodes.json');
+    if (!r.ok) return;
+    nodes = (await r.json()).nodes || [];
+  } catch (e) { nodes = []; }
+  loadOverrides();
+  for (const n of nodes) stampNode(n);
+  recountNodes();
+  // The mesh mode names the repeater count in its own description, and this
+  // is when that count first exists.
+  if (typeof applyCovMode === 'function') applyCovMode();
+}
+
+/// Format `last_seen_unix` for the inspector.
+///
+/// The range check is not defensive padding. parse_csv takes this column
+/// through `i64::from_str` with no bound, so a community CSV carrying a
+/// MICROSECOND epoch (1.75e15, which is what several logging stacks emit and
+/// what a spreadsheet reformat can produce) reaches the pack intact — and
+/// `new Date(1.75e18).toISOString()` throws RangeError. That throw happened
+/// inside selectNode, so clicking that marker did nothing at all: no
+/// inspector, no message, no way to tell it apart from a missed click.
+/// ±8.64e15 ms is the ECMAScript Date range, i.e. ±8.64e12 seconds.
+function fmtSeen(unix) {
+  if (unix == null) return 'never heard';
+  if (!Number.isFinite(unix) || Math.abs(unix) > 8.64e12) {
+    return `unusable timestamp ${unix} (not Unix SECONDS — rebuild the pack)`;
+  }
+  const days = Math.round(Date.now() / 1000 - unix) / 86400;
+  return new Date(unix * 1000).toISOString().slice(0, 10) +
+         ` (${days < 0 ? 'in the future?' : days.toFixed(0) + ' d ago'})`;
+}
+
+/// A coordinate the inspector can print. `n.lat.toFixed(5)` threw on a missing
+/// or non-finite value, and the throw took the whole inspector with it.
+function fmtDeg(v) {
+  return Number.isFinite(v) ? v.toFixed(5) : 'UNPROJECTED';
+}
+
+function selectNode(n) {
+  selected = n;
+  const p = el('nodepanel');
+  if (!n) { p.hidden = true; draw(); return; }
+  p.hidden = false;
+  el('nodename').textContent = n.name || '(unnamed)';
+  // textContent, not innerHTML: names and ids come out of third-party adverts
+  // written by strangers.
+  // "UNKNOWN" (nobody measured it) and "CORRUPT" (the pack holds a value, but
+  // a non-finite one) are different facts and must not print the same. The
+  // server sets h_bad/tx_bad because JSON has no NaN or Infinity, so both
+  // arrive here as null — see nodes_json().
+  const packSays = (v, bad, unit) =>
+    bad ? 'CORRUPT (pack holds a non-finite value — rebuild it)'
+        : v == null ? 'UNKNOWN' : v + unit;
+  el('nodemeta').textContent =
+    `${n.kind} · id ${n.id || '(none)'}\n` +
+    `${fmtDeg(n.lat)}, ${fmtDeg(n.lon)}  (lat, lon)\n` +
+    `${n.x.toFixed(0)}, ${n.y.toFixed(0)} m  (pack CRS)\n` +
+    `last advert ${fmtSeen(n.last_seen)}\n` +
+    `pack says h ${packSays(n.h, n.h_bad, ' m')}` +
+    ` · tx ${packSays(n.tx_dbm, n.tx_bad, ' dBm')}`;
+  el('nh').value  = n.oh  != null ? String(n.oh)  : '';
+  el('ntx').value = n.otx != null ? String(n.otx) : '';
+  // The placeholder shows what the pack holds, so a blank box unambiguously
+  // means "no override" rather than "I set it to nothing".
+  el('nh').placeholder  = n.h_bad ? 'corrupt' : n.h == null ? 'unknown' : String(n.h);
+  el('ntx').placeholder = n.tx_bad ? 'corrupt' : n.tx_dbm == null ? 'unknown' : String(n.tx_dbm);
+  const anon = !n.id;
+  el('nh').disabled = el('ntx').disabled = anon;
+  el('nodewarn').textContent = anon
+    ? 'no id: an edit here could not be matched back to this node on re-import'
+    : '';
+  el('nodenote').textContent = erpNote(n.otx);
+  draw();
+}
+
+/// Read one edit box. Returns {v: number|null} or {err}. Blank means NO
+/// override (fall back to the pack), which is why the check can never be a
+/// truthiness test: 0 is a real height and a real power.
+function readField(id, lo, hi, what) {
+  // A German keyboard types 18,5 — and parse_csv rejects a decimal comma on
+  // import, so normalising it here is the difference between a correction that
+  // lands and one that fails a rebuild hours later.
+  const t = el(id).value.trim().replace(',', '.');
+  if (t === '') return { v: null };
+  // Mid-typing states, not mistakes: no warning for these.
+  if (t === '-' || t === '+' || t === '.' || t === '-.') return { v: null };
+  const v = Number(t);
+  if (!Number.isFinite(v)) return { err: `${what}: ${JSON.stringify(t)} is not a number` };
+  // A band, not a clamp. Silently rounding a typo'd 1800 m mast down to
+  // something plausible would hide exactly the input that dominates the
+  // answer; refusing it names the problem. The bounds come from H_BAND /
+  // TX_BAND, which loadOverrides() re-applies to anything coming back out of
+  // storage — a band enforced only on the keyboard path is not enforced.
+  if (v < lo || v > hi) return { err: `${what}: ${v} is outside ${lo}..${hi}` };
+  return { v };
+}
+
+/// What an entered CONDUCTED power implies at the antenna, checked against the
+/// band ceiling the presets endpoint already computes (eu_erp_ceiling_dbm:
+/// 27 dBm ERP on 869.4-869.65). Not a refusal — plenty of deployed nodes are
+/// misconfigured and the planner's job is to model what is on the air — but
+/// the operator has to see that the number they typed is over the limit, and
+/// which convention it was read in. This is the same `over_erp` arithmetic the
+/// transmitter panel already shows; a node override was the one place that
+/// took a dBm figure with no unit context at all.
+function erpNote(tx) {
+  if (tx == null || !presets) return '';
+  const r = presets.radios.find(x => x.id === el('radio').value) || presets.radios[0];
+  if (!r) return '';
+  const erp = tx + r.antenna_gain_dbi;
+  return erp > r.erp_ceiling_dbm
+    ? `${tx} dBm conducted + ${r.antenna_gain_dbi} dBi = ${erp.toFixed(1)} dBm ERP, ` +
+      `over the ${r.erp_ceiling_dbm} dBm ceiling at ${r.freq_mhz} MHz. ` +
+      'If you meant the ERP allowance, enter the conducted power instead.'
+    : '';
+}
+
+function commitEdit() {
+  const n = selected;
+  if (!n || !n.id) return;
+  const h = readField('nh', H_BAND[0], H_BAND[1], 'height AGL');
+  const t = readField('ntx', TX_BAND[0], TX_BAND[1], 'tx power');
+  const err = h.err || t.err;
+  el('nodewarn').textContent = err || '';
+  if (err) { el('nodenote').textContent = ''; return; }  // keep the last good value, say why
+  if (h.v == null && t.v == null) delete overrides[n.id];
+  else overrides[n.id] = { h: h.v, tx: t.v };
+  el('nodenote').textContent = erpNote(t.v);
+  stampNode(n);
+  saveOverridesSoon();
+  recountNodes();
+  draw();
+}
+
+el('nh').addEventListener('input', commitEdit);
+el('ntx').addEventListener('input', commitEdit);
+el('nclose').onclick = () => selectNode(null);
+el('nrevert').onclick = () => {
+  if (!selected || !selected.id) return;
+  delete overrides[selected.id];
+  stampNode(selected);
+  saveOverridesSoon(); recountNodes();
+  el('nh').value = ''; el('ntx').value = '';
+  el('nodewarn').textContent = ''; el('nodenote').textContent = '';
+  draw();
+};
+// Arm-then-fire rather than confirm(): this discards survey work that exists
+// nowhere else until somebody has exported it, so it must not go on a single
+// click — and a modal confirm() is the one thing on this page that would block
+// the render loop and steal focus from whatever the operator was typing.
+let clearArmed = null;
+function disarmClear() {
+  clearTimeout(clearArmed); clearArmed = null;
+  el('clearov').textContent = 'clear overrides';
+}
+el('clearov').onclick = () => {
+  if (!nodesEdited) return;
+  if (!clearArmed) {
+    el('clearov').textContent =
+      `discard ${nodesEdited} edit${nodesEdited === 1 ? '' : 's'}? click again`;
+    clearArmed = setTimeout(disarmClear, 5000);
+    return;
+  }
+  disarmClear();
+  overrides = Object.create(null);
+  ovDropped = 0;
+  try { localStorage.removeItem(OV_KEY); } catch (e) { /* private window */ }
+  for (const n of nodes) stampNode(n);
+  recountNodes();
+  if (selected) selectNode(selected);
+  draw();
+};
+
+/// Escape one CSV cell the way planner_pack::nodes::csv_escape does, because
+/// this file has to be readable by parse_csv without a second thought.
+function csvCell(s) {
+  // The reader is line-oriented (`text.lines()`), so a record must stay on one
+  // line — quoting an embedded newline is not enough. Losing the newline is
+  // the cheaper loss.
+  const flat = String(s ?? '').replace(/[\r\n]+/g, ' ');
+  // A leading '#' is quoted too: the id starts the line, and an unquoted "#12"
+  // would come back as a comment, i.e. the node would vanish on re-import.
+  return (flat.startsWith('#') || /[,;"]/.test(flat))
+    ? '"' + flat.replace(/"/g, '""') + '"'
+    : flat;
+}
+
+/// Shortest decimal that still names the same f32 — what Rust's
+/// `f32::to_string()` writes, and what write_csv therefore produces.
+///
+/// NOT for the pack's own values: serde_json formats an f32 with a
+/// shortest-f32 formatter, so `/nodes.json` already delivers 27.7 as `27.7`
+/// and not as 27.700000762939453. It is for the OVERRIDES, which are f64s off
+/// a keyboard and out of JSON.parse: the pack stores this column as f32, so
+/// writing an operator's 18.499999999999998 verbatim puts more digits in the
+/// file than the pack can hold, and this file is meant to be read and edited
+/// by hand in a spreadsheet.
+function f32str(v) {
+  for (let p = 1; p <= 9; p++) {
+    const s = v.toPrecision(p);
+    if (Math.fround(Number(s)) === Math.fround(v)) return String(Number(s));
+  }
+  return String(v);
+}
+
+/// Export the WHOLE deployed set with the overrides applied.
+///
+/// The round trip is the point:
+///   export -> operators fill in the heights and powers they actually know ->
+///   planner pack build --nodes nodes.csv -> the assumed height is replaced by
+///   fact, and every later gap census runs on measured inputs instead of on a
+///   number that swings the answer by 88x.
+///
+/// The whole set goes out, not just the edited rows: `--nodes` REPLACES the
+/// pack's Nodes layer, so a file holding only the seven nodes somebody
+/// surveyed would delete the other 262. Unknown fields go out BLANK and never
+/// as 0 — 0 m AGL and 0 dBm are both legitimate values, and a confident zero
+/// is worse than an admitted gap.
+function exportNodesCsv() {
+  try { writeNodesCsv(); }
+  catch (e) {
+    // A throw in a click handler is invisible: the button just does nothing,
+    // and the operator concludes the export "worked" and closes the tab on
+    // survey data that exists nowhere else. Whatever breaks here has to say so.
+    el('ovstat').classList.add('on');
+    el('ovstat').textContent = 'export FAILED (' + e.name + ': ' + e.message +
+      ') — nothing was written, your edits are still here';
+  }
+}
+
+function writeNodesCsv() {
+  if (!nodes.length) { el('ovstat').textContent = 'nothing to export'; return; }
+  // isFinite, not `!= null`: a projection that silently failed server-side
+  // yields a number, just not a coordinate, and parse_csv's own lat/lon range
+  // check would reject the whole file at line 2 with no clue why.
+  // Never interpolate lat/lon out of the pack bbox as a fallback: that is
+  // exact only at the corners and already cost a day once. The server
+  // projects with proj4rs in /nodes.json.
+  if (nodes.some(n => !Number.isFinite(n.lat) || !Number.isFinite(n.lon))) {
+    el('ovstat').textContent = 'nodes.json carried no usable lat/lon — reload the page';
+    return;
+  }
+  const rows = ['id,name,kind,lat,lon,height_agl_m,tx_power_dbm,last_seen_unix'];
+  for (const n of nodes) {
+    const h = n.oh ?? n.h, t = n.otx ?? n.tx_dbm;
+    rows.push([
+      csvCell(n.id), csvCell(n.name), n.kind,
+      // Six decimals is ~0.11 m of latitude — finer than any advert position
+      // and finer than the f32 metres the pack stores. Same as write_csv.
+      n.lat.toFixed(6), n.lon.toFixed(6),
+      h == null ? '' : f32str(h),
+      t == null ? '' : f32str(t),
+      n.last_seen == null ? '' : String(n.last_seen),
+    ].join(','));
+  }
+  // Leading BOM: these files get opened in Excel, which reads UTF-8 without
+  // one as mojibake and would mangle every umlaut and emoji in an adv_name.
+  // column_of() already strips a BOM off the first header cell.
+  const blob = new Blob(['\ufeff' + rows.join('\n') + '\n'],
+                        { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'nodes.csv';
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+el('expnodes').onclick = exportNodesCsv;
+
+// ---- the deployed network's coverage census -----------------------------
+let netPoll = null, netReady = false;
+
+function fmtPop(v, uniform) {
+  return uniform ? `${Math.round(v).toLocaleString()} cells`
+                 : `${Math.round(v).toLocaleString()} residents`;
+}
+
+function renderNetStat(s) {
+  const el_ = el('netstat');
+  if (!s || s.state === 'idle') { el_.textContent = 'not computed'; return; }
+  if (s.state === 'computing') {
+    el_.textContent = `computing… ${s.elapsed_s}s\n(269 sweeps; expect a few minutes)`;
+    return;
+  }
+  if (s.state === 'failed') { el_.innerHTML = `<span class="warn">${s.error}</span>`; return; }
+  const pct = v => s.total > 0 ? (100 * v / s.total).toFixed(1) + '%' : '—';
+  el_.innerHTML =
+    `<b>${pct(s.served)}</b> reached by >=1  (${fmtPop(s.served, s.uniform_weights)})\n` +
+    (s.k_target > 1 ? `<b>${pct(s.served_k)}</b> reached by >=${s.k_target}\n` : '') +
+    `<b>${pct(s.uncovered)}</b> not reached\n` +
+    `${s.sites} sites (${s.skipped} skipped) · ${s.situation}\n` +
+    `backbone: ${s.backbone_components} components, ${s.backbone_isolated} isolated\n` +
+    `<span class="warn">heights assumed ${fmtM(s.assumed_height_m)} — this number moves ` +
+    `20+ points with that assumption</span>`;
+}
+
+async function pollNet() {
+  try {
+    const s = await (await fetch('/network/status')).json();
+    renderNetStat(s);
+    if (s.state === 'ready') {
+      clearInterval(netPoll); netPoll = null;
+      await loadNetRaster(s.k_target);
+      el('netshow').checked = true; el('netkey').hidden = false;
+      el('netrun').textContent = 'recompute';
+      draw();
+    } else if (s.state === 'failed') {
+      clearInterval(netPoll); netPoll = null;
+      el('netrun').textContent = 'compute network coverage';
+    }
+  } catch (e) { /* the server may be restarting; keep polling */ }
+}
+
+/// Attach the census to whatever is currently drawn.
+///
+/// Two windows, because the two canvases answer different questions: the
+/// detail tile carries the view, and the resident overview carries the whole
+/// pack at 480 cells across, which is what shows through while a pan is in
+/// flight. Both are cut server-side; the pack-wide one is ~200 kB where the
+/// full-resolution census was 98 MB.
+async function loadNetRaster(k) {
+  netReady = true;
+  netK = k || 1;
+  refreshBuildingValues();
+  const jobs = [];
+  if (tile && tileBounds) {
+    const s = size();
+    jobs.push(attachOverlays(tile, { minx: tileBounds[0], miny: tileBounds[1],
+      maxx: tileBounds[2], maxy: tileBounds[3] },
+      Math.round(s.w * 1.6), Math.round(s.h * 1.6)));
+  }
+  if (overview && pack) {
+    const e = pack.extent;
+    const ow = 480, oh = Math.max(64, Math.round(480 * (e.maxy - e.miny) / (e.maxx - e.minx)));
+    jobs.push(fetch(`/network.bin?${boxQuery(e, ow, oh)}`).then(async r => {
+      if (!r.ok) return;
+      const N = decodeNet(await r.arrayBuffer());
+      // Resolve k ONCE, into the window, so the Tile and the shader are given
+      // the same number rather than each falling back on its own default.
+      N.k = N.k || k || 1;
+      overview.set_network(N.ox, N.oy, N.rx, N.ry, N.w, N.h, N.k, N.f);
+      ovNetWin = N;
+      invalidateOverlay();
+    }));
+  }
+  // A window that fails to arrive is not a census that stopped existing: the
+  // flag says the server HAS one, and the next tile will fetch its window
+  // again. A frame with the flag set and no grid attached draws no overlay,
+  // which is the right answer to "we could not fetch it" — better than
+  // clearing the flag and reporting the network as uncensused.
+  try { await Promise.all(jobs); } catch (e) { /* next tile retries */ }
+}
+
+// ---- building footprints ------------------------------------------------
+//
+// Fetched with the tile, not on every frame. Gated on view width because the
+// whole city is 8.4 M vertices: at 3 km a footprint is a few pixels and worth
+// drawing, at 30 km it is a smudge that costs megabytes.
+let bldgReq = null, bldgValReq = null;
+// The footprint CACHE. Keyed by the server's building id; holds geometry and
+// the two per-building answers. Geometry is never invalidated -- a footprint
+// fetched once is drawn wherever the operator goes next -- and a value is
+// dropped only when it becomes WRONG: every loss value when a new sweep
+// starts (it belongs to a different transmitter), every census value when a
+// new census starts. Bounded, because WASM and JS memory never shrink: past
+// BLDG_CACHE_MAX_RINGS the least recently SEEN buildings go first.
+const bldgCache = new Map();          // id -> { rings, x0, y0, x1, y1, top, loss, census, seen }
+let bldgOrigin = [0, 0], bldgRings = 0, bldgTick = 0, bldgTruncated = false;
+// A coarse spatial index over the cache: bucket key -> Set of ids, buckets of
+// BLDG_BUCKET_M on a side, a building in every bucket its bounding box
+// touches. Both composes used to scan the whole cache with a box test per
+// entry -- fine at 12 000 buildings, not at the 300 000-ring ceiling the
+// cache is allowed to reach, where a settled pan at 3 km measured 80-100 ms
+// for outlines that path in ~20 ms. The index turns that scan into a walk of
+// the few dozen buckets under the box.
+const BLDG_BUCKET_M = 500;
+const bldgIndex = new Map();
+const bucketKey = (bx, by) => bx * 1048576 + by;   // 2^20 columns is far beyond any pack
+function bldgIndexAdd(id, e) {
+  const bx0 = Math.floor(e.x0 / BLDG_BUCKET_M), bx1 = Math.floor(e.x1 / BLDG_BUCKET_M);
+  const by0 = Math.floor(e.y0 / BLDG_BUCKET_M), by1 = Math.floor(e.y1 / BLDG_BUCKET_M);
+  for (let bx = bx0; bx <= bx1; bx++) for (let by = by0; by <= by1; by++) {
+    const k = bucketKey(bx, by);
+    let set = bldgIndex.get(k); if (!set) { set = new Set(); bldgIndex.set(k, set); }
+    set.add(id);
+  }
+}
+function bldgIndexRemove(id, e) {
+  const bx0 = Math.floor(e.x0 / BLDG_BUCKET_M), bx1 = Math.floor(e.x1 / BLDG_BUCKET_M);
+  const by0 = Math.floor(e.y0 / BLDG_BUCKET_M), by1 = Math.floor(e.y1 / BLDG_BUCKET_M);
+  for (let bx = bx0; bx <= bx1; bx++) for (let by = by0; by <= by1; by++) {
+    const set = bldgIndex.get(bucketKey(bx, by));
+    if (set) { set.delete(id); if (!set.size) bldgIndex.delete(bucketKey(bx, by)); }
+  }
+}
+/// Every cached building whose bounding box meets `box`, each once.
+function bldgInBoxIter(box) {
+  const out = [], seen = new Set();
+  const bx0 = Math.floor(box.minx / BLDG_BUCKET_M), bx1 = Math.floor(box.maxx / BLDG_BUCKET_M);
+  const by0 = Math.floor(box.miny / BLDG_BUCKET_M), by1 = Math.floor(box.maxy / BLDG_BUCKET_M);
+  for (let bx = bx0; bx <= bx1; bx++) for (let by = by0; by <= by1; by++) {
+    const set = bldgIndex.get(bucketKey(bx, by));
+    if (!set) continue;
+    for (const id of set) {
+      if (seen.has(id)) continue; seen.add(id);
+      const e = bldgCache.get(id);
+      if (e && bldgInBox(e, box)) out.push(e);
+    }
+  }
+  return out;
+}
+const BLDG_CACHE_MAX_RINGS = 300000;  // ~the 9 km view three times over
+let netK = 1;
+
+function bldgEvict() {
+  if (bldgRings <= BLDG_CACHE_MAX_RINGS) return;
+  const es = [...bldgCache.entries()].sort((a, b) => a[1].seen - b[1].seen);
+  for (const [id, e] of es) {
+    if (bldgRings <= BLDG_CACHE_MAX_RINGS * 0.8) break;
+    bldgIndexRemove(id, e); bldgCache.delete(id); bldgRings -= e.rings.length;
+  }
+}
+
+/// Where the footprints for the current position come from: the padded tile
+/// box when there is one, so the layer survives a pan the way the tile does
+/// (fetched for the bare view, it ended at the old view's edge mid-drag).
+function bldgBox() {
+  return tileBounds
+    ? { minx: tileBounds[0], miny: tileBounds[1], maxx: tileBounds[2], maxy: tileBounds[3] }
+    : { minx: view.minx, miny: view.miny, maxx: view.maxx, maxy: view.maxy };
+}
+
+// The outline layer is worth drawing below 9 km; above that the city exceeds
+// the 900 000-vertex budget and a fraction of it would be drawn unmarked. The
+// fill needs a closer look to read at all, so it has its own, smaller limit.
+const BLDG_MAX_VIEW_M = 9000;
+const BLDG_COLOUR_VIEW_M = 4000;
+
+async function fetchBuildings() {
+  if (!view) return;
+  const wide = vw(view) > BLDG_MAX_VIEW_M;
+  const on = el('showbldg') && el('showbldg').checked;
+  // Nothing is thrown away when the view is too wide or the layer is off;
+  // the surface simply is not painted (draw() gates on the width).
+  if (!on || wide) { draw(); return; }
+  if (bldgReq) bldgReq.abort();
+  const ctrl = new AbortController(); bldgReq = ctrl;
+  try {
+    const b = bldgBox();
+    const q = new URLSearchParams({ minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy, w: 1, h: 1 });
+    const r = await fetch(`/buildings.bin?${q}`, { signal: ctrl.signal });
+    if (r.status === 204 || !r.ok) return;
+    const buf = await r.arrayBuffer(), dv = new DataView(buf);
+    if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PBO3')
+      return;
+    const count = dv.getUint32(4, true);
+    bldgTruncated = !!dv.getUint8(8);
+    const ox = dv.getFloat64(9, true), oy = dv.getFloat64(17, true);
+    bldgOrigin = [ox, oy];
+    let off = 25;
+    bldgTick++;
+    // Rings of one building arrive consecutively; a building already cached
+    // keeps its geometry and only takes the fresher values.
+    let cur = null, curId = -1;
+    for (let i = 0; i < count; i++) {
+      const id = dv.getUint32(off, true); off += 4;
+      const n = dv.getUint32(off, true); off += 4;
+      const top = dv.getFloat32(off, true); off += 4;
+      const loss = dv.getFloat32(off, true); off += 4;
+      const census = dv.getFloat32(off, true); off += 4;
+      // Offsets from the header origin, NOT absolute UTM: an f32 northing
+      // quantises to 0.5 m, which is the width of the thing being drawn.
+      const ring = new Float32Array(buf.slice(off, off + n*8)); off += n * 8;
+      if (id !== curId) {
+        curId = id;
+        cur = bldgCache.get(id);
+        if (cur) { cur.loss = loss; cur.census = census; cur.top = top; cur.seen = bldgTick; cur = null; continue; }
+        cur = { rings: [], x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity, top, loss, census, seen: bldgTick };
+        bldgCache.set(id, cur);
+      }
+      if (!cur) continue;                        // already held; skip its rings
+      cur.rings.push(ring); bldgRings++;
+      for (let k = 0; k < n; k++) {
+        const x = ox + ring[k*2], y = oy + ring[k*2+1];
+        if (x < cur.x0) cur.x0 = x; if (x > cur.x1) cur.x1 = x;
+        if (y < cur.y0) cur.y0 = y; if (y > cur.y1) cur.y1 = y;
+      }
+      // Indexed once its bounding box is final; a building's rings arrive
+      // consecutively, so the last ring of `cur` is the one before the id
+      // changes (or the end of the payload).
+      const nextIsNew = (i + 1 === count) || dv.getUint32(off, true) !== id;
+      if (nextIsNew) bldgIndexAdd(id, cur);
+    }
+    bldgEvict();
+    bldgGen++;
+    draw();
+  } catch (e) { /* an aborted or failed fetch leaves the cache as it was */ }
+  finally { if (bldgReq === ctrl) bldgReq = null; }
+}
+
+/// Refresh only the VALUES of footprints in the current box -- 12 bytes per
+/// building instead of its outline again. Called when a sweep band lands and
+/// when a census finishes.
+async function refreshBuildingValues() {
+  if (!view || !bldgCache.size) return;
+  if (bldgValReq) bldgValReq.abort();
+  const ctrl = new AbortController(); bldgValReq = ctrl;
+  try {
+    const b = bldgBox();
+    const q = new URLSearchParams({ minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy, w: 1, h: 1 });
+    const r = await fetch(`/buildings/values.bin?${q}`, { signal: ctrl.signal });
+    if (!r.ok) return;
+    const buf = await r.arrayBuffer(), dv = new DataView(buf);
+    if (String.fromCharCode(dv.getUint8(0),dv.getUint8(1),dv.getUint8(2),dv.getUint8(3)) !== 'PBV1')
+      return;
+    const count = dv.getUint32(4, true);
+    let off = 8, touched = 0;
+    for (let i = 0; i < count; i++) {
+      const id = dv.getUint32(off, true), loss = dv.getFloat32(off + 4, true), census = dv.getFloat32(off + 8, true);
+      off += 12;
+      const e = bldgCache.get(id);
+      if (e) { e.loss = loss; e.census = census; touched++; }
+    }
+    if (touched) { bldgGen++; draw(); }
+  } catch (e) { /* stale values stay until the next refresh */ }
+  finally { if (bldgValReq === ctrl) bldgValReq = null; }
+}
+
+/// A value is dropped only when it is WRONG, never to save space.
+function invalidateBuildingValues(which) {
+  for (const e of bldgCache.values()) {
+    if (which === 'loss') e.loss = NaN; else e.census = NaN;
+  }
+  bldgGen++;
+}
+
+el('netrun').onclick = async () => {
+  el('netrun').textContent = 'computing…';
+  invalidateBuildingValues('census');
+  const q = new URLSearchParams({ budget_db: el('bud').value,
+    situation: el('situation').value, assume_h: el('netah').value,
+    k: el('netk').value, radius_km: 12, azimuths: 512 });
+  try {
+    renderNetStat(await (await fetch(`/network/start?${q}`)).json());
+  } catch (e) { el('netstat').textContent = 'failed to start: ' + e.message; }
+  if (netPoll) clearInterval(netPoll);
+  netPoll = setInterval(pollNet, 2000);
+};
+el('netshow').onchange = draw;
+
+// ---- coverage mode: one transmitter, or the whole mesh -------------------
+//
+// These answer different questions and must never be on the map together.
+// "Could a listener here hear THIS proposed site" and "is a listener here
+// already covered by ANY of 253 deployed repeaters" use the same green, and
+// once both were drawn there was no way to tell which green was which — so
+// the mode hides the other panel's controls AND its overlay.
+//
+// Neither computation is discarded on a switch: a census costs minutes, and
+// throwing it away because someone looked at a candidate site would make the
+// two modes hostile to each other. Both stay in memory; only what is DRAWN
+// changes.
+function covMode() { return el('covmode').value; }
+
+function applyCovMode() {
+  const m = covMode();
+  el('txpanel').hidden = m !== 'tx';
+  el('netpanel').hidden = m !== 'net';
+  const zb = el('zbar');
+  if (zb) {
+    zb.classList.toggle('off', m !== 'tx');
+    el('zslider').disabled = m !== 'tx';
+    zb.title = m === 'tx' ? 'listener height above ground'
+      : 'the mesh census takes its listener height from the receiver dropdown';
+  }
+  el('covwhat').innerHTML = m === 'tx'
+    ? 'One candidate site against the terrain. Nothing about the network that '
+      + 'already exists — place it, and the map shows only its own reach.'
+    : 'A census of the <b>' + (nodes.length || 0) + '</b> repeaters already on '
+      + 'the air. No candidate site is involved.';
+  draw();
+}
+el('covmode').onchange = applyCovMode;
+
+// The listener height appears in the sentence under it, because a bare number
+// in a box beside "transmitter AGL" reads as a second transmitter.
+function echoRxH() {
+  const e = el('rxhecho');
+  if (e) e.textContent = el('rxh').value;
+  const z = el('zval');
+  if (z) z.textContent = (+el('rxh').value).toFixed(1).replace(/\.0$/, '') + ' m';
+}
+
+// ---- the receiver-height scrubber ---------------------------------------
+//
+// The number box and the slider are two views of ONE value, so neither can
+// drift from what was actually computed.
+//
+// Dragging restarts the sweep, which sounds expensive and is not: the sweep
+// now grows outward in bands and the innermost lands in ~0.03 s, so the map
+// near the transmitter tracks the drag while the distance fills in behind it.
+// That is only true because the height genuinely changes the answer — rx
+// height enters P.1812 at the receive end and in the location-variability
+// term — so there is nothing to interpolate and no cached stack to scrub.
+let zTimer = null;
+function scrubRxH(v) {
+  el('rxh').value = v;
+  echoRxH();
+  // Debounced: a drag fires input dozens of times, and each one would abort
+  // and restart a sweep, so the map would never finish a band.
+  clearTimeout(zTimer);
+  zTimer = setTimeout(() => {
+    if (covMode() !== 'tx') {
+      el('zval').textContent = 'mesh mode';
+      return;
+    }
+    if (!tx) {
+      // Say why nothing happened. Silently doing nothing is what makes a
+      // control feel broken.
+      stat.textContent = 'listener height set — place a transmitter to see it';
+      return;
+    }
+    fetchLoss();
+  }, 250);
+}
+if (el('zslider')) {
+  el('zslider').value = el('rxh').value;
+  el('zslider').addEventListener('input', e => scrubRxH(e.target.value));
+  // The map listens for pointerdown on the whole document to pan and to
+  // place a transmitter. Without this, dragging the slider dragged the map
+  // underneath it and could drop a transmitter where the thumb happened to
+  // be.
+  for (const ev of ['pointerdown','mousedown','touchstart','wheel']) {
+    el('zbar').addEventListener(ev, e => e.stopPropagation(), { passive: false });
+  }
+}
+el('rxh').addEventListener('input', () => {
+  if (el('zslider')) el('zslider').value = el('rxh').value;
+  echoRxH();
+});
+echoRxH();
+applyCovMode();
+
+// ---- radio presets: make the budget number mean something ---------------
+let presets = null;
+
+function applyBudget() {
+  if (!presets) return;
+  const r = presets.radios.find(x => x.id === el('radio').value);
+  if (!r) return;
+  const p = r.powers.find(x => String(x.tx_dbm) === el('pwr').value) || r.powers.at(-1);
+  if (!p || p.max_loss_db == null) return;
+  el('bud').value = p.max_loss_db.toFixed(1);
+  el('budval').textContent = p.max_loss_db.toFixed(1) + ' dB';
+  // Show the arithmetic, so the threshold is auditable rather than a number.
+  el('budgetwhy').textContent =
+    `SF${r.sf} BW${r.bw_khz|0} @ ${r.freq_mhz} MHz\n` +
+    `  ${p.tx_dbm.toFixed(0)} dBm tx  + ${(2*r.antenna_gain_dbi).toFixed(0)} dB ant (both ends)\n` +
+    `  − (${r.sensitivity_dbm.toFixed(1)}) dBm sens  − ${(+r.fade_margin_db).toFixed(1)} dB fade\n` +
+    `  = ${p.max_loss_db.toFixed(1)} dB of path loss you can spend` +
+    (p.over_erp ? `\n  ! ${p.tx_dbm}+${r.antenna_gain_dbi} dBi exceeds the ${r.erp_ceiling_dbm} dBm ERP ceiling` : '');
+  draw();
+  if (tx) fetchLoss();
+}
+
+async function loadPresets() {
+  try {
+    presets = await (await fetch('/api/presets')).json();
+  } catch (e) { return; }
+  const rs = el('radio');
+  for (const r of presets.radios) {
+    const o = document.createElement('option');
+    o.value = r.id; o.textContent = r.id;
+    if (r.id === 'mc-eu868-default') o.selected = true;
+    rs.append(o);
+  }
+  const fill = () => {
+    const r = presets.radios.find(x => x.id === rs.value);
+    el('pwr').textContent = '';
+    for (const p of r.powers) {
+      const o = document.createElement('option');
+      o.value = String(p.tx_dbm);
+      o.textContent = p.tx_dbm + ' dBm' + (p.over_erp ? ' ⚠' : '');
+      if (p.tx_dbm === 22) o.selected = true;
+      el('pwr').append(o);
+    }
+    applyBudget();
+  };
+  rs.onchange = fill;
+  el('pwr').onchange = applyBudget;
+  fill();
+}
+
+// ---- point-to-point link: what a coverage raster cannot answer ----------
+let measuring = false, linkB = null;
+
+async function measureLink(b) {
+  if (!tx) return;
+  linkB = b;
+  el('linkout').textContent = 'computing…';
+  try {
+    const q = new URLSearchParams({ ax:tx.xy.x, ay:tx.xy.y, bx:b.x, by:b.y,
+      tx_h:el('txh').value, rx_h:el('bh').value, budget_db:el('bud').value });
+    const r = await fetch(`/link.json?${q}`);
+    if (!r.ok) { el('linkout').textContent = await r.text(); return; }
+    const d = await r.json();
+    const verdict = d.closes
+      ? `<span class="ok">CLOSES</span> with ${d.margin_db.toFixed(1)} dB spare`
+      : `<span class="no">SHORT</span> by ${(-d.margin_db).toFixed(1)} dB`;
+    el('linkout').innerHTML =
+      `${d.distance_km.toFixed(2)} km · ${fmtM(d.tx_h)} → ${fmtM(d.rx_h)}<br>` +
+      `path loss ${d.lb_db.toFixed(1)} dB vs ${d.budget_db.toFixed(1)} budget<br>${verdict}`;
+    drawProfile(d);
+    draw();
+  } catch (e) { el('linkout').textContent = 'link error: ' + e.message; }
+}
+
+function drawProfile(d) {
+  const cvp = el('prof');
+  cvp.classList.add('on');
+  // Size the backing store from the element's ACTUAL laid-out box, so the
+  // chart can never exceed its column, and clamp it: a canvas is sized in
+  // device pixels and a stale/huge measurement would allocate accordingly.
+  const box = cvp.getBoundingClientRect();
+  const cssW = Math.max(120, Math.min(box.width || 260, 1200));
+  const cssH = Math.max(80, Math.min(box.height || 120, 400));
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cvp.width = Math.round(cssW * dpr);
+  cvp.height = Math.round(cssH * dpr);
+  const g = cvp.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+
+  const P = d.profile;
+  if (!P.length) return;
+  const F = d.fresnel || { worst_ratio: 0, worst_d_km: 0 };
+
+  // Vertical extent must contain the terrain, the ray AND the Fresnel zone —
+  // clipping the zone would hide exactly the pinch the chart exists to show.
+  const lo = Math.min(...P.map(p => Math.min(p.h, p.ray - p.f1)));
+  const hi = Math.max(...P.map(p => Math.max(p.e, p.ray + p.f1)));
+  const span = Math.max(hi - lo, 20);
+  const padT = 4, padB = 12;
+  const X = i => (P[i].d / d.distance_km) * cssW;
+  const Y = v => cssH - padB - ((v - lo) / span) * (cssH - padT - padB);
+
+  // Terrain WITH earth curvature folded in (field p.e), then bare terrain.
+  // Drawing the flat-earth profile would make every long path look clearer
+  // than it is.
+  g.beginPath(); g.moveTo(0, cssH);
+  P.forEach((p,i) => g.lineTo(X(i), Y(p.e)));
+  g.lineTo(cssW, cssH); g.closePath();
+  g.fillStyle = '#cfd8cb'; g.fill();
+  g.beginPath(); g.moveTo(0, cssH);
+  P.forEach((p,i) => g.lineTo(X(i), Y(p.h)));
+  g.lineTo(cssW, cssH); g.closePath();
+  g.fillStyle = '#b6a892'; g.fill();
+
+  // First Fresnel zone, and the 0.6 x F1 threshold inside it.
+  const zone = (frac, fill, stroke) => {
+    g.beginPath();
+    P.forEach((p,i) => { const y = Y(p.ray + p.f1*frac); i ? g.lineTo(X(i), y) : g.moveTo(X(i), y); });
+    for (let i = P.length - 1; i >= 0; i--) g.lineTo(X(i), Y(P[i].ray - P[i].f1*frac));
+    g.closePath();
+    if (fill) { g.fillStyle = fill; g.fill(); }
+    if (stroke) { g.strokeStyle = stroke; g.lineWidth = 1; g.stroke(); }
+  };
+  zone(1.0, 'rgba(28,79,143,0.13)', 'rgba(28,79,143,0.45)');
+  zone(0.6, null, 'rgba(28,79,143,0.30)');
+
+  // The ray itself.
+  g.beginPath();
+  g.moveTo(X(0), Y(P[0].ray));
+  g.lineTo(X(P.length-1), Y(P[P.length-1].ray));
+  g.strokeStyle = d.closes ? '#1f7a4b' : '#b0202f';
+  g.lineWidth = 2; g.stroke();
+
+  // Mark the pinch point — the number in the readout, located on the chart.
+  const wx = (F.worst_d_km / d.distance_km) * cssW;
+  g.beginPath(); g.moveTo(wx, padT); g.lineTo(wx, cssH - padB);
+  g.setLineDash([3,3]); g.strokeStyle = '#b0202f'; g.lineWidth = 1; g.stroke();
+  g.setLineDash([]);
+
+  // Fresnel readout under the chart.
+  const cls = F.verdict === 'clear' ? 'ok' : 'bad';
+  // The clearance numbers are a DIAGNOSIS. What follows is the part an
+  // operator can act on, and it differs per link: the same -63% is nothing
+  // with 26 dB of margin and fatal with 3.
+  const S = d.sensitivity || {};
+  const nu = Math.max(0, -F.worst_ratio) * Math.SQRT2;
+  // Single knife-edge diffraction, ITU-R P.526 eq. (31). Turns a percentage
+  // nobody can price into decibels, which is the unit the budget is in.
+  const jdb = 6.9 + 20 * Math.log10(Math.sqrt(Math.pow(nu - 0.1, 2) + 1) + nu - 0.1);
+  el('fres').innerHTML =
+    `1st Fresnel worst <b class="${cls}">${(F.worst_ratio*100).toFixed(0)}%</b> ` +
+    `(<span class="${cls}">${F.verdict}</span>) at ${F.worst_d_km.toFixed(2)} km` +
+    (S.pinch_on ? `, on ${S.pinch_on}` : '') + `<br>` +
+    `clearance ${F.worst_clearance_m.toFixed(1)} m vs F1 radius ${F.worst_f1_m.toFixed(1)} m` +
+    (nu > 0 && jdb > 0.5 ? ` &rarr; about <b>${jdb.toFixed(0)} dB</b> of diffraction` : '') +
+    `<br>&lambda; ${F.lambda_m.toFixed(3)} m &middot; k-factor ${F.k_factor.toFixed(3)}` +
+    (S.db_per_m_this_end !== undefined
+      ? `<br>a metre of height is worth <b>${(+S.db_per_m_this_end).toFixed(2)} dB</b> here, ` +
+        `<b>${(+S.db_per_m_far_end).toFixed(2)} dB</b> at the far end`
+      : '');
+
+  const optsBox = el('linkopts');
+  if (!optsBox) return;
+  optsBox.innerHTML = (!d.options || !d.options.length) ? '' :
+    '<div class="oh">what you can do about it</div>' +
+    d.options.map(o =>
+      `<div class="opt ${o.practical ? '' : 'hard'}">` +
+      `<span class="oa">${o.action}</span>` +
+      (o.gain_db ? `<span class="og">+${o.gain_db} dB</span>` : '') +
+      `<div class="od">${o.detail}</div></div>`).join('');
+}
+
+el('measure').onclick = () => {
+  if (!tx) { el('linkout').textContent = 'place a transmitter first'; return; }
+  measuring = !measuring;
+  mapEl.classList.toggle('place', measuring);
+  el('measure').textContent = measuring ? 'click the far end…' : 'measure link…';
+};
+
+// ---- offline search: the pack's own gazetteer, no geocoding service -----
+let searchTimer = null, searchReq = null;
+
+function centreOn(x, y, spanM) {
+  const s = size();
+  const w = spanM ?? vw(view), h = w * (s.ch / s.cw);
+  view = { minx: x - w/2, maxx: x + w/2, miny: y - h/2, maxy: y + h/2 };
+  draw(); scheduleTile();
+}
+
+async function selectHit(h) {
+  pin = { x: h.x, y: h.y };
+  highlight = null;
+  if (tile) { tile.clear_highlight(); invalidateCompose(); }
+  // Summits and masts frame a link-sized area, not a landmark-sized one: you
+  // look one up to see what it can reach, not to read its name.
+  let span = h.kind === 'city' ? 24000 : h.kind === 'town' ? 9000
+           : h.kind === 'summit' || h.kind === 'mast' ? 16000
+           : h.kind === 'village' ? 5000 : h.kind === 'district' ? 6000 : 1800;
+  if (h.area !== null && h.area !== undefined) {
+    try {
+      const r = await fetch(`/area.bin?i=${h.area}`);
+      if (r.ok) {
+        const dv = new DataView(await r.arrayBuffer());
+        const rings = dv.getUint16(4, true);
+        const flat = [];
+        let off = 6, minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+        for (let k = 0; k < rings; k++) {
+          const n = dv.getUint32(off, true); off += 4;
+          flat.push(n);
+          for (let i = 0; i < n; i++) {
+            const px = dv.getFloat32(off, true), py = dv.getFloat32(off + 4, true);
+            off += 8; flat.push(px, py);
+            if (px < minx) minx = px; if (px > maxx) maxx = px;
+            if (py < miny) miny = py; if (py > maxy) maxy = py;
+          }
+        }
+        if (flat.length) {
+          highlight = new Float32Array(flat);
+          if (tile) { tile.set_highlight(highlight); invalidateCompose(); }
+          // Frame the whole postal area with a margin.
+          span = Math.max(maxx - minx, (maxy - miny) * (size().cw / size().ch)) * 1.25;
+        }
+      }
+    } catch (e) { /* offline is the normal case; the pin still works */ }
+  }
+  centreOn(h.x, h.y, span);
+}
+
+function renderHits(hits) {
+  const ul = el('hits');
+  ul.textContent = '';
+  if (!hits.length) {
+    const li = document.createElement('li');
+    li.id = 'none'; li.textContent = 'no match in this pack';
+    ul.append(li); return;
+  }
+  for (const h of hits) {
+    const li = document.createElement('li');
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = h.name;
+    if (h.ctx) { const c = document.createElement('span');
+                 c.className = 'c'; c.textContent = ' · ' + h.ctx; n.append(c); }
+    const k = document.createElement('span');
+    k.className = 'k'; k.textContent = h.kind;
+    li.append(n, k);
+    li.onclick = () => selectHit(h);
+    ul.append(li);
+  }
+}
+
+el('q').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const term = el('q').value.trim();
+  if (term.length < 2) { el('hits').textContent = ''; return; }
+  searchTimer = setTimeout(async () => {
+    if (searchReq) searchReq.abort();
+    const ctrl = new AbortController(); searchReq = ctrl;
+    try {
+      const r = await fetch(`/search?q=${encodeURIComponent(term)}`, { signal: ctrl.signal });
+      if (r.ok) renderHits((await r.json()).hits);
+    } catch (e) { if (e.name !== 'AbortError') el('hits').textContent = ''; }
+    finally { if (searchReq === ctrl) searchReq = null; }
+  }, 140);
+});
+el('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { const first = el('hits').querySelector('li:not(#none)');
+                           if (first) first.click(); }
+  if (e.key === 'Escape') { el('q').value = ''; el('hits').textContent = '';
+                            pin = null; highlight = null;
+                            if (tile) { tile.clear_highlight(); invalidateCompose(); } draw(); }
+});
+
+el('place').onclick = () => {
+  placing = !placing; mapEl.classList.toggle('place', placing);
+  el('place').textContent = placing ? 'click the map…' : 'place transmitter';
+};
+el('clear').onclick = () => { tx = null; linkB = null; lossLoaded = false; lastComputeMs = null;
+                              invalidateBuildingValues('loss');
+                              el('linkout').textContent = ''; el('fres').textContent = '';
+                              if (el('linkopts')) el('linkopts').innerHTML = '';
+                              el('prof').classList.remove('on');
+                              lossWin = null;
+                              if (tile) { tile.clear_loss(); invalidateOverlay(); } draw(); };
+el('layer').onchange = refetchBasemap;
+el('roads').onchange = refetchBasemap;
+if (el('showbldg')) el('showbldg').onchange = fetchBuildings;
+el('shownodes').onchange = () => { lastNodesShown = -1; draw(); updateNodeStat(); };
+let budTimer = null;
+el('bud').oninput = () => {
+  el('budval').textContent = (+el('bud').value).toFixed(1) + ' dB';
+  // On the GL path the budget is a UNIFORM. Nothing is recomposed, nothing is
+  // re-uploaded, and the whole tick is a clear, a triangle and a blit: 0-1 ms
+  // by the page's own counter at both 25.6 km and 3.1 km, against 57-83 and
+  // 25-34 on the CPU path. So the debounce that the paragraph below exists to
+  // justify is not owed here, and the map tracks the slider.
+  //
+  // Still coalesced to one draw per frame — `input` outruns the display — and
+  // still only the OVERLAY is free: at 3.1 km with footprints shown the tick
+  // measures 18-22 ms, all of it `refreshBuildingFills` re-pathing the
+  // footprints, which this change does not touch.
+  if (glo.active()) { scheduleDraw(); return; }
+  // TRAILING debounce, not the per-frame coalescer. Moving the budget
+  // recomposes the whole tile through the coverage overlay: measured 45-120 ms
+  // across the slider's travel at a 25.6 km view (73 ms at the default), which
+  // is 5-8 frames of work per tick. scheduleDraw clears its flag at the START
+  // of a 16 ms callback, so under a drag the next tick was queued before the
+  // last compose retired and the pointer queue never drained -- an 85% duty
+  // cycle of long tasks. The readout stays live; the recompose lands 140 ms
+  // after the last movement, once, the way the listener-height scrubber
+  // already does it.
+  clearTimeout(budTimer);
+  budTimer = setTimeout(draw, 140);
+};
+for (const id of ['txh','rxh','rad']) el(id).onchange = () => { if (tx) fetchLoss(); };
+el('bh').onchange = () => { if (linkB) measureLink(linkB); };
+// Watch the map box itself rather than the window. At boot the flex layout
+// has not resolved yet — and in a hidden pane it never resolves until the
+// pane is shown — so reading its size too early yields a few pixels and the
+// first tile comes back as a 10x10 grid of kilometre cells. This observer
+// OWNS the first view as well as every later resize, so there is one code
+// path and no "measure early and hope" fallback.
+let rt;
+function fitView() {
+  const s = size();
+  if (s.cw < 40 || !pack) return false;
+  if (!view) {
+    const e = pack.extent;
+    const cx = (e.minx + e.maxx)/2, cy = (e.miny + e.maxy)/2;
+    const halfW = 12800, halfH = halfW * (s.ch / s.cw);
+    view = { minx: cx-halfW, maxx: cx+halfW, miny: cy-halfH, maxy: cy+halfH };
+    return true;
+  }
+  // Keep the view's aspect ratio locked to the canvas. Without this the two
+  // drift apart on every resize, and the tile — whose cell size is derived
+  // from the requested box — no longer lines up with anything drawn from
+  // world coordinates.
+  const cy = (view.miny + view.maxy) / 2, want = vw(view) * (s.ch / s.cw);
+  view = { ...view, miny: cy - want/2, maxy: cy + want/2 };
+  return true;
+}
+new ResizeObserver(() => {
+  clearTimeout(rt);
+  rt = setTimeout(() => {
+    if (!fitView()) return;
+    if (!tile) { fetchTile(); return; }
+    draw(); scheduleTile();
+  }, 100);
+}).observe(mapEl);
+
+// ---- overlay parity self-test -------------------------------------------
+//
+// A GLSL shader cannot be reached from a Rust test, so the shader's contract
+// — the same colours as planner_render, at the same sample points — is
+// checked here, in two stages, against the two things it must agree with:
+//
+//   A. a JS transcription of the same rules, evaluated at the same fragment
+//      centres and in the same single precision. This is the SHADER's test:
+//      it fails on a wrong ramp constant, a wrong tap weight, a wrong domain
+//      test, a mishandled sentinel or a flipped row order.
+//   B. planner_render itself, through `Tile::compose`. Stage A alone only
+//      proves the shader matches the JS beside it; stage B is what ties that
+//      JS to the Rust, and it is the stage that catches BOTH of them being
+//      wrong together.
+//
+// Run it with `?selftest=overlay`, or from the console as
+// `plannerSelftest()`. It reports pixels compared, pixels identical, the
+// largest per-channel difference and how many pixels differ by more than
+// PARITY_NEAR_DIFF, and it fails loudly — in the page and in the console —
+// when a threshold is crossed.
+//
+// Thresholds, not eyeballs. Neither stage is expected to be BIT-exact, and
+// the reason is measured rather than assumed:
+//
+//   - GPUs may contract `a*(1-t) + b*t` into a single-rounding multiply-add,
+//     and GLSL ES 3.0 has no way to forbid it (no `precise` qualifier). On
+//     the machine this was written on, 35 of 256 sampled interpolations came
+//     back exactly one f32 ulp away from the same expression evaluated as
+//     separate multiplies and an add. One ulp in the interpolated loss can
+//     move a ramp channel across an integer, so stage A lands ~6 pixels in
+//     256 000 one count out. That is the whole of its residual.
+//   - Rust evaluates the ramp in f64 and the shader cannot, so stage B has
+//     the same freedom in the other direction.
+//
+// Hence: an overwhelming majority identical, and no pixel more than a few
+// counts out. A stage reporting a max difference of tens is not floating
+// point — it is a wrong constant, a wrong tap, or a wrong row order.
+const PARITY_MIN_IDENTICAL = 0.999;   // fraction of compared pixels
+const PARITY_MAX_DIFF = 8;            // largest tolerated per-channel step
+const PARITY_NEAR_DIFF = 2;           // differences above this are counted
+
+/// planner_render's two overlays, transcribed, in the SHADER's precision.
+///
+/// `Math.fround` after every operation, because the shader is f32 throughout
+/// and JS arithmetic is f64: without it this would disagree with the GPU in
+/// the last bit and prove nothing about the last bit. `map` is the shader's
+/// own `u_map`, taken from `glo.mapOf`, so both sides sample the same points
+/// rather than two derivations of them. `flipY` selects the row order: a
+/// framebuffer read counts rows from the bottom, a composed image from the
+/// top.
+function overlayRef(w, h, map, win, mode, budget, k, flipY) {
+  const F = Math.fround, out = new Uint8Array(w * h * 4);
+  const A = map[0], Bm = map[1], C = map[2], D = map[3];
+  // The shader's effective domain limits. Grid's 1e-9 slack is left out for
+  // the same reason it is left out of the shader: at these magnitudes it is
+  // below one f32 step.
+  const hiX = win.w - 0.5, hiY = win.h - 0.5;
+  const lp = (a, b, t) => F(a + F(F(b - a) * Math.min(1, Math.max(0, t))));
+  for (let row = 0; row < h; row++) {
+    const gy = flipY ? h - row - 0.5 : row + 0.5;
+    const fy = F(C + F(gy * D));
+    for (let col = 0; col < w; col++) {
+      const fx = F(A + F((col + 0.5) * Bm));
+      const o = (row * w + col) * 4;
+      if (fx < -0.5 || fy < -0.5 || fx > hiX || fy > hiY) continue;
+      if (mode === 1) {
+        const c = Math.min(win.w - 1, Math.max(0, Math.floor(fx + 0.5)));
+        const r = Math.min(win.h - 1, Math.max(0, Math.floor(fy + 0.5)));
+        const n = win.u8[r * win.w + c];
+        if (n === 255) continue;
+        const p = n === 0 ? [200, 40, 50, 150]
+                : n < Math.max(1, k) ? [235, 170, 45, 135]
+                : [40, 150, 90, 120];
+        out[o] = p[0]; out[o+1] = p[1]; out[o+2] = p[2]; out[o+3] = p[3];
+        continue;
+      }
+      const cx = Math.min(win.w - 1, Math.max(0, fx));
+      const cy = Math.min(win.h - 1, Math.max(0, fy));
+      const c0 = Math.floor(cx), r0 = Math.floor(cy);
+      const c1 = Math.min(c0 + 1, win.w - 1), r1 = Math.min(r0 + 1, win.h - 1);
+      const tx = F(cx - c0), ty = F(cy - r0);
+      const q0 = win.u16[r0*win.w + c0], q1 = win.u16[r0*win.w + c1];
+      const q2 = win.u16[r1*win.w + c0], q3 = win.u16[r1*win.w + c1];
+      if (q0 === 65535 || q1 === 65535 || q2 === 65535 || q3 === 65535) continue;
+      const v0 = F(q0/100), v1 = F(q1/100), v2 = F(q2/100), v3 = F(q3/100);
+      const top = F(F(v0 * F(1 - tx)) + F(v1 * tx));
+      const bot = F(F(v2 * F(1 - tx)) + F(v3 * tx));
+      const lb  = F(F(top * F(1 - ty)) + F(bot * ty));
+      if (lb > budget) continue;
+      const t = Math.min(1, Math.max(0, F(F(budget - lb) / 30)));
+      let r3, g3, b3;
+      if (t > 0.5) { const uu = F(F(t - 0.5) * 2);
+                     r3 = lp(240, 40, uu); g3 = lp(200, 170, uu); b3 = lp(60, 90, uu); }
+      else         { const uu = F(t * 2);
+                     r3 = lp(200, 240, uu); g3 = lp(50, 200, uu); b3 = lp(50, 60, uu); }
+      out[o] = Math.floor(r3); out[o+1] = Math.floor(g3); out[o+2] = Math.floor(b3);
+      out[o+3] = 165;
+    }
+  }
+  return out;
+}
+
+/// Agreement over the pixels that CARRY COLOUR on at least one side. A pixel
+/// transparent on both is agreement about nothing, and the synthetic windows
+/// leave 40-65 % of the view untouched, so counting those made "99.998 %
+/// identical" read as stronger than the figure over painted pixels it stands
+/// for (independent review). A pixel painted on one side only differs in
+/// alpha and is counted as a difference.
+function parityCompare(a, b, n) {
+  let painted = 0, identical = 0, maxDiff = 0, over = 0;
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    if (!a[j+3] && !b[j+3]) continue;
+    painted++;
+    let d = Math.abs(a[j] - b[j]);
+    d = Math.max(d, Math.abs(a[j+1] - b[j+1]));
+    d = Math.max(d, Math.abs(a[j+2] - b[j+2]));
+    d = Math.max(d, Math.abs(a[j+3] - b[j+3]));
+    if (d === 0) identical++;
+    else { if (d > maxDiff) maxDiff = d; if (d > PARITY_NEAR_DIFF) over++; }
+  }
+  const pass = (painted === 0 || identical / painted >= PARITY_MIN_IDENTICAL) &&
+               maxDiff <= PARITY_MAX_DIFF;
+  return { compared: n, painted, identical,
+           pct: painted ? +(100 * identical / painted).toFixed(4) : 100, maxDiff, over, pass };
+}
+
+/// Deterministic windows that put every branch of both overlays on screen.
+///
+/// Odd cell counts, a window covering only the middle of the view, an
+/// interior block of "not evaluated" and a loss ramp that runs off both ends
+/// of the budget: so one pass exercises the interior, the clamped edge, the
+/// half-cell domain limit, the pixels beyond it, and both sentinels.
+function paritySynthetic(v) {
+  const w = 97, h = 61;
+  const rx = (v.maxx - v.minx) * 0.6 / w, ry = (v.maxy - v.miny) * 0.6 / h;
+  const ox = v.minx + (v.maxx - v.minx) * 0.2 + rx / 2;
+  const oy = v.maxy - (v.maxy - v.miny) * 0.2 - ry / 2;
+  const u16 = new Uint16Array(w * h), u8 = new Uint8Array(w * h);
+  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) {
+    const i = r * w + c;
+    u16[i] = (c > 40 && c < 47 && r > 20 && r < 30)
+      ? 65535 : Math.round((110 + c * 0.63 + r * 0.29) * 100);
+    u8[i] = (c % 37 === 0 && r % 11 === 0) ? 255 : (c + r * 3) % 7;
+  }
+  return { loss: { ox, oy, rx, ry, w, h, u16 },
+           net:  { ox, oy, rx, ry, w, h, u8, k: 2 } };
+}
+
+/// Stage A: the shader against the transcription, at screen resolution.
+function parityStageA(syn, sz, v) {
+  const rows = [];
+  for (const [mode, budget] of [[0, 132], [0, 145], [0, 160], [1, 0]]) {
+    const win = mode === 1 ? syn.net : syn.loss;
+    const c = glo.render(sz, v, [{ win, mode, budget, k: syn.net.k }]);
+    if (!c) return [{ name: 'gl', error: 'the overlay pass did not run' }];
+    const got = glo.read(sz.w, sz.h);
+    const want = overlayRef(sz.w, sz.h, glo.mapOf(win, v, sz), win, mode, budget, syn.net.k, false);
+    rows.push({ name: mode === 1 ? 'census' : `coverage ${budget} dB`,
+                ...parityCompare(got, want, sz.w * sz.h) });
+  }
+  return rows;
+}
+
+/// Stage B: the transcription against planner_render, at tile resolution.
+///
+/// Uses the OVERVIEW tile — it is real, it is small, and it is already baked.
+/// Its own rasters are put back before returning, so the map is exactly as it
+/// was; `feather` is off on both composites so the comparison is over the
+/// overlay and nothing else.
+function parityStageB(syn) {
+  if (!overview || !overviewHolder) return [{ name: 'vs planner-render', error: 'no overview tile' }];
+  const t = overview, w = overviewHolder.w, h = overviewHolder.h;
+  const L = +el('layer').value, R = el('roads').checked;
+  const rows = [];
+  try {
+    t.set_loss(syn.loss.ox, syn.loss.oy, syn.loss.rx, syn.loss.ry,
+               syn.loss.w, syn.loss.h, lossF32(syn.loss));
+    t.set_network(syn.net.ox, syn.net.oy, syn.net.rx, syn.net.ry,
+                  syn.net.w, syn.net.h, syn.net.k, netF32(syn.net));
+    const e = t.outer_bounds();
+    const v = { minx: e[0], miny: e[1], maxx: e[2], maxy: e[3] };
+    const base = t.compose_base(L, R, false);
+    for (const [mode, budget] of [[0, 145], [1, 0]]) {
+      const win = mode === 1 ? syn.net : syn.loss;
+      const rust = t.compose(L, mode === 0, budget, R, mode === 1, false);
+      const ov = overlayRef(w, h, glo.mapOf(win, v, { w, h }), win, mode, budget, syn.net.k, true);
+      // planner_render's blend, byte for byte: c*a + base*(1-a), truncated,
+      // with a = alpha/255 in f64. Rounding instead of truncating is a
+      // one-count difference on most of the image, so this is not a detail.
+      //
+      // What this stage ties together is the JS transcription and the Rust
+      // compositor. It does NOT check the blend the GL path actually ships,
+      // which is the 2D canvas's (see draw()): that step is measured at 0 or
+      // +1 per channel against this arithmetic and has no automated check.
+      const want = new Uint8Array(base.length);
+      want.set(base);
+      for (let i = 0; i < want.length; i += 4) {
+        const a = ov[i+3] / 255;
+        if (!a) continue;
+        want[i]   = Math.trunc(ov[i]   * a + base[i]   * (1 - a));
+        want[i+1] = Math.trunc(ov[i+1] * a + base[i+1] * (1 - a));
+        want[i+2] = Math.trunc(ov[i+2] * a + base[i+2] * (1 - a));
+      }
+      rows.push({ name: mode === 1 ? 'census vs compose' : `coverage ${budget} dB vs compose`,
+                  ...parityCompare(rust, want, w * h) });
+    }
+  } finally {
+    t.clear_loss();
+    if (ovNetWin) t.set_network(ovNetWin.ox, ovNetWin.oy, ovNetWin.rx, ovNetWin.ry,
+                                ovNetWin.w, ovNetWin.h, ovNetWin.k, ovNetWin.f);
+    else t.clear_network();
+    invalidateCompose();
+  }
+  return rows;
+}
+
+/// Take the GL context away and check the CPU path actually comes back.
+///
+/// Requirement, not decoration: this page must keep drawing both overlays on
+/// a machine with no WebGL2 and through a driver reset. The drill loses the
+/// context, confirms the overlays are back INSIDE the tile surface (which is
+/// what the CPU path means), restores it, and confirms they leave again.
+async function parityFallbackDrill() {
+  if (!lossWin && !netWin) return { name: 'context loss', skip: 'no overlay loaded' };
+  const ext = glo.loseContextExtension();
+  if (!ext) return { name: 'context loss', skip: 'WEBGL_lose_context unavailable' };
+  const sig = () => {
+    const d = tileSurf.cx.getImageData(0, 0, tileSurf.cv.width, tileSurf.cv.height).data;
+    let a = 2166136261;
+    // Every 997th pixel: a prime stride walks the whole image without
+    // correlating with its rows, and reading all 12 MB adds nothing.
+    for (let i = 0; i < d.length; i += 997 * 4) a = Math.imul(a ^ d[i], 16777619) >>> 0;
+    return a;
+  };
+  const wasActive = glo.active();
+  ext.loseContext();
+  await new Promise(r => setTimeout(r, 100));
+  const lostActive = glo.active();
+  draw();
+  const cpuSig = sig();
+  ext.restoreContext();
+  for (let i = 0; i < 40 && !glo.active(); i++) await new Promise(r => setTimeout(r, 50));
+  const backActive = glo.active();
+  draw();
+  const glSig = sig();
+  return { name: 'context loss', wasActive, lostActive, backActive,
+           surfaceChanged: cpuSig !== glSig,
+           pass: wasActive && !lostActive && backActive && cpuSig !== glSig };
+}
+
+/// What a budget tick and a tile update actually cost, on this machine, in
+/// this build. Reported by the self-test rather than written down anywhere,
+/// because a number nobody can re-run is not a measurement.
+function parityBench() {
+  if (!tile || !tileHolder || !view) return { note: 'no detail tile' };
+  const s = size(), L = +el('layer').value, R = el('roads').checked, B = +el('bud').value;
+  const med = (f, n) => {
+    const ts = [];
+    for (let i = 0; i < n; i++) { const a = performance.now(); f(i); ts.push(performance.now() - a); }
+    ts.sort((x, y) => x - y);
+    return +ts[ts.length >> 1].toFixed(2);
+  };
+  const out = { view_km: +(vw(view) / 1000).toFixed(2), canvas: `${s.w}x${s.h}`,
+                tile_cells: `${tileHolder.w}x${tileHolder.h}` };
+  const bench = makeSurface();
+  const put = rgba => {
+    if (bench.cv.width !== tileHolder.w) { bench.cv.width = tileHolder.w; bench.cv.height = tileHolder.h; }
+    bench.cx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.length),
+                                        tileHolder.w, tileHolder.h), 0, 0);
+  };
+  out.compose_base_ms = med(() => put(tile.compose_base(L, R, true)), 5);
+  if (lossWin) out.compose_coverage_ms = med(i => put(tile.compose(L, true, B + (i % 5), R, false, true)), 5);
+  if (netWin) out.compose_census_ms = med(() => put(tile.compose(L, false, 0, R, true, true)), 5);
+  if (glo.active()) {
+    const win = lossWin || netWin;
+    if (win) out.gl_tick_ms = med(i => {
+      const c = glo.render(s, view, [{ win, mode: lossWin ? 0 : 1, budget: B + (i % 5), k: netK }]);
+      if (c) ctx.drawImage(c, 0, 0);
+    }, 21);
+    out.gl_texture_bytes = glo.textureBytes();
+    out.gl_last_upload = glo.lastUpload();
+  }
+  draw();                                    // undo the bench's scribbling
+  return out;
+}
+
+async function plannerSelftest() {
+  const box = el('selftest');
+  box.hidden = false;
+  box.textContent = 'overlay parity: running…';
+  await new Promise(r => setTimeout(r, 0));
+  const lines = [];
+  let pass = true, skipped = false;
+  if (!glo.active()) {
+    // Nothing was compared, so neither PASS nor FAIL is true. A PASS that
+    // compared nothing would be worse than a FAIL; a FAIL for a path the
+    // operator switched off with ?gl=0 is noise. SKIP, in neither colour.
+    lines.push('WebGL2 overlay path INACTIVE — nothing to compare.');
+    lines.push('(no WebGL2 context, or ?gl=0 is set)');
+    skipped = true;
+  } else {
+    const v = view || { minx: 0, miny: 0, maxx: 1000, maxy: 800 };
+    const syn = paritySynthetic(v);
+    const sz = { w: 640, h: 400 };
+    lines.push(`thresholds: >= ${(PARITY_MIN_IDENTICAL*100).toFixed(1)}% identical,` +
+               ` max diff <= ${PARITY_MAX_DIFF}/255`);
+    lines.push('');
+    lines.push(`A. shader vs transcription  (${sz.w}x${sz.h} device px)`);
+    for (const r of parityStageA(syn, sz, v)) {
+      if (r.error) { pass = false; lines.push(`   ${r.name}: ERROR ${r.error}`); continue; }
+      pass = pass && r.pass;
+      lines.push(`   ${r.pass ? 'PASS' : 'FAIL'} ${r.name.padEnd(18)} ` +
+                 `${r.identical}/${r.painted} painted identical (${r.pct}%), ` +
+                 `max ${r.maxDiff}/255, >${PARITY_NEAR_DIFF}: ${r.over}`);
+    }
+    lines.push('');
+    lines.push(`B. transcription vs planner-render (overview tile, f32 vs f64 ramp)`);
+    for (const r of parityStageB(syn)) {
+      if (r.error) { pass = false; lines.push(`   ${r.name}: ERROR ${r.error}`); continue; }
+      pass = pass && r.pass;
+      lines.push(`   ${r.pass ? 'PASS' : 'FAIL'} ${r.name.padEnd(26)} ` +
+                 `${r.identical}/${r.painted} painted identical (${r.pct}%), ` +
+                 `max ${r.maxDiff}/255, >${PARITY_NEAR_DIFF}: ${r.over}`);
+    }
+    lines.push('');
+    const d = await parityFallbackDrill();
+    if (d.skip) lines.push(`C. fallback drill: skipped (${d.skip})`);
+    else {
+      pass = pass && d.pass;
+      lines.push(`C. ${d.pass ? 'PASS' : 'FAIL'} fallback drill — active ${d.wasActive},` +
+                 ` after loss ${d.lostActive}, after restore ${d.backActive},` +
+                 ` surface changed ${d.surfaceChanged}`);
+    }
+    lines.push('');
+    lines.push('cost, this view:');
+    for (const [k, val] of Object.entries(parityBench()))
+      lines.push(`   ${k} = ${typeof val === 'object' ? JSON.stringify(val) : val}`);
+  }
+  lines.unshift(skipped ? 'overlay parity: SKIP' : pass ? 'overlay parity: PASS' : 'overlay parity: FAIL');
+  box.textContent = lines.join('\n');
+  box.classList.toggle('fail', !pass && !skipped);
+  const text = lines.join('\n');
+  if (pass || skipped) console.log(text); else console.error(text);
+  return { pass: skipped ? null : pass, skipped, text };
+}
+window.plannerSelftest = plannerSelftest;
+
+// ---- boot ---------------------------------------------------------------
+(async () => {
+  await init({ module_or_path: '/planner_wasm_bg.wasm' });
+  pack = await (await fetch('/api/pack')).json();
+  await loadPresets();
+  await loadNodes();
+  el('name').textContent = pack.name;
+  el('dir').textContent = pack.dir + ' · ' + pack.layers.join(', ');
+  // Never fetch against a degenerate measurement — that is what produced the
+  // kilometre-cell tile. Poll as well as observing: the ResizeObserver's only
+  // firing can land BEFORE the pack JSON arrives, and then there is no
+  // further resize to react to and the map waits forever.
+  el('hud').textContent = 'waiting for layout…';
+  // Poll until the map box has a size, and NEVER give up: a pane that is
+  // collapsed, hidden, or behind another tab can stay at zero size for
+  // minutes, and the previous ten-second deadline left a permanently dead map
+  // with an error where a map should be. Backs off to twice a second so an
+  // hour in a background tab costs nothing.
+  for (let i = 0; !fitView(); i++) {
+    await new Promise(r => setTimeout(r, i < 40 ? 50 : 500));
+  }
+  // Overview first and awaited: it is small, and having it before the detail
+  // tile means the very first paint is a map rather than an empty rectangle.
+  await loadOverview();
+  await fetchTile();
+  // A census already computed on the server survives a page reload; picking it
+  // up costs one request and saves the operator two minutes of recomputation.
+  // It also reattaches after a server restart mid-session.
+  try {
+    const s = await (await fetch('/network/status')).json();
+    renderNetStat(s);
+    if (s.state === 'ready') {
+      await loadNetRaster(s.k_target);
+      el('netkey').hidden = false;
+      el('netrun').textContent = 'recompute';
+      draw();
+    } else if (s.state === 'computing') {
+      netPoll = setInterval(pollNet, 2000);
+    }
+  } catch (e) { /* census is optional */ }
+  // Last, so it runs against a real tile and a real overview rather than
+  // against whatever existed a second into the load.
+  if (new URLSearchParams(location.search).get('selftest') === 'overlay')
+    await plannerSelftest();
+})();
+</script>
