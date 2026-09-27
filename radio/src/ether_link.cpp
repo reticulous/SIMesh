@@ -100,6 +100,7 @@ void handleMessage(const char* text, size_t len)
             f.tHdr     = msg.num("t_hdr", 0);
             f.tEnd     = msg.num("t_end", 0);
             f.levelDbm = (int)msg.num("level", kNoiseFloorDbm);
+            f.energyOnly = msg.num("cad", 0) != 0;
             modelRxBegin(chip, f);
         }
     } else if (type == "rx_end") {

@@ -195,8 +195,6 @@ struct ChipState {
     int      airLevel = 0;           /* the strongest level in flight */
     int64_t  airEndUs = 0;           /* when the last of it is over */
     int      lockId = 0;             /* the frame this receiver is following */
-    int      lockLevel = 0;
-    int64_t  lockEndUs = 0;
 
     /* When the last frame this antenna has been told of leaves the air. Not
      * the chip's state but the air's, so no mode change clears it: a driver
@@ -333,7 +331,6 @@ void dropLock(simradio* c)
 {
     ChipState& d = c->st;
     d.lockId = 0;
-    d.lockEndUs = 0;
     d.pendingValid = false;
     stopTimer(c->tPre);
     stopTimer(c->tHdr);
@@ -799,23 +796,17 @@ void modelRxBegin(simradio* c, const VirtualRxBegin& f)
     if (endUs > d.airEndUs) d.airEndUs = endUs;
     if (endUs > d.heardEndUs) d.heardEndUs = endUs;
 
-    /* A CAD senses; it demodulates nothing. */
-    if (cad) { S()->unlock(); return; }
+    /* A CAD senses; it demodulates nothing. Nor does an RX slot follow a frame
+     * the ether marks as energy. */
+    if (cad || f.energyOnly) { S()->unlock(); return; }
 
-    /* Then the demodulator, which follows one frame at a time. A frame that
-     * starts while another is being demodulated is not received at all unless
-     * it leads the one in progress by the capture margin, in which case the
-     * receiver drops what it had and takes the louder frame instead. Without
-     * this the chip would hand up whichever frame ended last and the medium's
-     * verdict — which says only one of them survived — would mean nothing. */
-    bool busy = now < d.lockEndUs;
-    if (busy && f.levelDbm < d.lockLevel + kCaptureDb) {
-        S()->unlock();
-        return;
-    }
-    d.lockId    = f.id;
-    d.lockLevel = f.levelDbm;
-    d.lockEndUs = now + (f.tEnd - f.t0);
+    /* Then the demodulator, which follows one frame at a time: the one the
+     * ether last began on it. Whether a later frame takes the receiver off
+     * the one in progress is the ether's decision, because only the ether
+     * sees everything arriving at this antenna summed; a frame that does not
+     * is sent here as energy. An rx_end for any frame but this one is not
+     * this receiver's. */
+    d.lockId = f.id;
 
     /* The sender's stamps are its own clock's; only the gaps between them mean
      * anything here, and they are measured from this instant. */
@@ -829,7 +820,7 @@ void modelRxEnd(simradio* c, const VirtualRxEnd& f)
     S()->lock();
     ChipState& d = c->st;
     if (strcmp(d.mode, "RX") != 0 || f.id != d.lockId) { S()->unlock(); return; }
-    d.lockEndUs = 0;
+    d.lockId = 0;
     size_t n = f.len > sizeof(d.pendingPayload) ? sizeof(d.pendingPayload) : f.len;
     if (f.payload && n) memcpy(d.pendingPayload, f.payload, n);
     d.pendingLen = n;

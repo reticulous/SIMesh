@@ -35,8 +35,44 @@
  * waiting for. A wake that fires counts its thread as running at once, so the
  * station cannot look idle between the grant and the thread getting the CPU.
  *
+ * With SIMESH_SEED in the environment as well, the shim is also the station's
+ * randomness: getentropy, getrandom and syscall(SYS_getrandom) — what ESP-IDF's
+ * host esp_random and mbedtls's platform entropy call — draw from a generator
+ * keyed by the seed and SIMESH_NODE_ID, so a run given the same seed gives
+ * every station the same bytes in the same order, and two stations of one run
+ * different ones. This needs nothing from the chip library and holds from the
+ * process's first instruction.
+ *
+ * In a virtual-time run the shim also counts the bytes that reach the station
+ * from outside the air, and the bytes it sends to another station over TCP,
+ * and tells the ether, on the chip library's own socket to it, once the
+ * station has said hello on it:
+ *
+ *   {"type":"read","ch":"tty","total":N}      N bytes read from the console
+ *                                             (descriptor 0) since the start,
+ *                                             once a read leaves none waiting
+ *   {"type":"wrote","ch":"tcp/A>B","n":N,"go":k}
+ *                                             N bytes about to be written on
+ *                                             the TCP connection from A to B
+ *                                             ("addr:port"): asked before the
+ *                                             call, on the writing thread's
+ *                                             own socket to SIMESH_ETHER, and
+ *                                             the call waits for {"go":k};
+ *                                             after it, without "go", minus
+ *                                             what the call did not take
+ *   {"type":"read","ch":"tcp/A>B","n":N}      N bytes read from it
+ *
+ * The ether holds T while a channel has bytes its reader has not taken, and
+ * lets a TCP write go when its reader is in step (ether/INTERNALS.md). A
+ * report travels on the same socket as the idle that follows it, so it is
+ * always ahead of it; a TCP write is asked for before its bytes exist. A TCP
+ * connection to a loopback address leaves from SIMESH_BIND_ADDR, so both of
+ * its ends name a station. And while the station computes, the chip
+ * library's busy watchdog is held back (below).
+ *
  * Without SIMESH_TIME=virtual, and before the chip library attaches, every
- * call is the C library's own.
+ * clock and wait is the C library's own; without SIMESH_TIME=virtual or
+ * without SIMESH_SEED, so is the randomness.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -45,15 +81,23 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -97,11 +141,31 @@ static int (*r_pthread_cond_clockwait)(pthread_cond_t*, pthread_mutex_t*, clocki
 static int (*r_pthread_cond_wait)(pthread_cond_t*, pthread_mutex_t*);
 static int (*r_pthread_create)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 static ssize_t (*r_read)(int, void*, size_t);
+static ssize_t (*r_readv)(int, const struct iovec*, int);
+static ssize_t (*r_write)(int, const void*, size_t);
+static ssize_t (*r_writev)(int, const struct iovec*, int);
+static ssize_t (*r_send)(int, const void*, size_t, int);
+static ssize_t (*r_sendto)(int, const void*, size_t, int, const struct sockaddr*, socklen_t);
+static ssize_t (*r_sendmsg)(int, const struct msghdr*, int);
 static ssize_t (*r_recv)(int, void*, size_t, int);
 static ssize_t (*r_recvfrom)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
 static ssize_t (*r_recvmsg)(int, struct msghdr*, int);
 static int (*r_accept)(int, struct sockaddr*, socklen_t*);
 static int (*r_accept4)(int, struct sockaddr*, socklen_t*, int);
+static int (*r_connect)(int, const struct sockaddr*, socklen_t);
+static int (*r_getentropy)(void*, size_t);
+static ssize_t (*r_getrandom)(void*, size_t, unsigned);
+static long (*r_syscall)(long, ...);
+
+static int s_seeded;                /* the randomness is ours */
+static uint64_t s_randKey;          /* from SIMESH_SEED and SIMESH_NODE_ID */
+static int s_sid;                   /* SIMESH_NODE_ID */
+
+static uint64_t fnv(uint64_t h, const char* s)
+{
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
 
 static void load_mode(void)
 {
@@ -109,9 +173,17 @@ static void load_mode(void)
     const char* v = getenv("SIMESH_TIME");
     const char* i = getenv("SIMESH_IDLE");
     const char* e = getenv("SIMESH_EPOCH_US");
+    const char* seed = getenv("SIMESH_SEED");
+    const char* id = getenv("SIMESH_NODE_ID");
+    int virt = v && strcmp(v, "virtual") == 0;
     s_census = i && strcmp(i, "threads") == 0;
     s_epochEnv = e && *e ? strtoll(e, NULL, 10) : 0;
-    s_virtual = v && strcmp(v, "virtual") == 0;
+    s_sid = id ? atoi(id) : 0;
+    if (virt && seed && *seed) {
+        s_randKey = fnv(fnv(fnv(1469598103934665603ULL, seed), "/"), id ? id : "");
+        s_seeded = 1;
+    }
+    s_virtual = virt;
 }
 
 /* The clock, when it is ours to answer; NULL means "the C library's". */
@@ -195,7 +267,7 @@ static void wake_due(void* arg)
     struct thread_rec* r = (struct thread_rec*)arg;
     if (atomic_exchange(&r->blocked, 0)) atomic_fetch_sub(&s_blocked, 1);
     uint64_t one = 1;
-    ssize_t w = write(r->efd, &one, sizeof one);
+    ssize_t w = REAL(write)(r->efd, &one, sizeof one);
     (void)w;
 }
 
@@ -681,28 +753,503 @@ static int blocking(int fd, int flags)
     return fl >= 0 && !(fl & O_NONBLOCK);
 }
 
-#define CENSUS_CALL(call, fd, flags)                                  \
-    do {                                                              \
-        const struct simclock_ops* o_ = ops();                        \
-        if (!o_ || !s_census || !blocking(fd, flags)) return call;    \
-        struct thread_rec* r_ = ready_rec(o_);                        \
-        census_block(o_, r_);                                         \
-        __typeof__(call) rc_ = call;                                  \
-        int e_ = errno;                                               \
-        census_run(r_);                                               \
-        errno = e_;                                                   \
-        return rc_;                                                   \
+/* `rc = call`, the thread counted as blocked around it when it can block. */
+#define CENSUS_RUN(rc, call, fd, flags)                                   \
+    do {                                                                  \
+        const struct simclock_ops* o_ = ops();                            \
+        if (!o_ || !s_census || !blocking(fd, flags)) { rc = call; break; } \
+        struct thread_rec* r_ = ready_rec(o_);                            \
+        census_block(o_, r_);                                             \
+        rc = call;                                                        \
+        int e_ = errno;                                                   \
+        census_run(r_);                                                   \
+        errno = e_;                                                       \
     } while (0)
 
-ssize_t read(int fd, void* buf, size_t n) { CENSUS_CALL(REAL(read)(fd, buf, n), fd, 0); }
-ssize_t recv(int fd, void* buf, size_t n, int fl) { CENSUS_CALL(REAL(recv)(fd, buf, n, fl), fd, fl); }
+/* ---- Bytes from outside the air, for the ether ---- */
+
+/* The chip library's socket to the ether, learned from the hello it sends on
+ * it: a report goes out behind everything the station has sent before it and
+ * ahead of the idle that follows. */
+static atomic_int s_linkFd = -1;
+static atomic_llong s_ttyIn;        /* bytes read from the console */
+static atomic_llong s_ioCalls;      /* reads and writes the station has made */
+
+#define TCP_KEY 112                 /* "tcp/" and two "addr:port" */
+
+static void report(const char* line, int len)
+{
+    int fd = atomic_load(&s_linkFd);
+    if (fd < 0 || len <= 0) return;
+    ssize_t w = REAL(send)(fd, line, (size_t)len, MSG_DONTWAIT);
+    (void)w;
+}
+
+static void report_tty(const char* type, long long total)
+{
+    char line[128];
+    report(line, snprintf(line, sizeof line,
+                          "{\"type\":\"%s\",\"sid\":%d,\"ch\":\"tty\",\"total\":%lld}",
+                          type, s_sid, total));
+}
+
+static void report_tcp(const char* type, const char* key, long long n)
+{
+    char line[TCP_KEY + 96];
+    report(line, snprintf(line, sizeof line,
+                          "{\"type\":\"%s\",\"sid\":%d,\"ch\":\"%s\",\"n\":%lld}",
+                          type, s_sid, key, n));
+}
+
+/* The channel a descriptor is, when it is an IPv4 TCP connection: "tcp/", the
+ * writer's end and the reader's. 0 for anything else. */
+static int tcp_key(int fd, int writing, char* key)
+{
+    int type = 0;
+    socklen_t tl = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0 || type != SOCK_STREAM) return 0;
+    struct sockaddr_in me, peer;
+    socklen_t ml = sizeof me, pl = sizeof peer;
+    if (getsockname(fd, (struct sockaddr*)&me, &ml) != 0 || me.sin_family != AF_INET) return 0;
+    if (getpeername(fd, (struct sockaddr*)&peer, &pl) != 0 || peer.sin_family != AF_INET) return 0;
+    char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &me.sin_addr, a, sizeof a);
+    inet_ntop(AF_INET, &peer.sin_addr, b, sizeof b);
+    if (writing)
+        snprintf(key, TCP_KEY, "tcp/%s:%u>%s:%u", a, ntohs(me.sin_port), b, ntohs(peer.sin_port));
+    else
+        snprintf(key, TCP_KEY, "tcp/%s:%u>%s:%u", b, ntohs(peer.sin_port), a, ntohs(me.sin_port));
+    return 1;
+}
+
+static int reporting(int fd)
+{
+    load_mode();
+    return s_virtual && atomic_load(&s_linkFd) >= 0 && fd != atomic_load(&s_linkFd);
+}
+
+/* After a read of `rc` bytes from `fd`. The console's count goes out when the
+ * read leaves nothing waiting, so a reader taking a byte at a time reports
+ * once per burst. */
+static void took(int fd, ssize_t rc, int flags)
+{
+    atomic_fetch_add(&s_ioCalls, 1);
+    if (rc <= 0 || (flags & MSG_PEEK)) return;
+    load_mode();
+    if (!s_virtual) return;
+    int saved = errno;
+    if (fd == 0) {
+        long long total = atomic_fetch_add(&s_ttyIn, rc) + rc;
+        int left = 0;
+        if (ioctl(0, FIONREAD, &left) != 0 || left <= 0) report_tty("read", total);
+    } else if (reporting(fd)) {
+        char key[TCP_KEY];
+        if (tcp_key(fd, 0, key)) report_tcp("read", key, rc);
+    }
+    errno = saved;
+}
+
+/* A writing thread's own socket to the ether, on which it asks to write and
+ * hears that it may. */
+static __thread int t_goFd = -1;
+
+#define GO_WAIT_MS 1000             /* an ether that does not answer is not waited for */
+
+static int go_socket(void)
+{
+    if (t_goFd >= 0) return t_goFd;
+    const char* e = getenv("SIMESH_ETHER");
+    const char* colon = e ? strrchr(e, ':') : NULL;
+    char host[INET_ADDRSTRLEN];
+    if (!colon || (size_t)(colon - e) >= sizeof host) return -1;
+    memcpy(host, e, (size_t)(colon - e));
+    host[colon - e] = '\0';
+    struct sockaddr_in to = { 0 };
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t)atoi(colon + 1));
+    if (inet_pton(AF_INET, host, &to.sin_addr) != 1) return -1;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (REAL(connect)(fd, (struct sockaddr*)&to, sizeof to) != 0) {
+        close(fd);
+        return -1;
+    }
+    t_goFd = fd;
+    return fd;
+}
+
+/* `n` bytes are about to go out on the TCP connection `key`: the ether is
+ * told, and the write waits for its go-ahead, which comes once the reader has
+ * the run's T and nothing else in hand. The reader then reads them at that T
+ * however the two stations' threads fall on the host. */
+static void ask_to_write(const char* key, size_t n)
+{
+    static atomic_uint s_req;
+    int g = go_socket();
+    if (g < 0) {
+        report_tcp("wrote", key, (long long)n);
+        return;
+    }
+    unsigned req = atomic_fetch_add(&s_req, 1) + 1;
+    char line[TCP_KEY + 128];
+    int len = snprintf(line, sizeof line,
+                       "{\"type\":\"wrote\",\"sid\":%d,\"ch\":\"%s\",\"n\":%lld,\"go\":%u}",
+                       s_sid, key, (long long)n, req);
+    if (REAL(send)(g, line, (size_t)len, 0) != len) return;
+    char want[32];
+    snprintf(want, sizeof want, "\"go\":%u}", req);
+    struct timespec now, end;
+    REAL(clock_gettime)(CLOCK_MONOTONIC, &end);
+    end.tv_sec += GO_WAIT_MS / 1000;
+    for (;;) {
+        REAL(clock_gettime)(CLOCK_MONOTONIC, &now);
+        int64_t left = ((int64_t)end.tv_sec - now.tv_sec) * 1000000000LL + (end.tv_nsec - now.tv_nsec);
+        if (left <= 0) return;
+        struct timespec tmo = { (time_t)(left / 1000000000LL), (long)(left % 1000000000LL) };
+        struct pollfd p = { g, POLLIN, 0 };
+        if (REAL(ppoll)(&p, 1, &tmo, NULL) <= 0) continue;
+        char buf[128];
+        ssize_t got = REAL(recv)(g, buf, sizeof buf - 1, MSG_DONTWAIT);
+        if (got <= 0) continue;
+        buf[got] = '\0';
+        if (strstr(buf, want)) return;
+    }
+}
+
+/* Before a write of `n` bytes to `fd`: a TCP connection's are announced now,
+ * while the bytes do not yet exist. Returns whether they were. */
+static int announce(int fd, size_t n, char* key)
+{
+    atomic_fetch_add(&s_ioCalls, 1);
+    if (fd <= 2 || n == 0 || !reporting(fd)) return 0;
+    int saved = errno;
+    int yes = tcp_key(fd, 1, key);
+    if (yes) ask_to_write(key, n);
+    errno = saved;
+    return yes;
+}
+
+/* After an announced write, `rc` of the `n`: what the call did not take is
+ * taken back. */
+static void wrote(size_t n, ssize_t rc, int announced, const char* key)
+{
+    size_t done = rc > 0 ? (size_t)rc : 0;
+    if (!announced || done >= n) return;
+    int saved = errno;
+    report_tcp("wrote", key, (long long)done - (long long)n);
+    errno = saved;
+}
+
+static size_t iov_len(const struct iovec* v, int n)
+{
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += v[i].iov_len;
+    return len;
+}
+
+/* ---- The busy watchdog, while the station computes ----
+ *
+ * The chip library's busy watchdog reads a timerfd and, when it expires,
+ * says the station is idle whatever its threads are doing, so that a thread
+ * waiting where nothing can see it, or spinning until T moves, does not stop
+ * T. A thread that is working is neither, and T moving under it would land
+ * the rest of its work at a T that depends on the host's speed. So while
+ * another thread of the process is on the CPU, the expiry is not handed to
+ * the watchdog: the timer is set again and the watchdog waits on. Work that
+ * takes longer than 20 ms of the host's time then takes no time of T's, the
+ * same in every run. A spin is told from work after WATCH_SPIN_NS of looking
+ * at it: its threads spend their time in the kernel (a task yielding in a
+ * loop, on a host whose tasks switch by signals, is signal-mask calls) and
+ * read and write nothing; computing is user time, and working reads or
+ * writes. A spin is let through then, and anything after WATCH_CAP_NS.
+ * Nothing here allocates: another thread may be switched out holding the
+ * allocator's lock. */
+
+#define WATCH_RECHECK_NS (5 * 1000 * 1000)
+#define WATCH_SPIN_NS    (50LL * 1000 * 1000)
+#define WATCH_CAP_NS     (10LL * 1000 * 1000 * 1000)
+
+static _Atomic signed char s_fdKind[1024];     /* 1: a timerfd, -1: not, 0: unknown */
+
+static int is_timerfd(int fd)
+{
+    if (fd < 0 || fd >= 1024) return 0;
+    signed char k = atomic_load(&s_fdKind[fd]);
+    if (k) return k > 0;
+    char path[32], target[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(path, target, sizeof target - 1);
+    int yes = len > 0 && (target[len] = '\0', strcmp(target, "anon_inode:[timerfd]") == 0);
+    atomic_store(&s_fdKind[fd], yes ? 1 : -1);
+    return yes;
+}
+
+/* Whether any thread of the process but this one is on the CPU or waiting
+ * for it; and the user and system time, in clock ticks, of all of them. */
+static int others_running(long long* user, long long* sys)
+{
+    *user = *sys = 0;
+    int dir = open("/proc/self/task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) return 0;
+    pid_t self = gettid();
+    int running = 0;
+    char buf[4096];
+    for (;;) {
+        long got = REAL(syscall)(SYS_getdents64, dir, buf, sizeof buf, 0, 0, 0);
+        if (got <= 0) break;
+        for (long at = 0; at < got;) {
+            struct { uint64_t ino; int64_t off; unsigned short reclen; unsigned char type; char name[]; }* e =
+                (void*)(buf + at);
+            at += e->reclen;
+            if (e->name[0] < '0' || e->name[0] > '9' || atoi(e->name) == self) continue;
+            char path[64], stat[512];
+            snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->name);
+            int f = open(path, O_RDONLY | O_CLOEXEC);
+            if (f < 0) continue;
+            ssize_t n = REAL(read)(f, stat, sizeof stat - 1);
+            close(f);
+            if (n <= 0) continue;
+            stat[n] = '\0';
+            /* "tid (name) S ppid … " — the state, ten fields, then utime and
+             * stime; the name may hold anything, so from its last ')'. */
+            char* p = strrchr(stat, ')');
+            if (!p || p[1] != ' ') continue;
+            if (p[2] == 'R') running = 1;
+            p += 3;
+            for (int field = 0; field < 10 && p; field++) p = strchr(p + 1, ' ');
+            if (!p) continue;
+            char* end;
+            *user += strtoll(p + 1, &end, 10);
+            *sys += strtoll(end, NULL, 10);
+        }
+    }
+    close(dir);
+    return running;
+}
+
+static int64_t mono_ns(void)
+{
+    struct timespec ts;
+    REAL(clock_gettime)(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* The timer `fd` has expired and `buf` holds the count: hand it on once no
+ * other thread is computing. */
+static ssize_t hold_expiry(int fd, void* buf)
+{
+    int64_t start = mono_ns();
+    long long user0, sys0, user, sys;
+    long long io0 = atomic_load(&s_ioCalls);
+    if (!others_running(&user0, &sys0)) return sizeof(uint64_t);
+    for (;;) {
+        struct itimerspec again = { { 0, 0 }, { 0, WATCH_RECHECK_NS } };
+        if (timerfd_settime(fd, 0, &again, NULL) != 0) break;
+        ssize_t rc = REAL(read)(fd, buf, sizeof(uint64_t));
+        if (rc != (ssize_t)sizeof(uint64_t)) return rc;
+        if (!others_running(&user, &sys)) break;
+        int64_t spent = mono_ns() - start;
+        if (spent >= WATCH_CAP_NS) break;
+        if (spent >= WATCH_SPIN_NS && sys - sys0 >= user - user0
+            && atomic_load(&s_ioCalls) == io0)
+            break;
+    }
+    return sizeof(uint64_t);
+}
+
+ssize_t read(int fd, void* buf, size_t n)
+{
+    ssize_t rc;
+    CENSUS_RUN(rc, REAL(read)(fd, buf, n), fd, 0);
+    if (rc == (ssize_t)sizeof(uint64_t) && n == sizeof(uint64_t) && s_virtual && is_timerfd(fd)) {
+        int saved = errno;
+        rc = hold_expiry(fd, buf);
+        errno = saved;
+    }
+    took(fd, rc, 0);
+    return rc;
+}
+
+ssize_t readv(int fd, const struct iovec* v, int cnt)
+{
+    ssize_t rc;
+    CENSUS_RUN(rc, REAL(readv)(fd, v, cnt), fd, 0);
+    took(fd, rc, 0);
+    return rc;
+}
+
+ssize_t recv(int fd, void* buf, size_t n, int fl)
+{
+    ssize_t rc;
+    CENSUS_RUN(rc, REAL(recv)(fd, buf, n, fl), fd, fl);
+    took(fd, rc, fl);
+    return rc;
+}
+
 ssize_t recvfrom(int fd, void* buf, size_t n, int fl, struct sockaddr* a, socklen_t* al)
 {
-    CENSUS_CALL(REAL(recvfrom)(fd, buf, n, fl, a, al), fd, fl);
+    ssize_t rc;
+    CENSUS_RUN(rc, REAL(recvfrom)(fd, buf, n, fl, a, al), fd, fl);
+    took(fd, rc, fl);
+    return rc;
 }
-ssize_t recvmsg(int fd, struct msghdr* m, int fl) { CENSUS_CALL(REAL(recvmsg)(fd, m, fl), fd, fl); }
-int accept(int fd, struct sockaddr* a, socklen_t* al) { CENSUS_CALL(REAL(accept)(fd, a, al), fd, 0); }
-int accept4(int fd, struct sockaddr* a, socklen_t* al, int fl) { CENSUS_CALL(REAL(accept4)(fd, a, al, fl), fd, 0); }
+
+ssize_t recvmsg(int fd, struct msghdr* m, int fl)
+{
+    ssize_t rc;
+    CENSUS_RUN(rc, REAL(recvmsg)(fd, m, fl), fd, fl);
+    took(fd, rc, fl);
+    return rc;
+}
+
+int accept(int fd, struct sockaddr* a, socklen_t* al)
+{
+    int rc;
+    CENSUS_RUN(rc, REAL(accept)(fd, a, al), fd, 0);
+    return rc;
+}
+
+int accept4(int fd, struct sockaddr* a, socklen_t* al, int fl)
+{
+    int rc;
+    CENSUS_RUN(rc, REAL(accept4)(fd, a, al, fl), fd, 0);
+    return rc;
+}
+
+/* A TCP connection a station opens to a loopback address leaves from the
+ * station's own (SIMESH_BIND_ADDR) when it has not been given one: every end
+ * of a connection between two stations is then an address that says which
+ * station it is, to the peer and to the ether. */
+int connect(int fd, const struct sockaddr* a, socklen_t al)
+{
+    load_mode();
+    const char* own = s_virtual ? getenv("SIMESH_BIND_ADDR") : NULL;
+    if (own && *own && a && a->sa_family == AF_INET && al >= (socklen_t)sizeof(struct sockaddr_in)
+        && (ntohl(((const struct sockaddr_in*)a)->sin_addr.s_addr) >> 24) == 127) {
+        int type = 0;
+        socklen_t tl = sizeof type;
+        struct sockaddr_in me;
+        socklen_t ml = sizeof me;
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 && type == SOCK_STREAM
+            && getsockname(fd, (struct sockaddr*)&me, &ml) == 0 && me.sin_family == AF_INET
+            && me.sin_port == 0 && me.sin_addr.s_addr == htonl(INADDR_ANY)) {
+            struct sockaddr_in bind_to = { 0 };
+            bind_to.sin_family = AF_INET;
+            if (inet_pton(AF_INET, own, &bind_to.sin_addr) == 1) {
+                int saved = errno;
+                if (bind(fd, (struct sockaddr*)&bind_to, sizeof bind_to) != 0) errno = saved;
+            }
+        }
+    }
+    return REAL(connect)(fd, a, al);
+}
+
+ssize_t write(int fd, const void* buf, size_t n)
+{
+    char key[TCP_KEY];
+    int announced = announce(fd, n, key);
+    ssize_t rc = REAL(write)(fd, buf, n);
+    wrote(n, rc, announced, key);
+    return rc;
+}
+
+ssize_t writev(int fd, const struct iovec* v, int cnt)
+{
+    char key[TCP_KEY];
+    size_t n = iov_len(v, cnt);
+    int announced = announce(fd, n, key);
+    ssize_t rc = REAL(writev)(fd, v, cnt);
+    wrote(n, rc, announced, key);
+    return rc;
+}
+
+ssize_t send(int fd, const void* buf, size_t n, int fl)
+{
+    load_mode();
+    if (s_virtual && n >= 15 && memcmp(buf, "{\"type\":\"hello\"", 15) == 0)
+        atomic_store(&s_linkFd, fd);
+    char key[TCP_KEY];
+    int announced = announce(fd, n, key);
+    ssize_t rc = REAL(send)(fd, buf, n, fl);
+    wrote(n, rc, announced, key);
+    return rc;
+}
+
+ssize_t sendto(int fd, const void* buf, size_t n, int fl, const struct sockaddr* a, socklen_t al)
+{
+    char key[TCP_KEY];
+    int announced = announce(fd, n, key);
+    ssize_t rc = REAL(sendto)(fd, buf, n, fl, a, al);
+    wrote(n, rc, announced, key);
+    return rc;
+}
+
+ssize_t sendmsg(int fd, const struct msghdr* m, int fl)
+{
+    char key[TCP_KEY];
+    size_t n = m ? iov_len(m->msg_iov, (int)m->msg_iovlen) : 0;
+    int announced = announce(fd, n, key);
+    ssize_t rc = REAL(sendmsg)(fd, m, fl);
+    wrote(n, rc, announced, key);
+    return rc;
+}
+
+/* ---- Randomness ---- */
+
+/* splitmix64 as a counter: draw n is a mix of key + n·γ. A call takes all the
+ * words it needs in one atomic step, so its bytes do not depend on where
+ * another thread's call falls, and no lock is held that a thread switched out
+ * by a signal could keep. */
+static atomic_uint_fast64_t s_draws;
+
+static void fill(void* buf, size_t len)
+{
+    uint64_t n = atomic_fetch_add(&s_draws, (len + 7) / 8);
+    unsigned char* b = (unsigned char*)buf;
+    while (len) {
+        uint64_t z = s_randKey + ++n * 0x9e3779b97f4a7c15ULL;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z ^= z >> 31;
+        size_t k = len < 8 ? len : 8;
+        memcpy(b, &z, k);
+        b += k;
+        len -= k;
+    }
+}
+
+int getentropy(void* buf, size_t len)
+{
+    load_mode();
+    if (!s_seeded) return REAL(getentropy)(buf, len);
+    if (len > 256) { errno = EIO; return -1; }
+    fill(buf, len);
+    return 0;
+}
+
+ssize_t getrandom(void* buf, size_t len, unsigned flags)
+{
+    load_mode();
+    if (!s_seeded) return REAL(getrandom)(buf, len, flags);
+    fill(buf, len);
+    return (ssize_t)len;
+}
+
+/* Every other call number goes to the C library's syscall untouched. */
+long syscall(long n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    long a = va_arg(ap, long), b = va_arg(ap, long), c = va_arg(ap, long);
+    long d = va_arg(ap, long), e = va_arg(ap, long), f = va_arg(ap, long);
+    va_end(ap);
+    load_mode();
+    if (n == SYS_getrandom && s_seeded) {
+        fill((void*)a, (size_t)b);
+        return b;
+    }
+    return REAL(syscall)(n, a, b, c, d, e, f);
+}
 
 /* ---- The chip library arrives ---- */
 
@@ -728,6 +1275,9 @@ __attribute__((constructor)) static void simclock_init(void)
     (void)REAL(epoll_wait); (void)REAL(epoll_pwait);
     (void)REAL(pthread_cond_timedwait); (void)REAL(pthread_cond_clockwait);
     (void)REAL(pthread_cond_wait); (void)REAL(pthread_create);
-    (void)REAL(read); (void)REAL(recv); (void)REAL(recvfrom); (void)REAL(recvmsg);
-    (void)REAL(accept); (void)REAL(accept4);
+    (void)REAL(read); (void)REAL(readv); (void)REAL(recv); (void)REAL(recvfrom);
+    (void)REAL(recvmsg); (void)REAL(write); (void)REAL(writev); (void)REAL(send);
+    (void)REAL(sendto); (void)REAL(sendmsg);
+    (void)REAL(accept); (void)REAL(accept4); (void)REAL(connect);
+    (void)REAL(getentropy); (void)REAL(getrandom); (void)REAL(syscall);
 }

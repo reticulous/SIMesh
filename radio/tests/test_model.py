@@ -251,6 +251,12 @@ def chip(station):
         ether.clear()
 
 
+# How late a wall-clock timer on the host may wake: a model timer and the
+# poll that sees it, on a virtual machine that overshoots a 60 ms wait by up
+# to 10 ms.
+HOST_TIMER_LATE_S = 0.025
+
+
 def settle(seconds=0.05):
     time.sleep(seconds)
 
@@ -326,12 +332,17 @@ def test_rx_begin_raises_preamble_and_header_then_rx_end_delivers(chip):
     begun = time.monotonic()
     chip.ether.rx_begin(101, -80, pre_us=60_000, hdr_us=100_000, end_us=250_000)
 
+    # The offsets run from the datagram's arrival, which is after `begun`, so
+    # neither interrupt may come a moment early. How late a wall-clock timer
+    # wakes is the host's (a virtual machine overshoots a 60 ms wait by up to
+    # 10 ms), so lateness is only bounded here; the exact instants are
+    # test_conductor's, on T.
     at = chip.wait_irq(PREAMBLE)
-    assert at - begun == pytest.approx(0.060, abs=0.010)
+    assert 0.060 <= at - begun < 0.060 + HOST_TIMER_LATE_S
     assert chip.irq() & (PREAMBLE | SYNC) == PREAMBLE | SYNC
     assert chip.irq() & HEADER_VALID == 0
     at = chip.wait_irq(HEADER_VALID)
-    assert at - begun == pytest.approx(0.100, abs=0.010)
+    assert 0.100 <= at - begun < 0.100 + HOST_TIMER_LATE_S
 
     payload = b"a frame out of the air"
     chip.ether.rx_end(101, payload, rssi=-80, snr=7)
@@ -345,6 +356,30 @@ def test_rx_begin_raises_preamble_and_header_then_rx_end_delivers(chip):
     assert snr == 28                              # 4 x 7
 
 
+def test_dio1_routing_changed_in_rx_keeps_the_reception(chip):
+    chip.configure(dio1=RX_DONE)
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    route = RX_DONE | PREAMBLE | HEADER_VALID
+    chip.write(SET_DIO_IRQ_PARAMS, ALL_IRQ >> 8, ALL_IRQ & 0xFF,
+               route >> 8, route & 0xFF, 0, 0, 0, 0)
+    assert chip.dio1() == 0
+    chip.ether.rx_begin(103, -80, pre_us=40_000, hdr_us=80_000, end_us=200_000)
+    chip.wait_irq(PREAMBLE)
+    assert chip.dio1() == 1
+
+    chip.write(SET_DIO_IRQ_PARAMS, ALL_IRQ >> 8, ALL_IRQ & 0xFF,
+               RX_DONE >> 8, RX_DONE & 0xFF, 0, 0, 0, 0)
+    assert chip.dio1() == 0
+    assert chip.irq() & PREAMBLE
+
+    chip.wait_irq(HEADER_VALID)
+    assert chip.dio1() == 0
+    chip.ether.rx_end(103, b"still following it", rssi=-80, snr=7)
+    chip.wait_irq(RX_DONE)
+    assert chip.dio1() == 1
+
+
 def test_rx_end_with_a_crc_verdict_raises_crc_err(chip):
     chip.configure()
     chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
@@ -356,37 +391,45 @@ def test_rx_end_with_a_crc_verdict_raises_crc_err(chip):
     assert chip.irq() & (RX_DONE | CRC_ERR) == RX_DONE | CRC_ERR
 
 
-def test_a_louder_frame_takes_the_receiver_only_past_the_capture_margin(chip):
+def test_the_receiver_follows_whichever_frame_the_ether_last_began(chip):
+    """The ether owns the lock: the chip applies no capture margin of its own,
+    so a later rx_begin takes the receiver even when it is quieter."""
     chip.configure()
     chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
     settle()
 
-    # 3 dB louder: the receiver stays on the first frame.
-    chip.ether.rx_begin(201, -90, 10_000, 20_000, 300_000)
+    chip.ether.rx_begin(201, -83, 10_000, 20_000, 300_000)
     settle(0.02)
-    chip.ether.rx_begin(202, -87, 10_000, 20_000, 300_000)
+    chip.ether.rx_begin(202, -90, 10_000, 20_000, 300_000)
     settle(0.05)
-    chip.ether.rx_end(202, b"the second")
+    chip.ether.rx_end(201, b"the first")
     settle(0.1)
     assert chip.irq() & RX_DONE == 0
-    chip.ether.rx_end(201, b"the first")
+    chip.ether.rx_end(202, b"the second")
     chip.wait_irq(RX_DONE)
     length, start = chip.read(GET_RX_BUF_STATUS, 2)
-    assert chip.read_buffer(start, length) == b"the first"
+    assert chip.read_buffer(start, length) == b"the second"
 
-    # 7 dB louder: the receiver drops the first and takes the second.
-    chip.clear_irq()
+
+def test_an_energy_begin_in_rx_is_read_but_not_followed(chip):
+    """A begin marked `cad` in RX raises the air's level and leaves the
+    demodulator on the frame it had."""
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+
     chip.ether.rx_begin(203, -90, 10_000, 20_000, 300_000)
     settle(0.02)
-    chip.ether.rx_begin(204, -83, 10_000, 20_000, 300_000)
-    settle(0.05)
-    chip.ether.rx_end(203, b"the quiet one")
+    chip.ether.rx_begin(204, -70, 10_000, 20_000, 300_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 140        # -2 x -70
+    chip.ether.rx_end(204, b"energy")
     settle(0.1)
     assert chip.irq() & RX_DONE == 0
-    chip.ether.rx_end(204, b"the loud one")
+    chip.ether.rx_end(203, b"the followed one")
     chip.wait_irq(RX_DONE)
     length, start = chip.read(GET_RX_BUF_STATUS, 2)
-    assert chip.read_buffer(start, length) == b"the loud one"
+    assert chip.read_buffer(start, length) == b"the followed one"
 
 
 def test_standby_during_a_reception_drops_it(chip):

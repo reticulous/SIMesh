@@ -1,6 +1,7 @@
 # The ether — the medium between simulated stations
 
-One UDP endpoint that carries LoRa frames between stations. A station tells it
+One UDP (User Datagram Protocol) endpoint that carries LoRa frames between
+stations. A station tells it
 what its radio is doing; when one transmits, the ether works out who hears it
 and how loudly, starts their reception and closes it out at the right instant.
 
@@ -8,87 +9,135 @@ It is the medium and nothing else. It holds no firmware, speaks no Reticulum,
 and knows a frame only as a carrier, a duration and a payload it never opens.
 
 ```sh
-python3 ether.py --bind 127.0.0.1:7000 --record record.tsv --scenario <dir> [--time real|max|<k>x]
+python3 ether.py --bind 127.0.0.1:7000 --record record.tsv \
+    --geodata <geodata.yaml> --nodeset <nodeset.yaml> --losses <dir> \
+    [--noise-figure 6] [--pairwise] [--time real|max|<k>x]
 ```
 
 Stations reach it through the testbed, which holds it in its own event loop and
-places the stations by direct call — see [`../README.md`](../README.md).
+hands it the loss tables by direct call — see [`../README.md`](../README.md).
 [INTERNALS.md](INTERNALS.md) is how it works inside.
 
 ## What it models
 
-**Where a station stands is the whole of who can hear it.** Every station has a
-position in metres and an antenna gain; the level a frame arrives at is
+**The loss table is the whole of who can hear whom.** Every ordered pair of
+nodes has a path loss per band, computed at one frequency `f0` in it (the
+format is [`../LOSSTABLE.md`](../LOSSTABLE.md), read by [`slt.py`](slt.py));
+every node has an antenna gain; every
+frame states the power it went out at. The level a frame arrives at is
 
 ```
-L = P_tx + G_tx + G_rx − PL(d)
-PL(d) = FSPL(1 m, f) + 10·n·log10(d) + obstruction(tx, rx)
+L = P_tx + G_tx + G_rx − loss(tx → rx) − 20·log10(f / f0)
 ```
 
-- `FSPL(1 m, f)` is the free-space loss over the first metre at the frame's own
-  carrier — 31.2 dB at 868 MHz.
-- `n` is the scenario's path-loss **exponent**: 2 is free space, 2.7 suburban.
-  Every step of ten in distance costs `10·n` dB, so at 2.7 a kilometre is 27 dB
-  down on a metre and two kilometres 8.1 dB down on one.
-- An **obstruction** is a constant in dB between one pair, in both directions.
-  It is how two stations within reach of each other are put out of it.
-- Two stations at the same point are held one metre apart, so nothing divides
-  by nothing.
+- The table is read in the frame's own direction: a measured table need not
+  be symmetric.
+- The last term moves the loss from the table's centre to the frame's carrier.
+  Only the free-space part of a loss scales that way, so it is used within a
+  band and a band with no table is silence.
+- A pair the table does not have, or has as +inf, is **never heard**, and a
+  station id the nodeset does not name is not in the medium at all.
+- A frame keeps the levels it had when it went on the air: a table replaced
+  mid-frame changes the next frame, not this one.
 
-A station's **noise floor** is `−174 + 10·log10(BW) + NF` — about −117 dBm at
-125 kHz with the default 6 dB noise figure. A frame that arrives below the SNR
-its **spreading factor** needs is not delivered at all and no `rx_begin` goes
-out: that is what "out of range" means here. The thresholds are the SX1262's —
-−7.5 dB at SF7, 2.5 dB lower per step to −20 dB at SF12 — so SF12 reaches
-17.5 dB further than SF7 and pays for it in air time, and a scenario that moves
-SF to reach further sees the difference. The SNR reported with a reception is
-the level above the floor.
+A station's **noise floor** is `−174 + 10·log10(BW) + NF`, with BW its
+bandwidth in Hz and NF the noise figure — about −117 dBm at 125 kHz with the
+default 6 dB.
 
-A frame is heard by a station within that range whose radio last said it was
-**receiving** on the same **carrier, bandwidth, spreading factor and sync
-word** — the carrier within a quarter of the bandwidth, which is what a LoRa
+**Who is affected and who can decode are two questions.** Every transmission
+whose channel overlaps a receiver's is interference there, whatever its
+spreading factor (SF) or sync word. A receiver can decode only a frame whose
+**bandwidth, spreading factor and sync word** match its last stated radio, on
+its **carrier** — within a quarter of the bandwidth, which is what a LoRa
 demodulator tolerates and what lets two drivers that round one frequency
-differently hear each other. A station whose radio last said it was in **CAD** (channel activity
-detection) on that carrier is told the frame is arriving and nothing more:
-it is sensing energy, so it gets an `rx_begin` marked `"cad": true` and no
-`rx_end`, and no reception is recorded for it.
+differently hear each other — and only one that clears its spreading factor's
+**demodulation threshold** over the noise: −7.5 dB at SF7, 2.5 dB lower per
+step to −20 dB at SF12. So SF12 reaches 17.5 dB further than SF7 and pays for
+it in air time. A frame under that threshold is not delivered at all: that is
+what "out of range" means here.
+
+**The receiver locks on at the preamble.** A decodable frame takes the
+receiver when it is not demodulating another, or when it leads the one in
+progress by the same-SF figure, 6 dB — and then the earlier one is lost
+there. A frame that does not take the receiver is sent as energy: an
+`rx_begin` marked `"cad": true`, and later an `rx_end` with verdict `crc` that
+the chip, following another frame, drops.
+
+**A locked frame survives two tests, over its whole air, the worst stretch
+deciding.** Its air is cut wherever the set of overlapping transmissions
+changes, and in every piece:
+
+1. its level over the noise is at or above its spreading factor's
+   demodulation threshold;
+2. its level over each **class** of interference — every overlapping
+   transmission at one spreading factor, their powers summed — is at or above
+   that class's rejection figure: 6 dB for its own spreading factor, and for
+   another the inter-SF figure Croce et al. measured on the SX1272 (from −8 dB
+   for SF7 against SF8 to −25 dB for SF12 against SF7).
+
+A frame that fails either is a CRC failure: the receiver is handed it with
+its cyclic redundancy check (CRC) failed, as a spoiled frame reaches a real
+one. So a station beside one of two
+transmitters keeps its neighbour's frame, a station that hears both equally
+keeps neither, two interferers each well under a frame can spoil it together,
+and a strong frame at another spreading factor spoils a weak one only when it
+is past the orthogonality the two SFs have. Every figure is in one table at
+the top of `ether.py`, with its source.
+
+**Carrier sense answers from the same air.** A station whose radio last said
+it was in **CAD** (channel activity detection) is told a frame is arriving —
+an `rx_begin` marked `"cad": true`, never an `rx_end`, and no reception
+recorded — when that frame is decodable there or the summed energy in its
+band crosses the **sense threshold**: 15 dB over the receiver sensitivity
+limit of the European Telecommunications Standards Institute's (ETSI) EN 300
+220-1, −81 dBm at 125 kHz. A station in RX is told of in-band energy over the
+same threshold the same way, which is what its instantaneous RSSI (received
+signal strength indication) reads.
 
 The ether does not match on preamble length: two radios whose preambles
 differ hear each other here, and may not on a bench.
 
-Two frames that share a carrier and any instant of air interfere, and **each
-receiver rules on them for itself**: a frame survives where it leads everything
-else that station could hear at the same instant by the **capture margin** of
-6 dB, and is a CRC failure where it does not. So a station beside one of two
-transmitters keeps its neighbour's frame, while a station that hears both
-equally keeps neither, out of the same collision.
-
 A station is deaf while its own frame is going out — the radio is half duplex —
 which is what makes a hidden terminal behave like one: two stations that cannot
-hear each other do not defer to each other either.
+hear each other do not defer to each other either. A frame a station was
+receiving when it started transmitting is lost to it.
 
-Absent at this depth: fading, the CRC band just above the sensitivity threshold,
-noise that varies with what else is in the air, and a referee. A level is computed once from the geometry and does not change from
+**The pairwise rule** (`--pairwise`, or `Ether(pairwise=True)`) decides on the
+same levels the way a simpler medium does: a frame is delivered where it
+matches and is audible, a later frame takes the receiver only when it leads
+the one in progress by 6 dB in the whole dB the station is shown, and a frame
+survives only by leading each audible interferer on its carrier by 6 dB, one
+at a time, whatever their spreading factors, with nothing summed. It is there
+to compare against.
+
+Absent at this depth: fading, the CRC band just above the demodulation
+threshold, and a referee. A pair's loss is the table's and does not change from
 one frame to the next.
 
-## Positions
+## Losses
 
-Whatever drives a run places the stations:
+Whatever drives a run hands the ether its tables:
 
 ```python
-ether.place(sid, x_m, y_m, gain_db)     # metres on a flat plane
-ether.obstruct(a, b, db)                # extra loss between one pair
-ether.physics = Physics(exponent, noise_figure_db, capture_db)
+ether.set_losses({"868": table, ...}, {"gw-alex": 1, ...}, {1: 5.0, ...})
+                                  # tables by band, station id by node name,
+                                  # antenna gain in dBi by station id
+ether.update_node("gw-alex", {"868": (from_db, to_db)})
+                                  # one node's row and column, recomputed
+ether.replace_losses("868", table)   # one band's whole table
+ether.set_gain(sid, gain_db)
+ether.physics = Physics(noise_figure_db=6)
 ```
 
-Run alone, `--scenario` takes them from a scenario file — a directory or a
-`scenario.yaml` — where they are latitude and longitude, and the ether projects
-them onto an equirectangular plane around the file's `origin`. See
-[`../README.md`](../README.md) for the format.
+Each call swaps what it changes in whole, between two events, so no frame is
+ruled on half a table; until it is made the old figures stand. The tables
+handed in are never written to.
 
-A station that has not been placed is not on the plane: it hears nothing and
-nothing hears it. That is deliberate — a station the scenario never mentioned
-being audible is the surprise nobody wants.
+Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi`,
+and `--losses` is the directory holding `<band>.bin` for each band computed.
+`--geodata` is named in the log and read for nothing else: the tables already
+belong to it. The tables are handed over as they are: whatever offsets a
+nodeset holds are the caller's to add first.
 
 ## Watching the air
 
@@ -101,8 +150,21 @@ testbed's map is fed:
 | `on_rx(sid, rsid, eid, verdict, level)` | one station's reception of it closes |
 | `on_station(sid, state)` | a station states what its radio is doing |
 
-`levels(sid, freq, bw, power)` answers the other question — everything within
-earshot of one station right now, and at what level.
+`levels(sid, freq, bw, power, sf)` answers the other question — every
+station that could decode one station on that carrier, from the table, and
+at what level.
+
+In a virtual-time run, whose clock is conductor time T ([Virtual
+time](#virtual-time)), whatever holds the ether also tells it what it does to
+the stations from outside the air, so that lands at an instant of T:
+
+| Call | Does |
+|---|---|
+| `sleep(s)` | waits `s` of T; T stays at the end until what the wait woke has run |
+| `expect(sid)` / `leave(sid)` | a station is starting (T waits for its hello and idle) / has gone |
+| `typed(sid, total)` | the console of `sid` is being written, `total` bytes since it started; T waits until the station has read them |
+| `sync(sid, done)` | `done()` once `sid` has the run's T and nothing in hand; console bytes go out then |
+| `on_drain(sids, done)` | set by the holder: before T moves past stations that ran, read what they printed, then `done()` |
 
 ## The wire
 
@@ -113,7 +175,7 @@ station → ether   hello {sid, slots}
 ether → station   welcome {t, mode: "real", rate: 1, epoch, seed}
 station → ether   state {slot, mode, freq, bw, sf, sync}          on every mode or carrier change
 station → ether   tx {slot, id, t0, t_pre, t_hdr, t_end, …, payload}
-ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level}   each receiver in earshot
+ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level[, cad]}   each receiver it reaches
 ether → station   rx_end {slot, id, verdict, payload, rssi, snr}         at the frame's end
 ```
 
@@ -133,8 +195,22 @@ receiver → ether  idle {seq: 7, until: …}
 ether → station   rx_end {t: 266000, seq: 9, …}          when T reaches the frame's end
 ```
 
+Input that does not come over the air, in a virtual-time run:
+
+```
+writer → ether    wrote {ch: "tcp/A>B", n: 207, go: 4}   from the writing thread's own socket
+ether → reader    run {t: T, seq: 12}                    the reader had an older T
+reader → ether    idle {seq: 12, …}
+ether → writer    go {go: 4}                             the run is quiet; lowest station first
+reader → ether    read {ch: "tcp/A>B", n: 207}           T has waited for this
+ether → reader    run {t: T, seq: 13}                    at work on it, at the T it has
+reader → ether    idle {seq: 13, …}
+station → ether   read {ch: "tty", total: 36}            the console, typed by the testbed
+```
+
 JSON, one message per datagram, payloads base64, times in microseconds.
-Positions are not on it in either direction: a station never learns where it is.
+Losses and positions are not on it in either direction: a station never
+learns where it is.
 
 **Station → ether**
 
@@ -144,15 +220,18 @@ Positions are not on it in either direction: a station never learns where it is.
 | `state` | a slot's mode and carrier — the ether matches on these |
 | `tx` | a transmission: its carrier, its power, its three instants, and its payload |
 | `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
+| `read` | virtual time: bytes it took in from outside the air — `"ch": "tty", "total": N`, its console, a running total; `"ch": "tcp/A>B", "n": N`, a TCP connection from another station |
+| `wrote` | virtual time: `"ch": "tcp/A>B", "n": N`, bytes it is about to write to another station; with `"go": k`, sent from the writing thread's own socket, which waits for the `go` |
 
 **Ether → station**
 
 | Message | Says |
 |---|---|
 | `welcome` | joined: `t`, the ether's clock now; `mode`, `real` or `virtual`; `rate`, how many times the wall clock a virtual run is paced at (`null`: as fast as it goes); `epoch`, the wall-clock microseconds T 0 stands for; and `seed` |
-| `rx_begin` | a frame is arriving: when its preamble, header and end fall, and how strongly; `"cad": true` when the station is in CAD and no end will follow |
-| `rx_end` | that frame is over: the verdict, the payload, RSSI and SNR |
-| `run` | virtual time: T has reached the instant this station asked for |
+| `rx_begin` | a frame is arriving: when its preamble, header and end fall, and how strongly; `"cad": true` when it is energy to this station, not a frame to demodulate — always so in CAD, and in RX when the receiver does not lock on to it |
+| `rx_end` | that frame is over: the verdict, the payload, RSSI and SNR (signal-to-noise ratio) |
+| `run` | virtual time: T has reached the instant this station asked for; or, at the T it has, it has input to work on and owes an idle for it |
+| `go` | virtual time, to the socket a `wrote` with `go` came from: that write may go ahead |
 
 A station's `t0`, `t_pre`, `t_hdr` and `t_end` are its own clock in real time
 and mean something only against each other within one message; in virtual
@@ -182,6 +261,12 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 - **What stations say while T stands is held** and taken when every station
   is idle again, in station-id order, so two stations acting at one instant
   are ruled on the same way every run.
+- **Input from outside the air lands at an instant.** A station with bytes
+  it has not read — typed at its console, written to it over TCP by another
+  station — holds T until its `read` says it has them, and is then sent a
+  `run` at the T it has. A station about to write to another over TCP asks
+  first (`wrote` with `go`); asks are answered when nothing else in the run
+  is at work, in station order, once the reader has been told T.
 - **A `tx` stamped before T** came from a station that acted on something from
   outside the run after its last idle. It goes on the air at T, and the ether
   logs it.
@@ -192,7 +277,10 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 
 A station that stays busy cannot stop T for good: its own side reports idle
 after 20 ms of wall time with nothing to show for it (the busy watchdog in
-[`../radio/src/conductor.cpp`](../radio/src/conductor.cpp)).
+[`../radio/src/conductor.cpp`](../radio/src/conductor.cpp)), once none of its
+threads is computing (the time shim, [`../radio/shim/simclock.c`](../radio/shim/simclock.c)).
+Bytes a reader has not taken a second of wall time after they were written let
+go of T too, and the ether logs the channel.
 
 ## The record
 
@@ -213,8 +301,12 @@ them, and how each reception ended.
 
 ## Tests
 
-No firmware needed; they speak the wire over real UDP sockets, and each one
-says where its stations stand rather than which links exist.
+No firmware needed. Most speak the wire over real UDP sockets to the ether as
+a child process, each writing the nodeset and the loss table it needs; the rest
+hold an ether in-process to check the reception arithmetic piece by piece.
+The hand-built case — two hidden senders and one receiver, on one spreading
+factor and on two — has its calculation written out beside it, against the
+figures table.
 
 ```sh
 python3 -m pytest test_ether.py

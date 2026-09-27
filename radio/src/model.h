@@ -23,11 +23,14 @@
 #include <stdint.h>
 
 /** A frame arriving at this receiver: when its stages land, relative to the
- *  `t0` the sender stamped, and how strongly it arrives. */
+ *  `t0` the sender stamped, and how strongly it arrives. `energyOnly` is the
+ *  ether's `"cad": true`: the frame is in the air at this antenna and the
+ *  demodulator is not to follow it. */
 struct VirtualRxBegin {
     int     id;
     int64_t t0, tPre, tHdr, tEnd;   /* the sender's own microsecond stamps */
     int     levelDbm;
+    bool    energyOnly;
 };
 
 /** The same frame, finished: what it carried and how it came out. */
@@ -43,11 +46,6 @@ struct VirtualRxEnd {
 
 /** The noise floor a receiver reports when nothing is arriving. */
 constexpr int kNoiseFloorDbm = -110;
-
-/** How far a frame must lead one already being demodulated to take the
- *  receiver off it. The medium decides the same question with the same
- *  margin when it rules on a frame that shared the air. */
-constexpr int kCaptureDb = 6;
 
 /** The chip for a slot, if one has been opened. */
 struct simradio* modelChip(int slot);
