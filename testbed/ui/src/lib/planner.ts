@@ -259,6 +259,24 @@ export async function roads(base: string, box: Box, signal?: AbortSignal): Promi
   return ways
 }
 
+/** The terrain on a grid of w×h cells over `box`, as tile.bin gives it
+ *  (it may send fewer cells than asked, never more). */
+export async function terrainGrid(base: string, box: Box, w: number, h: number,
+                                  signal?: AbortSignal): Promise<Grid> {
+  const res = await getWithBackoff(`${base}/tile.bin?${boxQuery(box, w, h, { terrain_only: 1 })}`, signal)
+  if (!res.ok) throw new Error(`tile ${res.status}`)
+  const d = decodeTile(await res.arrayBuffer())
+  return { w: d.w, h: d.h, ox: d.ox, oy: d.oy, rx: d.rx, ry: d.ry, terrain: d.terrain }
+}
+
+/** The terrain of a grid at (x, y), the nearest cell's, or null off it or where it has none. */
+export function terrainAt(g: Grid, x: number, y: number): number | null {
+  const col = Math.round((x - g.ox) / Math.abs(g.rx)), row = Math.round((g.oy - y) / Math.abs(g.ry))
+  if (col < 0 || row < 0 || col >= g.w || row >= g.h) return null
+  const v = g.terrain[row * g.w + col]!
+  return Number.isFinite(v) ? v : null
+}
+
 /** Ground and clutter height at one point, from the pack's rasters. */
 export async function sample(base: string, x: number, y: number,
                              signal?: AbortSignal): Promise<{ ground: number; clutter: number | null }> {

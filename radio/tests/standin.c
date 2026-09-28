@@ -4,6 +4,8 @@
  * that blocks on a pipe. It prints one line per event, with node time:
  *
  *     sleeper <node us>        a 25 ms sleep ended
+ *     waiter <node us> <rc>    a 40 ms pthread_cond_timedwait nobody signals
+ *                              ended, and what it returned
  *     alarm <count>            SIGALRM, counted in the handler
  *     clock <mono us> <wall s> what clock_gettime and time() said at start
  *     entropy <hex> <hex> <hex>
@@ -56,6 +58,27 @@ static void* sleeper(void* arg)
         struct timespec req = { 0, 25 * 1000 * 1000 }, rem;
         while (nanosleep(&req, &rem) != 0 && errno == EINTR) req = rem;
         printf("sleeper %lld\n", (long long)mono_us());
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+static void* waiter(void* arg)
+{
+    (void)arg;
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t c = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_lock(&m);
+    for (;;) {
+        struct timespec end;
+        clock_gettime(CLOCK_REALTIME, &end);
+        end.tv_nsec += 40 * 1000 * 1000;
+        if (end.tv_nsec >= 1000000000) {
+            end.tv_sec += 1;
+            end.tv_nsec -= 1000000000;
+        }
+        int rc = pthread_cond_timedwait(&c, &m, &end);
+        printf("waiter %lld %d\n", (long long)mono_us(), rc);
         fflush(stdout);
     }
     return NULL;
@@ -144,9 +167,10 @@ int main(int argc, char** argv)
 
     /* The alarm lands on the first thread only: the others block it. */
     pthread_sigmask(SIG_BLOCK, &alrm, NULL);
-    pthread_t a, b;
+    pthread_t a, b, w;
     pthread_create(&a, NULL, sleeper, NULL);
     pthread_create(&b, NULL, reporter, NULL);
+    pthread_create(&w, NULL, waiter, NULL);
     pthread_sigmask(SIG_UNBLOCK, &alrm, NULL);
 
     struct itimerval it = { { 0, 10000 }, { 0, 10000 } };

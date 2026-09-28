@@ -1,7 +1,7 @@
 """The time shim, in a stand-in station, against a fake conductor.
 
-standin.c links the chip library and runs a thread that sleeps in 25 ms steps
-and an interval timer at 10 ms; it is started with the shim preloaded, in a
+standin.c links the chip library and runs a thread that sleeps in 25 ms steps,
+one in 40 ms timed condition waits, and an interval timer at 10 ms; it is started with the shim preloaded, in a
 virtual-time run with the thread census on. The conductor here grants T only
 up to what the station last asked for, as the ether does, and every event the
 station prints must land at its own instant in node time.
@@ -9,6 +9,7 @@ station prints must land at its own instant in node time.
 
 import json
 import os
+from errno import ETIMEDOUT
 import select
 import shutil
 import socket
@@ -125,6 +126,10 @@ def test_the_shim_keeps_the_station_on_node_time(conductor):
     assert sleeps[:7] == [25_000, 50_000, 75_000, 100_000, 125_000, 150_000, 175_000]
     alarms = [l for l in station.lines if l[0] == "alarm"]
     assert len(alarms) >= 19
+    # A timed wait ends at its deadline in node time, and says it timed out.
+    waits = [(int(l[1]), int(l[2])) for l in station.lines if l[0] == "waiter"]
+    assert waits[:4] == [(40_000, ETIMEDOUT), (80_000, ETIMEDOUT), (120_000, ETIMEDOUT),
+                         (160_000, ETIMEDOUT)]
     # Every instant the station asked for is a tick or a sleep ending.
     ticks = {10_000 * i for i in range(1, 25)}
     assert set(untils) <= ticks | set(sleeps) | {s + 25_000 for s in sleeps}

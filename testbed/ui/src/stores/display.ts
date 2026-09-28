@@ -17,7 +17,6 @@ export interface Display {
    *  and coverage exclude each other, and under either the rest goes grey. */
   population: boolean
   coverage: boolean
-  links: boolean
   offsets: boolean
   labels: boolean
   tags: boolean
@@ -26,7 +25,7 @@ export interface Display {
 
 const DEFAULTS: Display = {
   base: 'terrain', roads: true, buildings: true, units: 'metres', population: false,
-  coverage: true, links: true, offsets: true, labels: true, tags: true, heights: true,
+  coverage: true, offsets: true, labels: true, tags: true, heights: true,
 }
 const BASES: Display['base'][] = ['terrain', 'clutter']
 

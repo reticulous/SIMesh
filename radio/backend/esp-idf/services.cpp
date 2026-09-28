@@ -132,6 +132,10 @@ int udpOpen(const char* bindAddr, const char* dest)
         return -1;
     }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    /* Room for a burst of the ether's messages: one the kernel drops is
+     * recovered only by a resend (conductor::resendIdle). */
+    int rcvbuf = kRecvBufferBytes;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
 
     /* Bound to an ephemeral port on this station's own address, so the ether
      * can tell one station's datagrams from another's by source alone. */

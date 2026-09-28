@@ -9,6 +9,7 @@
 //! contribute nothing themselves.
 
 use crate::PackError;
+use planner_buildings::HeightSource;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
@@ -17,13 +18,11 @@ use std::io::BufRead;
 /// One ground-surface polygon: an outer ring and the courtyards inside it.
 ///
 /// The distinction is not cosmetic. CityGML marks a courtyard as
-/// `gml:interior`, and this parser used to collect every `posList` inside a
-/// `GroundSurface` into one flat list — so an Innenhof became an ordinary
-/// outer ring. Two things followed: its area was ADDED to the footprint
-/// instead of subtracted, and `rasterize_building` filled it solid. Measured
-/// on the Berlin tile LoD2_33_392_5820: 12 of 1419 ground surfaces carry a
-/// hole, 7 688 m² of courtyard against 274 426 m² of building, so those
-/// twelve footprints were overstated by roughly twice their yard.
+/// `gml:interior` (OpenStreetMap as a multipolygon's `inner` member); read as
+/// an ordinary outer ring, its area is ADDED to the footprint instead of
+/// subtracted and `rasterize_building` fills it solid. On the Berlin tile
+/// LoD2_33_392_5820, 12 of 1419 ground surfaces carry a hole, 7 688 m² of
+/// courtyard against 274 426 m² of building.
 ///
 /// A Blockrand courtyard is open sky where people and nodes actually are. It
 /// is the last place that should be modelled as masonry.
@@ -35,36 +34,48 @@ pub struct Polygon {
     pub interiors: Vec<Vec<(f64, f64)>>,
 }
 
+/// One `buildings.jsonl` record, from LoD2 or from OpenStreetMap (`osm.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lod2Building {
+    /// The LoD2 `gml:id`, or `w<id>` / `r<id>` for an OpenStreetMap way or
+    /// multipolygon relation.
     pub id: String,
-    /// Area-weighted footprint centroid, EPSG:25833 (≈ UTM33 WGS84).
+    /// Area-weighted footprint centroid in the pack CRS (LoD2's EPSG:25833
+    /// is taken as UTM 33 within a metre).
     pub e: f64,
     pub n: f64,
-    /// Mean ground elevation (m amsl) of the footprint rings.
+    /// Mean ground elevation (m amsl) of the footprint rings; for an
+    /// OpenStreetMap building, the pack terrain under its centroid.
     pub ground_z: f64,
     /// Net footprint: outer rings MINUS courtyards.
     pub area_m2: f64,
-    /// bldg:measuredHeight (m above ground).
+    /// Height above ground to the top of the roof: bldg:measuredHeight, or
+    /// what the OpenStreetMap tags give (`source` says which).
     pub height_m: f64,
+    /// Where `height_m` came from.
+    #[serde(default = "lod2_source")]
+    pub source: HeightSource,
     /// Ground-surface polygons (E,N).
     ///
     /// Serialized only when the caller asks for it — see
     /// [`Lod2Building::to_json_line`]. A full-city sidecar with geometry is
-    /// several hundred MB against 137 MB without, and most consumers only
-    /// want the centroid, so which one a pack carries is a build decision
-    /// rather than something this type should force.
+    /// about 300 MB against 137 MB without, so which one a pack carries is a
+    /// build decision rather than something this type should force.
     #[serde(skip_serializing, default)]
     pub rings: Vec<Polygon>,
+}
+
+fn lod2_source() -> HeightSource {
+    HeightSource::Lod2
 }
 
 impl Lod2Building {
     /// The record as one `buildings.jsonl` line.
     ///
     /// `with_geometry` decides whether the footprint polygons ride along. The
-    /// centroid-only form is what every existing pack carries and what the
-    /// server's `BuildingRecord` reads; the geometry form is additive, so an
-    /// older reader ignoring the extra field still parses it.
+    /// centroid-only fields are what the server's `BuildingRecord` requires;
+    /// the geometry is additive, so a reader ignoring it still parses the
+    /// line.
     pub fn to_json_line(&self, with_geometry: bool) -> Result<String, PackError> {
         let mut v = serde_json::to_value(self)
             .map_err(|e| PackError::Invalid(format!("building {}: {e}", self.id)))?;
@@ -113,17 +124,16 @@ fn ring_area_centroid(ring: &[(f64, f64)]) -> (f64, f64, f64) {
     (a2.abs() / 2.0, cx / (3.0 * a2), cy / (3.0 * a2))
 }
 
-fn finish(ctx: Ctx, out: &mut Vec<Lod2Building>) {
-    let Some(height) = ctx.height else { return };
-    if ctx.rings.is_empty() || height <= 0.0 {
-        return;
-    }
-    // Courtyards are SUBTRACTED, from both the area and the centroid moment.
-    // Adding them (the previous behaviour) reports a ring block as more
-    // building than it is and drags the centroid toward the middle of the
-    // yard — the one point in the block that has no building on it.
+/// Net area and area-weighted centroid `(area, e, n)` of a footprint.
+///
+/// Courtyards are SUBTRACTED, from both the area and the centroid moment:
+/// adding them reports a ring block as more building than it is and drags the
+/// centroid toward the middle of the yard — the one point in the block that
+/// has no building on it. The centroid is meaningless when the area is below
+/// a square metre.
+pub fn footprint(rings: &[Polygon]) -> (f64, f64, f64) {
     let (mut area, mut cxw, mut cyw) = (0.0, 0.0, 0.0);
-    for p in &ctx.rings {
+    for p in rings {
         let (a, cx, cy) = ring_area_centroid(&p.exterior);
         area += a;
         cxw += cx * a;
@@ -136,17 +146,51 @@ fn finish(ctx: Ctx, out: &mut Vec<Lod2Building>) {
         }
     }
     if area < 1.0 {
+        return (area, 0.0, 0.0);
+    }
+    (area, cxw / area, cyw / area)
+}
+
+/// The extent `[min_e, min_n, max_e, max_n]` of a building's outlines.
+pub fn extent(b: &Lod2Building) -> [f64; 4] {
+    let mut r = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for p in &b.rings {
+        for &(x, y) in &p.exterior {
+            r = [r[0].min(x), r[1].min(y), r[2].max(x), r[3].max(y)];
+        }
+    }
+    r
+}
+
+fn finish(ctx: Ctx, out: &mut Vec<Lod2Building>) {
+    let Some(height) = ctx.height else { return };
+    if ctx.rings.is_empty() || height <= 0.0 {
+        return;
+    }
+    let (area, e, n) = footprint(&ctx.rings);
+    if area < 1.0 {
         return; // degenerate slivers, and yards that swallowed their building
     }
     out.push(Lod2Building {
         id: ctx.id,
-        e: cxw / area,
-        n: cyw / area,
+        e,
+        n,
         ground_z: if ctx.ground_z_n > 0 { ctx.ground_z_sum / ctx.ground_z_n as f64 } else { 0.0 },
         area_m2: area,
         height_m: height,
+        source: HeightSource::Lod2,
         rings: ctx.rings,
     });
+}
+
+/// The 1 km tile a Berlin LoD2 file name holds, `LoD2_33_<E km>_<N km>_…`,
+/// as its extent in metres. `None` for a name in any other form.
+pub fn tile_extent(file_name: &str) -> Option<[f64; 4]> {
+    let mut parts = file_name.strip_prefix("LoD2_")?.split('_');
+    let _zone = parts.next()?;
+    let e: f64 = parts.next()?.parse().ok()?;
+    let n: f64 = parts.next()?.parse().ok()?;
+    Some([e * 1000.0, n * 1000.0, (e + 1.0) * 1000.0, (n + 1.0) * 1000.0])
 }
 
 /// Streaming parse of one CityGML file.
@@ -360,11 +404,10 @@ mod tests {
 
     /// A Blockrand block: 20×20 m outline with a 10×10 m courtyard.
     ///
-    /// `gml:interior` is a hole. The parser used to collect it as one more
-    /// outer ring, so the yard was ADDED to the footprint and then filled
-    /// solid — 300 m² of building reported as 500 m², and the one patch of
-    /// open sky in the middle of the block modelled as masonry. On the real
-    /// Berlin tile that hit 12 of 1419 ground surfaces.
+    /// `gml:interior` is a hole: read as one more outer ring, the yard would
+    /// be ADDED to the footprint and filled solid — 300 m² of building
+    /// reported as 500 m², and the one patch of open sky in the middle of the
+    /// block modelled as masonry.
     const COURTYARD: &str = r#"<?xml version="1.0"?>
 <CityModel xmlns:bldg="http://www.opengis.net/citygml/building/2.0" xmlns:gml="http://www.opengis.net/gml">
  <cityObjectMember>
@@ -391,7 +434,7 @@ mod tests {
         let b = &b[0];
         assert_eq!(b.rings.len(), 1, "one polygon, not two rings");
         assert_eq!(b.rings[0].interiors.len(), 1, "the yard must be an interior");
-        // 20×20 outline − 10×10 yard. The defect gave 400 + 100 = 500.
+        // 20×20 outline − 10×10 yard, not 400 + 100 = 500.
         assert!((b.area_m2 - 300.0).abs() < 1e-6, "area was {}", b.area_m2);
         // Centroid stays at the block's centre by symmetry, but it is now the
         // centre of the RING of building rather than an area-weighted blend
@@ -432,6 +475,7 @@ mod tests {
             ground_z: 0.0,
             area_m2: 0.0,
             height_m: 10.0,
+            source: HeightSource::Lod2,
             rings: vec![
                 Polygon {
                     exterior: vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],

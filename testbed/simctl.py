@@ -2,7 +2,7 @@
 """Simulations from a shell: start, stop, list and plan them through the
 front. The `simesh` launcher's `new`, `stop`, `list` and `plan` verbs.
 
-    simesh new [NAME] (--geodata G --nodeset N [--script S] | --snapshot S)
+    simesh new [NAME] (--geodata G --nodeset N | --snapshot S)
                       [--time max|<k>x|real] [--stagger N] [--build B]
                       [--pairwise]
     simesh stop NAME
@@ -14,13 +14,15 @@ front. The `simesh` launcher's `new`, `stop`, `list` and `plan` verbs.
 `new` starts the front (front.py, in the background, logging to
 runs/front.log) when nothing answers on the port, waits while the front
 computes the loss tables (progress on stderr), and prints the new
-simulation's name, control websocket, ether, network and run as JSON.
-`--script` sets every station up with that script's `setup` after its
-declared settings. `--build` runs every node whose device is of that build's
-kind from it instead (a catalogue name, a package, a stamp, a local device
-or a path such as a workspace's build.linux). `--pairwise` puts that
-simulation's ether on the pairwise rule. A script's `main` drives it with
-`simesh run <script> --sim <name>`. `--port` (default 8800) is the front's.
+simulation's name, control websocket, ether, network and run as JSON. A
+snapshot brings its firmware back with it; from geodata and a nodeset no node
+runs anything until a script says what (`simesh run <script> --sim
+<name>`), so a simulation of those is usually a script's own, `simesh run
+<script> --geodata G --nodeset N`. `--build` runs every node whose firmware
+is of that build's kind from it instead (`<project>_<catalogue>_latest`, a
+saved build, or a path such as a workspace's build.linux). `--pairwise` puts
+that simulation's ether on the pairwise rule. `--port` (default 8800) is the
+front's.
 """
 import argparse
 import asyncio
@@ -146,7 +148,6 @@ async def main():
     new.add_argument("name", nargs="?")
     new.add_argument("--geodata")
     new.add_argument("--nodeset")
-    new.add_argument("--script")
     new.add_argument("--snapshot")
     new.add_argument("--time", default="real")
     new.add_argument("--stagger", type=float)
@@ -165,9 +166,8 @@ async def main():
     plan.add_argument("phases", nargs="*", metavar="PHASE=UNTIL")
     args = ap.parse_args()
     if args.verb == "new":
-        if args.snapshot and any([args.geodata, args.nodeset, args.script]):
-            ap.error("new takes --geodata and --nodeset (and --script), or --snapshot, "
-                     "not both")
+        if args.snapshot and any([args.geodata, args.nodeset]):
+            ap.error("new takes --geodata and --nodeset, or --snapshot, not both")
         if not args.snapshot and not (args.geodata and args.nodeset):
             ap.error("new needs --geodata and --nodeset, or --snapshot")
 
@@ -185,7 +185,7 @@ async def main():
 
         if args.verb == "new":
             msg = {"type": "sim_new", "name": args.name, "geodata": args.geodata,
-                   "nodeset": args.nodeset, "script": args.script, "snapshot": args.snapshot,
+                   "nodeset": args.nodeset, "snapshot": args.snapshot,
                    "time": args.time, "stagger": args.stagger, "build": args.build,
                    "pairwise": args.pairwise or None}
             await ws.send_str(json.dumps({k: v for k, v in msg.items() if v is not None}))

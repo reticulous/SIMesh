@@ -133,7 +133,12 @@ Each call swaps what it changes in whole, between two events, so no frame is
 ruled on half a table; until it is made the old figures stand. The tables
 handed in are never written to.
 
-Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi`,
+The gains are one figure per station, the same in every direction. SIMesh's
+testbed gives none: its antennas have patterns, so it takes each pair's gains
+off that pair's loss before it hands the tables over (`losses.with_antennas`).
+
+Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi` (a
+file of the ether's own: a SIMesh nodeset's antenna is a type, and gives 0),
 and `--losses` is the directory holding `<band>.bin` for each band computed.
 `--geodata` is named in the log and read for nothing else: the tables already
 belong to it. The tables are handed over as they are: whatever offsets a

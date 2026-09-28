@@ -2,76 +2,72 @@
 """Devices: the station builds a node can run.
 
 ```
-simesh ── GET <catalogue>/index.html ─────────────────────────► site or directory
-simesh: newest KEEP <slug>_hw-simesh-<arch>_<stamp>.zip per entry, this machine's arch only
-simesh ── GET <catalogue>/<slug>_hw-simesh-<arch>_<stamp>.zip ─► site   once per stamp
-simesh: unzip to devices/<catalogue>/.part-…, check node.yaml, rename to
-        devices/<catalogue>/<slug>_hw-simesh-<arch>_<stamp>/
-page ── POST /api/devices/import?name=<zip name> (the zip) ──► front
-front: the same checks, into devices/imported/<slug>_hw-simesh-<arch>_<stamp>/,
-       that name made from its node.yaml
-node  device: stable ──► resolve() ──► {elf, fixed, tools, env, kind_type, stamp, name, …}
+simesh ── GET <base>/index.html ────────────────────────────────► site     which catalogues there are
+simesh ── GET <catalogue>/index.html ───────────────────────────► site or builds/<catalogue>/
+simesh: the newest <project>_hw-simesh-<arch>_<stamp>.zip per project, this machine's arch only,
+        into devices/latest/index.yaml; a fetched one older than that is removed
+simesh ── its node.yaml, read from the zip (a range request on the web) ► site or builds/
+        once per new build: what it plays and its kind, before it is fetched
+script  firmware("all", "reticulous_dev_latest") ──► ensure() ──► resolve()
+simesh ── GET <catalogue>/<project>_hw-simesh-<arch>_<stamp>.zip ► site    only when used
+simesh: unzip to devices/latest/.part-…, check node.yaml, rename to
+        devices/latest/<project>_<catalogue>_<stamp>/
+page ── Save ──► devices/saved/<project>_<catalogue>_<stamp>/      a copy that stays
+page ── POST /api/devices/import?name=<zip name> (the zip) ──► devices/saved/<project>_imported_<stamp>/
 ```
 
 A **device file** is one station build ready to run: a zip holding an
 executable, whatever it needs beside it, and a `node.yaml` saying what those
-are (NODE.md is the spec). It is published in a catalogue exactly as a board
-image is, named `<slug>_<entry>_<stamp>.zip` with `hw-simesh-<arch>` as the
-entry, and listed in that catalogue's `index.html`; or imported on the page
-under any name. The executable is native code dynamically linked against the
-builder's C library, so a device runs only on a machine of the architecture
-its `node.yaml` names.
+are (NODE.md is the spec). It is published in a build catalogue exactly as a
+board image is, named `<project>_<entry>_<stamp>.zip` with
+`hw-simesh-<arch>` as the entry, and listed in that catalogue's `index.html`.
+The executable is native code dynamically linked against the builder's C
+library, so a device runs only on a machine of the architecture its
+`node.yaml` names.
 
-**Where devices live.** `devices/<catalogue>/<slug>_<entry>_<stamp>/`, one
-directory per package, holding what the zip held plus `origin.yaml` (where it
-came from and when). Imported zips are the catalogue `imported`. The
-catalogue is a level of its own because one `make-builds` run stamps every
-catalogue it builds with the same datetime, so `stable` and `dev` packages of
-one run share a filename and differ only in where they came from. A
-directory is whole or absent: a package is unzipped under a `.part-` name,
-checked, and renamed into place. Each entry keeps its newest `KEEP`
-packages per catalogue, and a refresh fetches that many; older ones are
-removed after a newer one lands. The listing shows the newest `KEEP` of each
-catalogue.
+**What a device is called.** `<project>_<catalogue>_<stamp>`, one name for
+one build: `reticulous_dev_20260927140352`. The project is the catalogue
+filename's slug, the catalogue is where it was published. Scripts name
+devices this way (`firmware(which, name)`), and two more forms:
 
-**Local devices** are `devices/local/<name>.yaml`: a `node.yaml` that is not
-in a package, its `elf`, `fixed` and `tools` paths relative to the file and
-free to point anywhere. They are the developer loop: a build of one's own
-tree, run in place, named once.
-
-**What a node's `device:` names**, which `resolve` turns into paths:
-
-- a catalogue name (`stable`, `dev`, `imported`, or any other fetched one):
-  the newest package from it for this machine's architecture;
-- a package, `<catalogue>/<slug>_hw-simesh-<arch>_<stamp>`: that package;
-  its bare name will do while only one catalogue has it;
-- a stamp: the package with that stamp, whichever catalogue it came from, as
-  long as only one did;
-- a local device's name;
+- `<project>_<catalogue>_latest`: the newest build of that project in that
+  catalogue, whichever it is at the moment it is used;
 - a path: a package directory (it holds `node.yaml`), or a workspace's
   `build.linux` (it holds `reticulous.elf` and `data_merged/`).
 
-**What a device is called** on the page: `node.yaml`'s `name`, else its
-project, catalogue and build time (`Reticulous dev 2026-09-25 03:50`); with
-`stands_for`, it is shown as a virtual one of that (`virtual ESP32`).
+**Latest.** A survey reads every catalogue's listing, fetching nothing, and
+keeps the newest build per project and catalogue for this machine in
+`devices/latest/index.yaml`. The catalogues are the ones the web's
+`SIMESH_CATALOGUES` index lists (by default `https://reticulous.net/builds/`)
+and every catalogue directory (one holding an `index.html`) in `builds/`
+beside SIMesh, a local one joining the web's of its name, so `builds/local`
+is the catalogue `local` (`reticulous_local_latest`); one called `imported`
+is `builds-imported`. Each new build's `node.yaml` is read from its zip as
+it is surveyed (on the web by HTTP range requests: the zip's directory and
+that one member, not the build), so the listing says what it plays and its
+kind before it is fetched. A `_latest` build is downloaded when it is used,
+into `devices/latest/<name>/`, and a fetched one is removed as soon as a
+survey sees a newer one for its project and catalogue, fetched or not. So
+`devices/latest/` holds at most one build per project and catalogue.
 
-**Where catalogues are**, for `refresh`: a URL ending in the catalogue's
-directory (its `index.html` is read, and every link is relative to it), a
-local catalogue directory holding an `index.html` (a workspace's
-`builds/<name>`), or a bare name, which is `SIMESH_CATALOGUES` + name (by
-default `https://reticulous.net/builds/<name>/`). A catalogue's name is the
-last component of its location, less a `catalogue-` prefix, so a GitHub
-release `…/releases/download/catalogue-stable/` is `stable`; a directory
-called `local` or `imported` is the catalogue `builds-local` or
-`builds-imported`. With no sources named, a refresh reads `stable` and `dev`
-from the web and then every catalogue directory in `builds/` beside SIMesh
-(`BUILDS_DIR`), so a workspace's own `make-builds` output joins the
-catalogue of its name. The front refreshes them all when it starts, and the
-`builds/` directories again whenever the Devices tab lists.
+**Compiled builds** are for a project that publishes no simesh build yet:
+`devices/local/<project>_<catalogue>.yaml`, a `node.yaml` that is not in a
+package, its `elf`, `fixed` and `tools` paths relative to the file and free
+to point anywhere, run in place from wherever it was last compiled. Each is
+the latest of its catalogue, `sergeyculum_local_latest` for Sergeyculum's
+`fw/simesh`, its stamp its executable's modification time.
 
-Fetching is aiohttp in the caller's loop, and unzipping runs in a worker
-thread, so nothing here blocks an event loop. Run as a script it is the CLI
-behind `simesh devices`.
+**Saved** builds are copies that stay: `devices/saved/<name>/`, a package
+directory like any other, made by Save from a latest build (fetching it first
+when it has not been) or by importing a zip, which joins the catalogue
+`imported`. Only deleting one removes it.
+
+A directory is whole or absent: a package is unzipped or copied under a
+`.part-` name, checked, and renamed into place.
+
+Fetching is aiohttp in the caller's loop, and unzipping and copying run in a
+worker thread, so nothing here blocks an event loop. Run as a script it is
+the CLI behind `simesh devices`.
 """
 
 import argparse
@@ -94,17 +90,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEVICES_DIR = os.path.join(ROOT, "devices")
 BUILDS_DIR = os.path.join(os.path.dirname(ROOT), "builds")
-LOCAL = "local"
-IMPORTED = "imported"
+LOCAL = "local"                 # devices/local/: compiled builds, run in place
+LATEST = "latest"               # devices/latest/: the newest of each catalogue, once used
+SAVED = "saved"                 # devices/saved/: copies that stay
+IMPORTED = "imported"           # the catalogue an imported zip joins
+COMPILED = "compiled"           # a latest row's source: a compiled build, run in place
+PEEK_TAIL = 1 << 16             # a zip's end read for its directory, by range request
+INDEX_YAML = "index.yaml"
 DEFAULT_BASE = os.environ.get("SIMESH_CATALOGUES", "https://reticulous.net/builds/")
-WEB_SOURCES = ("stable", "dev")
+WEB_FALLBACK = ("stable", "dev")    # the web's catalogues when its index cannot be read
 ENTRY_PREFIX = "hw-simesh-"
 NODE_YAML = "node.yaml"
 ORIGIN_YAML = "origin.yaml"
 PART_PREFIX = ".part-"
-KEEP = 3                        # packages kept, fetched and listed per entry per catalogue
 CHUNK = 1 << 16
 FETCH_TIMEOUT_S = 600
+SURVEY_TIMEOUT_S = 20
 
 # A workspace build.linux: what spangap leaves for a `target: linux` build.
 WORKSPACE_ELF = "reticulous.elf"
@@ -115,7 +116,7 @@ ARCH_ALIASES = {"arm64": "aarch64", "amd64": "x86_64", "x64": "x86_64"}
 
 
 class DeviceError(Exception):
-    """A device that cannot be used, or a `device:` that names none."""
+    """A device that cannot be used, or a name that names none."""
 
 
 def machine_arch():
@@ -140,6 +141,19 @@ def split_image_name(name):
     if not slug or not entry:
         return None
     return slug, entry, stamp
+
+
+def split_name(name):
+    """A device name as (project, catalogue, stamp), the stamp `latest` or
+    all digits; None for anything else. The project holds no underscore and
+    the stamp none, so the catalogue is what lies between."""
+    head, _, stamp = str(name).rpartition("_")
+    if not head or not (stamp == LATEST or stamp.isdigit()):
+        return None
+    project, _, catalogue = head.partition("_")
+    if not project or not catalogue:
+        return None
+    return project, catalogue, stamp
 
 
 def slug_of(project):
@@ -172,6 +186,14 @@ def display_name(node, catalogue=None, slug=None):
     project = node.get("project") or slug or node.get("kind") or "device"
     return " ".join(str(p) for p in (project, catalogue or node.get("catalogue"),
                                      when_of(str(node.get("stamp", "")))) if p)
+
+
+def stamp_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---- node.yaml ---------------------------------------------------------------
@@ -248,15 +270,16 @@ def _env(base, env):
             for k, v in (env or {}).items()}
 
 
-def package_result(directory, catalogue=None):
-    """What `resolve` hands back for an expanded package directory."""
+def package_result(directory):
+    """What `resolve` hands back for an expanded package directory, its name
+    the directory's own."""
     node = read_node_yaml(directory)
     origin = read_origin(directory)
-    catalogue = catalogue or origin.get("catalogue") or node.get("catalogue")
-    parts = split_image_name(os.path.basename(directory) + ".zip")
+    parts = split_name(os.path.basename(directory))
+    project = parts[0] if parts else slug_of(node.get("project") or node["kind"])
+    catalogue = parts[1] if parts else (origin.get("catalogue") or node.get("catalogue"))
     return {
-        "ref": "%s/%s" % (catalogue, os.path.basename(directory)) if catalogue
-               else os.path.basename(directory),
+        "ref": os.path.basename(directory),
         "elf": os.path.join(directory, node["elf"]),
         "fixed": os.path.join(directory, node["fixed"]) if node.get("fixed") else None,
         "tools": {k: os.path.join(directory, v) for k, v in (node.get("tools") or {}).items()},
@@ -264,128 +287,210 @@ def package_result(directory, catalogue=None):
         "kind_type": str(node["kind"]),
         "stamp": node["stamp"],
         "arch": str(node["arch"]),
-        "name": display_name(node, catalogue, parts[0] if parts else None),
-        "stands_for": node.get("stands_for"),
+        "name": display_name(node, catalogue, project),
+        "virtual_hardware": node.get("virtual_hardware"),
+        "virtual_radio": node.get("virtual_radio"),
         "source": origin.get("url") or directory,
+        "project": project,
         "catalogue": catalogue,
-        "entry": node.get("entry"),
         "dir": directory,
         "node": node,
     }
 
 
-# ---- local devices -------------------------------------------------------------
+# ---- compiled builds ------------------------------------------------------------
 
 def local_dir(devices_dir=None):
     return os.path.join(devices_dir or DEVICES_DIR, LOCAL)
 
 
 def local_names(devices_dir=None):
+    """Every compiled build, by its `<project>_<catalogue>` file name."""
     base = local_dir(devices_dir)
     if not os.path.isdir(base):
         return []
-    return sorted(e[:-5] for e in os.listdir(base) if e.endswith(".yaml") and not e.startswith("."))
+    return sorted(e[:-5] for e in os.listdir(base)
+                  if e.endswith(".yaml") and not e.startswith(".")
+                  and split_name(e[:-5] + "_" + LATEST))
 
 
-def local_result(name, devices_dir=None, arch=None):
-    """A local device: `devices/local/<name>.yaml`, its paths from the file."""
-    path = os.path.join(local_dir(devices_dir), name + ".yaml")
+def local_result(key, devices_dir=None, arch=None):
+    """A compiled build: `devices/local/<key>.yaml`, its paths from the file."""
+    path = os.path.join(local_dir(devices_dir), key + ".yaml")
     doc = _load_mapping(path)
-    for key in ("kind", "elf"):
-        if doc.get(key) in (None, ""):
-            raise DeviceError("%s: no `%s`" % (path, key))
+    for field in ("kind", "elf"):
+        if doc.get(field) in (None, ""):
+            raise DeviceError("%s: no `%s`" % (path, field))
     _check_maps(path, doc)
     base = os.path.dirname(path)
+    project, catalogue, _ = split_name(key + "_" + LATEST)
 
     def where(value):
         return os.path.normpath(os.path.join(base, os.path.expanduser(str(value))))
 
     elf = where(doc["elf"])
     if not os.path.isfile(elf):
-        raise DeviceError("device %s: no executable at %s (build it first)" % (name, elf))
+        raise DeviceError("device %s_%s: no executable at %s (build it first)"
+                          % (key, LATEST, elf))
     fixed = where(doc["fixed"]) if doc.get("fixed") else None
     stamp = datetime.datetime.fromtimestamp(os.stat(elf).st_mtime, datetime.timezone.utc)
+    stamp = stamp.strftime("%Y%m%d%H%M%S")
     return {
-        "ref": name,
+        "ref": "%s_%s" % (key, LATEST),
         "elf": elf,
         "fixed": fixed if fixed and os.path.isdir(fixed) else None,
         "tools": {k: where(v) for k, v in (doc.get("tools") or {}).items()},
         "env": _env(base, doc.get("env")),
         "kind_type": str(doc["kind"]),
-        "stamp": stamp.strftime("%Y%m%d%H%M%S"),
+        "stamp": stamp,
         "arch": str(doc.get("arch") or arch or machine_arch()),
-        "name": str(doc.get("name") or name),
-        "stands_for": doc.get("stands_for"),
+        "name": display_name({"project": doc.get("project") or project, "stamp": stamp},
+                             catalogue),
+        "virtual_hardware": doc.get("virtual_hardware"),
+        "virtual_radio": doc.get("virtual_radio"),
         "source": path,
-        "catalogue": LOCAL,
-        "entry": None,
+        "project": project,
+        "catalogue": catalogue,
         "dir": base,
         "node": doc,
     }
 
 
-# ---- what is installed -------------------------------------------------------
+# ---- what is here ------------------------------------------------------------
 
-def installed(devices_dir=None, arch=None):
-    """Every expanded package, as (catalogue, name, slug, entry, stamp, dir),
-    newest stamp first; only packages whose entry is for `arch` when given."""
-    devices_dir = devices_dir or DEVICES_DIR
-    found = []
+def packages(where):
+    """Every package directory in `where` (devices/latest or devices/saved),
+    as {name: (project, catalogue, stamp, dir)}."""
+    found = {}
     try:
-        catalogues = sorted(os.listdir(devices_dir))
+        names = os.listdir(where)
     except FileNotFoundError:
         return found
-    for catalogue in catalogues:
-        cdir = os.path.join(devices_dir, catalogue)
-        if catalogue.startswith(".") or catalogue == LOCAL or not os.path.isdir(cdir):
+    for name in names:
+        parts = split_name(name)
+        path = os.path.join(where, name)
+        if name.startswith(".") or not parts or parts[2] == LATEST or not os.path.isdir(path):
             continue
-        for name in os.listdir(cdir):
-            parts = split_image_name(name + ".zip")
-            pdir = os.path.join(cdir, name)
-            if not parts or not os.path.isdir(pdir):
-                continue
-            slug, entry, stamp = parts
-            if arch is not None and entry_arch(entry) != arch:
-                continue
-            found.append((catalogue, name, slug, entry, stamp, pdir))
-    found.sort(key=lambda p: (p[4], p[0], p[1]), reverse=True)
+        found[name] = parts + (path,)
     return found
 
 
+def fetched(key, devices_dir=None):
+    """The fetched builds of one `<project>_<catalogue>` in devices/latest,
+    as [(stamp, dir)], newest first."""
+    mine = [(p[2], p[3]) for n, p in packages(os.path.join(devices_dir or DEVICES_DIR, LATEST))
+            .items() if "%s_%s" % (p[0], p[1]) == key]
+    return sorted(mine, reverse=True)
+
+
+def read_index(devices_dir=None):
+    """The last survey: {`<project>_<catalogue>`: {project, catalogue, stamp,
+    where, local, source, node}}, `node` what the build's node.yaml says of
+    it (kind, virtual_hardware, virtual_radio, name) when it could be read."""
+    path = os.path.join(devices_dir or DEVICES_DIR, LATEST, INDEX_YAML)
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return {str(k): v for k, v in (doc.get("latest") or {}).items() if isinstance(v, dict)}
+
+
+def write_index(index, devices_dir=None):
+    where = os.path.join(devices_dir or DEVICES_DIR, LATEST)
+    os.makedirs(where, exist_ok=True)
+    tmp = os.path.join(where, PART_PREFIX + INDEX_YAML)
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.safe_dump({"latest": index}, f, sort_keys=True)
+    os.replace(tmp, os.path.join(where, INDEX_YAML))
+
+
+def prune_latest(index, devices_dir=None):
+    """Remove every fetched build a newer one of its project and catalogue
+    has been seen for. Returns the removed names."""
+    gone = []
+    where = os.path.join(devices_dir or DEVICES_DIR, LATEST)
+    by_key = {}
+    for name, (project, catalogue, stamp, path) in packages(where).items():
+        by_key.setdefault("%s_%s" % (project, catalogue), []).append((stamp, name, path))
+    for key, mine in by_key.items():
+        newest = max([s for s, _, _ in mine] + [str((index.get(key) or {}).get("stamp") or "")])
+        for stamp, name, path in mine:
+            if stamp < newest:
+                shutil.rmtree(path, ignore_errors=True)
+                gone.append(name)
+    return sorted(gone)
+
+
+def _row(result, **extra):
+    return {"name": result["name"], "virtual_hardware": result["virtual_hardware"],
+            "virtual_radio": result["virtual_radio"],
+            "kind": result["kind_type"], "stamp": result["stamp"],
+            "project": result["project"], "catalogue": result["catalogue"], **extra}
+
+
 def listing(devices_dir=None, arch=None):
-    """Every device, for the Devices tab: the newest `KEEP` packages of each
-    catalogue for this machine, newest first, then local devices. Each row
-    is {ref, name, stands_for, kind, arch, stamp, catalogue, runs_here,
-    newest_of, error?}; `newest_of` names the catalogue this package is what
-    that catalogue's name resolves to."""
+    """What the Devices tab shows: {latest: [row…], saved: [row…]}.
+
+    A latest row is one project's newest in one catalogue, named
+    `<project>_<catalogue>_latest`: {ref, project, catalogue, stamp, fetched,
+    source (web, builds or compiled), name?, virtual_hardware?, virtual_radio?,
+    kind?, error?}; what it plays, its radio and its kind come from its
+    node.yaml, read as it was surveyed or from the fetched build. A saved row
+    is {ref, project, catalogue, stamp, name, virtual_hardware, virtual_radio,
+    kind, error?}.
+    """
+    devices_dir = devices_dir or DEVICES_DIR
     arch = arch or machine_arch()
-    rows, newest, shown = [], {}, {}
-    for catalogue, name, slug, entry, stamp, pdir in installed(devices_dir, arch):
-        shown[catalogue] = shown.get(catalogue, 0) + 1
-        if shown[catalogue] > KEEP:
+    index = read_index(devices_dir)
+    latest = {}
+    for key, entry in index.items():
+        node = entry.get("node") or {}
+        latest[key] = {"ref": "%s_%s" % (key, LATEST), "project": entry.get("project"),
+                       "catalogue": entry.get("catalogue"), "stamp": str(entry.get("stamp")),
+                       "fetched": False, "source": "builds" if entry.get("local") else "web",
+                       "kind": node.get("kind"), "virtual_hardware": node.get("virtual_hardware"),
+                       "virtual_radio": node.get("virtual_radio"),
+                       "name": display_name(dict(node, stamp=entry.get("stamp")),
+                                            entry.get("catalogue"), entry.get("project"))}
+    for key in list(latest) + [k for k in {"%s_%s" % (p[0], p[1]) for p in packages(
+            os.path.join(devices_dir, LATEST)).values()} if k not in latest]:
+        have = fetched(key, devices_dir)
+        if not have:
             continue
-        row = {"ref": "%s/%s" % (catalogue, name), "catalogue": catalogue, "stamp": stamp,
-               "arch": entry_arch(entry), "runs_here": True, "newest_of": None, "local": False}
+        stamp, path = have[0]
+        row = latest.setdefault(key, {"ref": "%s_%s" % (key, LATEST), "source": "web"})
+        if str(row.get("stamp") or "") > stamp:
+            continue
         try:
-            got = package_result(pdir, catalogue)
-            row.update(name=got["name"], stands_for=got["stands_for"], kind=got["kind_type"],
-                       source=got["source"])
+            row.update(_row(package_result(path)), fetched=True)
         except DeviceError as err:
-            row.update(name=name, error=str(err))
-        if "error" not in row and catalogue not in newest:
-            newest[catalogue] = row
-            row["newest_of"] = catalogue
-        rows.append(row)
-    for name in local_names(devices_dir):
-        row = {"ref": name, "catalogue": LOCAL, "local": True, "newest_of": None, "runs_here": True}
+            row.update(stamp=stamp, error=str(err))
+    for key in local_names(devices_dir):
+        project, catalogue, _ = split_name(key + "_" + LATEST)
+        row = {"ref": "%s_%s" % (key, LATEST), "project": project, "catalogue": catalogue,
+               "fetched": True, "source": COMPILED}
         try:
-            got = local_result(name, devices_dir, arch)
-            row.update(name=got["name"], stands_for=got["stands_for"], kind=got["kind_type"],
-                       stamp=got["stamp"], arch=got["arch"], source=got["source"])
+            row.update(_row(local_result(key, devices_dir, arch)))
         except DeviceError as err:
-            row.update(name=name, error=str(err))
-        rows.append(row)
-    return rows
+            row["error"] = str(err)
+        latest[key] = row
+    saved = []
+    for name, (project, catalogue, stamp, path) in sorted(
+            packages(os.path.join(devices_dir, SAVED)).items(),
+            key=lambda kv: (kv[1][2], kv[0]), reverse=True):
+        row = {"ref": name, "project": project, "catalogue": catalogue, "stamp": stamp}
+        try:
+            got = package_result(path)
+            row.update(_row(got))
+            if got["arch"] != arch:
+                row["error"] = "built for %s, this machine is %s" % (got["arch"], arch)
+        except DeviceError as err:
+            row["error"] = str(err)
+        saved.append(row)
+    return {"latest": sorted(latest.values(), key=lambda r: (r.get("project") or "",
+                                                             r.get("catalogue") or "")),
+            "saved": saved}
 
 
 # ---- resolve -----------------------------------------------------------------
@@ -396,26 +501,20 @@ def _looks_like_path(ref):
 
 
 def resolve(ref, base_dir=None, devices_dir=None, arch=None):
-    """A node's `device:` value as the paths a kind needs.
+    """A device name as the paths a kind needs, from what is here: a
+    `_latest` build not fetched yet is refused (`ensure` fetches it).
 
     Returns {ref, elf, fixed, tools, env, kind_type, stamp, arch, name,
-    stands_for, source, catalogue, entry, dir, node}: `fixed` may be None,
-    `source` is where the build came from (a URL, a catalogue directory, or
-    the path given), `node` is the package's `node.yaml` (None for a
-    workspace build). A relative path is taken from `base_dir`. Raises
-    DeviceError naming what is missing, with the command that would supply it.
+    virtual_hardware, virtual_radio, source, project, catalogue, dir, node}:
+    `fixed` may be None, `source` is where the build came from (a URL, a
+    catalogue directory, or the path given), `node` is the package's
+    `node.yaml` (None for a workspace build.linux). A relative path is taken from `base_dir`.
     """
     arch = arch or machine_arch()
     devices_dir = devices_dir or DEVICES_DIR
-    if not isinstance(ref, (str, int)) or str(ref).strip() == "":
+    if not isinstance(ref, str) or ref.strip() == "":
         raise DeviceError("device: empty")
-    ref = str(ref).strip()
-
-    catalogue, _, package = ref.partition("/")
-    if package and "/" not in package and split_image_name(package + ".zip"):
-        hits = [p for p in installed(devices_dir) if p[0] == catalogue and p[1] == package]
-        if hits:
-            return _package_here(hits[0], ref, arch)
+    ref = ref.strip()
 
     if _looks_like_path(ref):
         path = os.path.expanduser(ref)
@@ -423,42 +522,30 @@ def resolve(ref, base_dir=None, devices_dir=None, arch=None):
             path = os.path.join(base_dir or os.getcwd(), path)
         return _resolve_path(os.path.normpath(path), arch)
 
-    if ref in local_names(devices_dir):
-        return local_result(ref, devices_dir, arch)
-
-    if split_image_name(ref + ".zip"):
-        hits = [p for p in installed(devices_dir) if p[1] == ref]
-        if not hits:
-            raise DeviceError("device %s: no such package in %s (simesh devices list shows "
-                              "what there is)" % (ref, devices_dir))
-        if len(hits) > 1:
-            raise DeviceError("device %s: that package is in several catalogues (%s); name "
-                              "it as <catalogue>/%s" % (ref, ", ".join(p[0] for p in hits), ref))
-        return _package_here(hits[0], ref, arch)
-
-    if ref.isdigit():
-        hits = [p for p in installed(devices_dir, arch) if p[4] == ref]
-        if not hits:
-            raise DeviceError("device %s: no %s package with that stamp in %s "
-                              "(simesh devices list shows what there is)"
-                              % (ref, arch, devices_dir))
-        if len({p[0] for p in hits}) > 1:
-            raise DeviceError("device %s: that stamp is in several catalogues (%s); "
-                              "name the package instead"
-                              % (ref, ", ".join(sorted({p[0] for p in hits}))))
-        return package_result(hits[0][5], hits[0][0])
-
-    hits = [p for p in installed(devices_dir, arch) if p[0] == ref]
-    if not hits:
-        raise DeviceError("device %s: no %s package from `%s` in %s; "
-                          "simesh devices refresh %s fetches one"
-                          % (ref, arch, ref, devices_dir, ref))
-    return package_result(hits[0][5], ref)
+    parts = split_name(ref)
+    if parts is None:
+        raise DeviceError("device %s: a device is <project>_<catalogue>_latest, "
+                          "<project>_<catalogue>_<stamp> or a path" % ref)
+    project, catalogue, stamp = parts
+    key = "%s_%s" % (project, catalogue)
+    if stamp == LATEST:
+        if key in local_names(devices_dir):
+            return local_result(key, devices_dir, arch)
+        have = fetched(key, devices_dir)
+        if not have:
+            raise DeviceError("device %s: not fetched yet (it is fetched when a simulation "
+                              "uses it, or by simesh devices fetch %s)" % (ref, ref))
+        return _package_here(have[0][1], ref, arch)
+    for where in (SAVED, LATEST):
+        path = os.path.join(devices_dir, where, ref)
+        if os.path.isfile(os.path.join(path, NODE_YAML)):
+            return _package_here(path, ref, arch)
+    raise DeviceError("device %s: not saved (the Devices tab lists what there is)" % ref)
 
 
-def _package_here(hit, ref, arch):
-    """An installed package named outright, refused unless it runs here."""
-    got = package_result(hit[5], hit[0])
+def _package_here(path, ref, arch):
+    """A package named outright, refused unless it runs here."""
+    got = package_result(path)
     if got["arch"] != arch:
         raise DeviceError("device %s: built for %s, this machine is %s"
                           % (ref, got["arch"], arch))
@@ -472,11 +559,7 @@ def _resolve_path(path, arch):
     if not os.path.isdir(path):
         raise DeviceError("device %s: no such directory" % path)
     if os.path.isfile(os.path.join(path, NODE_YAML)):
-        got = package_result(path)
-        if got["arch"] != arch:
-            raise DeviceError("device %s: built for %s, this machine is %s"
-                              % (path, got["arch"], arch))
-        return got
+        return _package_here(path, path, arch)
     elf = os.path.join(path, WORKSPACE_ELF)
     if os.path.isfile(elf):
         fixed = os.path.join(path, WORKSPACE_FIXED)
@@ -491,10 +574,11 @@ def _resolve_path(path, arch):
             "stamp": when.strftime("%Y%m%d%H%M%S"),
             "arch": arch,
             "name": "workspace %s" % path,
-            "stands_for": None,
+            "virtual_hardware": None,
+            "virtual_radio": None,
             "source": path,
+            "project": None,
             "catalogue": None,
-            "entry": None,
             "dir": path,
             "node": None,
         }
@@ -525,26 +609,34 @@ def parse_listing(text):
     return parser.links
 
 
-def newest_packages(links, keep=KEEP):
-    """The newest `keep` device packages per `hw-simesh-*` entry of a
-    listing, as {entry: [{href, name, slug, stamp, arch, attrs}, …]}, newest
-    first. Other images are left out."""
-    every = {}
+def newest_packages(links, arch):
+    """The newest device package for `arch` per project of a listing, as
+    {project: {href, name, slug, stamp, arch}}. Other images are left out."""
+    newest = {}
     for attrs in links:
         href = attrs["href"]
         name = urllib.parse.unquote(href.rstrip("/").rsplit("/", 1)[-1])
         parts = split_image_name(name)
-        if not parts:
+        if not parts or entry_arch(parts[1]) != arch:
             continue
-        slug, entry, stamp = parts
-        arch = entry_arch(entry)
-        if arch is None:
+        slug, _, stamp = parts
+        if slug not in newest or stamp > newest[slug]["stamp"]:
+            newest[slug] = {"href": href, "name": name, "slug": slug, "stamp": stamp,
+                            "arch": arch}
+    return newest
+
+
+def catalogue_names(links):
+    """The catalogues a site's index lists: its links to directories."""
+    out = []
+    for attrs in links:
+        href = attrs["href"]
+        if "://" in href or href.startswith(("/", ".", "?", "#")) or not href.endswith("/"):
             continue
-        mine = every.setdefault(entry, {})
-        mine.setdefault(stamp, {"href": href, "name": name, "slug": slug,
-                                "stamp": stamp, "arch": arch, "attrs": attrs})
-    return {entry: [pkgs[s] for s in sorted(pkgs, reverse=True)[:keep]]
-            for entry, pkgs in every.items()}
+        name = urllib.parse.unquote(href.rstrip("/"))
+        if name and "/" not in name and name not in out:
+            out.append(name)
+    return out
 
 
 def builds_sources(builds_dir=None):
@@ -559,13 +651,9 @@ def builds_sources(builds_dir=None):
             if not n.startswith(".") and os.path.isfile(os.path.join(base, n, "index.html"))]
 
 
-def default_sources():
-    return list(WEB_SOURCES) + builds_sources()
-
-
 class Source:
     """Where one catalogue is: `location` is a URL ending in `/`, or a local
-    directory; `name` is the catalogue's name, the directory under devices/."""
+    directory; `name` is the catalogue's name."""
 
     def __init__(self, spec, base=DEFAULT_BASE):
         self.spec = spec
@@ -589,7 +677,7 @@ class Source:
             last = last[len("catalogue-"):]
         if not last or last.startswith(".") or os.sep in last:
             raise DeviceError("%s: cannot tell the catalogue's name" % spec)
-        if last in (LOCAL, IMPORTED):
+        if last == IMPORTED:
             if not self.local:
                 raise DeviceError("%s: a catalogue cannot be called %s" % (spec, last))
             last = "builds-" + last
@@ -617,16 +705,35 @@ def _read_text(path):
         return f.read()
 
 
+async def web_catalogues(session, base=DEFAULT_BASE, say=print):
+    """The catalogues the web's index lists, or WEB_FALLBACK when it cannot
+    be read."""
+    import aiohttp
+
+    url = (base if base.endswith("/") else base + "/") + "index.html"
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise DeviceError("%s: HTTP %d" % (url, resp.status))
+            names = catalogue_names(parse_listing(await resp.text()))
+    except (DeviceError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+        say("%s: %s; trying %s" % (url, str(err) or type(err).__name__, ", ".join(WEB_FALLBACK)))
+        return list(WEB_FALLBACK)
+    return names
+
+
 # ---- expanding ---------------------------------------------------------------
 
 def expand(zip_path, dest, origin, arch):
-    """Unzip a package to `dest`, whole or not at all.
+    """Unzip a package to `dest` (named `<project>_<catalogue>_<stamp>`),
+    whole or not at all.
 
     The members go under a `.part-` sibling first; `node.yaml` is read and its
-    architecture and stamp checked against the filename before the rename, so
-    a package directory that exists is one that was checked. Members that
-    would land outside the package are refused. Permission bits the zip
-    carries are kept, and the ELF and the tools are made executable either way.
+    architecture and stamp checked against this machine and the name before
+    the rename, so a package directory that exists is one that was checked.
+    Members that would land outside the package are refused. Permission bits
+    the zip carries are kept, and the ELF and the tools are made executable
+    either way.
     """
     parent = os.path.dirname(dest)
     os.makedirs(parent, exist_ok=True)
@@ -650,16 +757,13 @@ def expand(zip_path, dest, origin, arch):
                 if mode:
                     os.chmod(target, mode)
         node = read_node_yaml(part)
-        parts = split_image_name(os.path.basename(dest) + ".zip")
+        parts = split_name(os.path.basename(dest))
         if str(node["arch"]) != arch:
             raise DeviceError("%s: built for %s, this machine is %s"
                               % (os.path.basename(zip_path), node["arch"], arch))
         if parts and node["stamp"] != parts[2]:
             raise DeviceError("%s: node.yaml says stamp %s, the filename %s"
                               % (os.path.basename(zip_path), node["stamp"], parts[2]))
-        if parts and entry_arch(parts[1]) != str(node["arch"]):
-            raise DeviceError("%s: node.yaml says arch %s, the filename %s"
-                              % (os.path.basename(zip_path), node["arch"], entry_arch(parts[1])))
         for inner in [node["elf"]] + list((node.get("tools") or {}).values()):
             path = os.path.join(part, inner)
             os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -675,49 +779,12 @@ def expand(zip_path, dest, origin, arch):
     return dest
 
 
-def _entry_packages(cdir, entry):
-    """(stamp, name) of one entry's packages in one catalogue's directory,
-    newest first."""
-    mine = []
-    try:
-        names = os.listdir(cdir)
-    except FileNotFoundError:
-        return mine
-    for name in names:
-        parts = split_image_name(name + ".zip")
-        if parts and parts[1] == entry and os.path.isdir(os.path.join(cdir, name)):
-            mine.append((parts[2], name))
-    mine.sort(reverse=True)
-    return mine
-
-
-def newer_installed(cdir, entry, stamp):
-    return [n for s, n in _entry_packages(cdir, entry) if s > stamp]
-
-
-def prune(cdir, entry, keep=KEEP):
-    """Remove all but the newest `keep` packages of one entry in one
-    catalogue's directory. Returns the removed directory names."""
-    mine = _entry_packages(cdir, entry)
-    gone = []
-    for _, name in mine[keep:]:
-        shutil.rmtree(os.path.join(cdir, name), ignore_errors=True)
-        gone.append(name)
-    return gone
-
-
-def now_utc():
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def import_zip(zip_path, filename, devices_dir=None, arch=None):
     """A device zip someone handed over, whatever it is called, into the
-    `imported` catalogue. Returns the package's `resolve` result.
-
-    It is named from its `node.yaml` as a catalogue would name it,
-    `<slug>_hw-simesh-<arch>_<stamp>`, the slug from its `project` or else its
-    `kind`; it must be for this machine's architecture, and a package already
-    there under that name is kept, not replaced."""
+    saved builds as `<project>_imported_<stamp>`, the project from its
+    `node.yaml`'s `project` or else its `kind`. It must be for this
+    machine's architecture, and one saved under that name already is kept,
+    not replaced. Returns the package's `resolve` result."""
     arch = arch or machine_arch()
     shown = os.path.basename(filename or "") or "the upload"
     try:
@@ -733,16 +800,144 @@ def import_zip(zip_path, filename, devices_dir=None, arch=None):
         raise DeviceError("%s: %s needs kind, arch and stamp" % (shown, NODE_YAML))
     if str(node["arch"]) != arch:
         raise DeviceError("%s is built for %s, and this machine is %s" % (shown, node["arch"], arch))
-    name = "%s_%s%s_%s" % (slug_of(node.get("project") or node["kind"]), ENTRY_PREFIX, arch,
-                           node["stamp"])
-    dest = os.path.join(devices_dir or DEVICES_DIR, IMPORTED, name)
+    name = "%s_%s_%s" % (slug_of(node.get("project") or node["kind"]), IMPORTED, node["stamp"])
+    dest = os.path.join(devices_dir or DEVICES_DIR, SAVED, name)
     if os.path.isfile(os.path.join(dest, NODE_YAML)):
         raise DeviceError("%s has been imported already, as %s" % (shown, name))
     expand(zip_path, dest, {"catalogue": IMPORTED, "url": shown, "fetched": now_utc()}, arch)
-    return package_result(dest, IMPORTED)
+    return package_result(dest)
 
 
-# ---- refresh -----------------------------------------------------------------
+# ---- the survey ----------------------------------------------------------------
+
+async def survey(sources=None, devices_dir=None, arch=None, say=print, base=DEFAULT_BASE,
+                 web=True):
+    """Read the catalogues' listings, fetching nothing, and keep the newest
+    build per project and catalogue in devices/latest/index.yaml; then
+    remove every fetched build a newer one has been seen for.
+
+    `sources` are catalogue names, URLs or directories; by default the web's
+    catalogues (when `web`) and then every catalogue in builds/. A source
+    that cannot be read is said and the others still run. Returns (index,
+    changed): whether the survey saw anything new or removed anything.
+    """
+    import aiohttp
+
+    arch = arch or machine_arch()
+    devices_dir = devices_dir or DEVICES_DIR
+    index = read_index(devices_dir)
+    before = dict(index)
+    timeout = aiohttp.ClientTimeout(total=SURVEY_TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        if sources is None:
+            sources = (await web_catalogues(session, base, say) if web else []) \
+                + builds_sources()
+        for spec in sources:
+            try:
+                source = Source(spec, base)
+                newest = newest_packages(parse_listing(await source.listing(session)), arch)
+            except (DeviceError, OSError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                say("%s: %s" % (spec, str(err) or type(err).__name__))
+                continue
+            for slug, pkg in sorted(newest.items()):
+                key = "%s_%s" % (slug, source.name)
+                held = index.get(key) or {}
+                if str(held.get("stamp") or "") > pkg["stamp"]:
+                    continue
+                if str(held.get("stamp") or "") == pkg["stamp"]:
+                    if "node" in held:
+                        continue
+                    entry = dict(held)      # surveyed before its node.yaml was read
+                else:
+                    entry = {"project": slug, "catalogue": source.name, "stamp": pkg["stamp"],
+                             "where": source.where(pkg["href"]), "local": source.local,
+                             "source": source.location}
+                    say("%s: %s_%s is %s" % (source.name, key, LATEST, pkg["stamp"]))
+                entry["node"] = await peek_node(session, entry["where"], entry["local"], say)
+                index[key] = entry
+    changed = index != before
+    if changed:
+        await asyncio.to_thread(write_index, index, devices_dir)
+    gone = await asyncio.to_thread(prune_latest, index, devices_dir)
+    if gone:
+        say("removed %s" % ", ".join(gone))
+    return index, changed or bool(gone)
+
+
+NODE_FACTS = ("kind", "virtual_hardware", "virtual_radio", "name", "project", "arch")
+
+
+def _facts(text):
+    """What a listing says of a build from its node.yaml's text, or {}."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {}
+    return {k: str(doc[k]) for k in NODE_FACTS if isinstance(doc, dict) and doc.get(k)}
+
+
+def _peek_local(path):
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return _facts(zf.read(NODE_YAML))
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return {}
+
+
+async def _range(session, url, spec):
+    async with session.get(url, headers={"Range": "bytes=" + spec}) as resp:
+        if resp.status != 206:
+            raise DeviceError("%s: no range requests (HTTP %d)" % (url, resp.status))
+        return await resp.read()
+
+
+async def peek_node(session, where, local, say=print):
+    """What a build's node.yaml says of it (kind, virtual_hardware,
+    virtual_radio, name, arch), read from its zip without fetching it: a local
+    zip opened, a web one read by range requests, its end for the central directory and then the one
+    member. {} when it cannot be read, which leaves the listing blank there
+    until the build is fetched."""
+    import struct
+    import zlib
+
+    import aiohttp
+
+    if local:
+        return await asyncio.to_thread(_peek_local, where)
+    try:
+        tail = await _range(session, where, "-%d" % PEEK_TAIL)
+        end = tail.rfind(b"PK\x05\x06")
+        if end < 0:
+            raise DeviceError("%s: no zip directory in its last %d bytes" % (where, PEEK_TAIL))
+        size, offset = struct.unpack_from("<II", tail, end + 12)
+        start = end - size
+        directory = tail[start:end] if start >= 0 else \
+            await _range(session, where, "%d-%d" % (offset, offset + size - 1))
+        at = 0
+        while at + 46 <= len(directory) and directory[at:at + 4] == b"PK\x01\x02":
+            method = struct.unpack_from("<H", directory, at + 10)[0]
+            csize = struct.unpack_from("<I", directory, at + 20)[0]
+            nlen, xlen, clen = struct.unpack_from("<HHH", directory, at + 28)
+            local_at = struct.unpack_from("<I", directory, at + 42)[0]
+            name = directory[at + 46:at + 46 + nlen].decode("utf-8", "replace")
+            at += 46 + nlen + xlen + clen
+            if name != NODE_YAML:
+                continue
+            head = await _range(session, where, "%d-%d" % (local_at, local_at + 29))
+            lnlen, lxlen = struct.unpack_from("<HH", head, 26)
+            begin = local_at + 30 + lnlen + lxlen
+            data = await _range(session, where, "%d-%d" % (begin, begin + max(csize, 1) - 1))
+            if method == 8:
+                data = zlib.decompressobj(-15).decompress(data)
+            elif method != 0:
+                return {}
+            return _facts(data)
+        return {}
+    except (DeviceError, struct.error, zlib.error, aiohttp.ClientError, asyncio.TimeoutError) as err:
+        say("%s: its node.yaml could not be read before fetching it: %s"
+            % (where, str(err) or type(err).__name__))
+        return {}
+
 
 async def _download(session, url, path):
     size = 0
@@ -756,106 +951,134 @@ async def _download(session, url, path):
     return size
 
 
-async def refresh_one(source, session, devices_dir=None, arch=None, say=print):
-    """Bring one catalogue's packages for this machine up to date. Returns one
-    result per `hw-simesh-*` entry and package, newest first: {catalogue,
-    entry, stamp, state, dir, reason}, state being `fetched`, `current`,
-    `skipped` or `failed`; an entry for another machine is one `skipped`."""
-    arch = arch or machine_arch()
-    text = await source.listing(session)
-    newest = newest_packages(parse_listing(text))
-    results = []
-    if not newest:
-        say("%s: no device packages in %s" % (source.name, source.location))
-        return results
-    cdir = os.path.join(devices_dir or DEVICES_DIR, source.name)
-    for entry in sorted(newest):
-        fetched = await _refresh_entry(source, session, cdir, entry, newest[entry], arch,
-                                       results, say)
-        if fetched:
-            gone = await asyncio.to_thread(prune, cdir, entry)
-            if gone:
-                say("%s: removed %s" % (source.name, ", ".join(gone)))
-    return results
-
-
-async def _refresh_entry(source, session, cdir, entry, pkgs, arch, results, say):
-    """One entry's newest packages, fetched where missing; whether any was."""
-    if pkgs[0]["arch"] != arch:
-        results.append({"catalogue": source.name, "entry": entry, "stamp": pkgs[0]["stamp"],
-                        "state": "skipped", "dir": None,
-                        "reason": "for %s, this machine is %s" % (pkgs[0]["arch"], arch)})
-        say("%s: skipping %s: it is for %s, this machine is %s"
-            % (source.name, entry, pkgs[0]["arch"], arch))
-        return False
-    any_fetched = False
-    for pkg in pkgs:
-        result = {"catalogue": source.name, "entry": entry, "stamp": pkg["stamp"],
-                  "state": None, "dir": None, "reason": None}
-        results.append(result)
-        dest = os.path.join(cdir, pkg["name"][:-4])
-        result["dir"] = dest
-        if os.path.isfile(os.path.join(dest, NODE_YAML)):
-            result["state"] = "current"
-            continue
-        # Another source of this catalogue may have newer ones: a package
-        # pruning would remove at once is not fetched at all.
-        if len(newer_installed(cdir, entry, pkg["stamp"])) >= KEEP:
-            result.update(state="skipped", dir=None, reason="older than the %d kept" % KEEP)
-            continue
-        where = source.where(pkg["href"])
-        origin = {"catalogue": source.name, "url": where, "fetched": now_utc()}
-        tmp_zip = None
-        try:
-            if source.local:
-                zip_path = where
-            else:
-                os.makedirs(cdir, exist_ok=True)
-                tmp_zip = os.path.join(cdir, PART_PREFIX + pkg["name"])
-                await _download(session, where, tmp_zip)
-                zip_path = tmp_zip
-            await asyncio.to_thread(expand, zip_path, dest, origin, arch)
-        except (DeviceError, OSError) as err:
-            result.update(state="failed", dir=None, reason=str(err))
-            say("%s: %s %s failed: %s" % (source.name, entry, pkg["stamp"], err))
-            continue
-        finally:
-            if tmp_zip:
-                try:
-                    os.unlink(tmp_zip)
-                except FileNotFoundError:
-                    pass
-        result["state"] = "fetched"
-        any_fetched = True
-        say("%s: %s %s fetched" % (source.name, entry, pkg["stamp"]))
-    if not any_fetched:
-        say("%s: %s is current" % (source.name, entry))
-    return any_fetched
-
-
-async def refresh(sources=None, devices_dir=None, arch=None, say=print,
-                  base=DEFAULT_BASE):
-    """Fetch the newest `KEEP` packages of every `hw-simesh-*` entry of each
-    source (catalogue names, URLs or directories; by default
-    `default_sources()`). A source that cannot be read is reported and the
-    others still run. Returns every result, a source that failed as one
-    result with entry None."""
+async def fetch(key, devices_dir=None, arch=None, say=print):
+    """The newest surveyed build of one `<project>_<catalogue>`, fetched into
+    devices/latest unless it is there: its directory."""
     import aiohttp
 
     arch = arch or machine_arch()
-    results = []
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_S)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for spec in (sources or default_sources()):
+    devices_dir = devices_dir or DEVICES_DIR
+    entry = read_index(devices_dir).get(key)
+    if entry is None:
+        raise DeviceError("device %s_%s: no catalogue has one for %s"
+                          % (key, LATEST, arch))
+    dest = os.path.join(devices_dir, LATEST, "%s_%s" % (key, entry["stamp"]))
+    if os.path.isfile(os.path.join(dest, NODE_YAML)):
+        return dest
+    where = str(entry["where"])
+    origin = {"catalogue": entry.get("catalogue"), "url": where, "fetched": now_utc()}
+    tmp_zip = None
+    try:
+        if entry.get("local"):
+            zip_path = where
+        else:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp_zip = os.path.join(os.path.dirname(dest), PART_PREFIX + os.path.basename(dest)
+                                   + ".zip")
+            timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_S)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                await _download(session, where, tmp_zip)
+            zip_path = tmp_zip
+        await asyncio.to_thread(expand, zip_path, dest, origin, arch)
+    except (OSError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+        raise DeviceError("device %s_%s: fetching %s: %s"
+                          % (key, LATEST, where, str(err) or type(err).__name__)) from err
+    finally:
+        if tmp_zip:
             try:
-                source = Source(spec, base)
-                results.extend(await refresh_one(source, session, devices_dir, arch, say))
-            except (DeviceError, OSError, aiohttp.ClientError, asyncio.TimeoutError) as err:
-                reason = str(err) or type(err).__name__
-                say("%s: %s" % (spec, reason))
-                results.append({"catalogue": spec, "entry": None, "stamp": None,
-                                "state": "failed", "dir": None, "reason": reason})
-    return results
+                os.unlink(tmp_zip)
+            except FileNotFoundError:
+                pass
+    say("fetched %s" % os.path.basename(dest))
+    await asyncio.to_thread(prune_latest, read_index(devices_dir), devices_dir)
+    return dest
+
+
+async def ensure(ref, base_dir=None, devices_dir=None, arch=None, say=print, look=True):
+    """A device name resolved, a `_latest` one fetched first: looked for
+    afresh in its catalogue when `look` (a survey of that catalogue alone,
+    whose failure leaves the last survey standing), then downloaded unless
+    it is here."""
+    devices_dir = devices_dir or DEVICES_DIR
+    parts = split_name(str(ref).strip()) if isinstance(ref, str) else None
+    if parts and parts[2] == LATEST:
+        key = "%s_%s" % parts[:2]
+        if key not in local_names(devices_dir):
+            if look:
+                await survey(None, devices_dir, arch, lambda line: None)
+            if key in read_index(devices_dir):
+                await fetch(key, devices_dir, arch, say)
+    return resolve(ref, base_dir, devices_dir, arch)
+
+
+# ---- saving ------------------------------------------------------------------
+
+def _copy_package(got, dest):
+    """A resolved build copied to `dest` as a package directory of its own,
+    whole or not at all: a package's tree as it is, a compiled build's
+    executable, `/fixed` tree and tools gathered, with a node.yaml saying so."""
+    part = os.path.join(os.path.dirname(dest), PART_PREFIX + os.path.basename(dest))
+    shutil.rmtree(part, ignore_errors=True)
+    try:
+        if got.get("node") is not None and os.path.isfile(os.path.join(got["dir"], NODE_YAML)):
+            shutil.copytree(got["dir"], part, symlinks=True)
+        else:
+            os.makedirs(part)
+            node = {"kind": got["kind_type"], "arch": got["arch"], "stamp": got["stamp"],
+                    "elf": os.path.basename(got["elf"]), "project": got.get("project"),
+                    "catalogue": got.get("catalogue")}
+            for fact in ("virtual_hardware", "virtual_radio"):
+                if got.get(fact):
+                    node[fact] = got[fact]
+            shutil.copy2(got["elf"], os.path.join(part, node["elf"]))
+            if got.get("fixed"):
+                shutil.copytree(got["fixed"], os.path.join(part, "fixed"), symlinks=True)
+                node["fixed"] = "fixed"
+            if got.get("tools"):
+                os.makedirs(os.path.join(part, "tools"))
+                node["tools"] = {}
+                for tool, path in got["tools"].items():
+                    shutil.copy2(path, os.path.join(part, "tools", os.path.basename(path)))
+                    node["tools"][tool] = "tools/" + os.path.basename(path)
+            if got.get("env"):
+                node["env"] = dict(got["env"])
+            with open(os.path.join(part, NODE_YAML), "w", encoding="utf-8") as f:
+                yaml.safe_dump(node, f, sort_keys=False)
+        with open(os.path.join(part, ORIGIN_YAML), "w", encoding="utf-8") as f:
+            yaml.safe_dump({"catalogue": got.get("catalogue"), "url": got.get("source"),
+                            "saved": now_utc()}, f, sort_keys=False)
+        read_node_yaml(part)
+        os.rename(part, dest)
+    finally:
+        shutil.rmtree(part, ignore_errors=True)
+    return dest
+
+
+async def save(ref, devices_dir=None, arch=None, say=print):
+    """A `_latest` build kept as a saved one, fetched first when it has not
+    been: its `resolve` result under its saved name."""
+    devices_dir = devices_dir or DEVICES_DIR
+    parts = split_name(str(ref))
+    if not parts or parts[2] != LATEST:
+        raise DeviceError("save %s: only a <project>_<catalogue>_latest build is saved" % ref)
+    got = await ensure(ref, devices_dir=devices_dir, arch=arch, say=say, look=False)
+    name = "%s_%s_%s" % (parts[0], parts[1], got["stamp"])
+    dest = os.path.join(devices_dir, SAVED, name)
+    if os.path.isfile(os.path.join(dest, NODE_YAML)):
+        raise DeviceError("%s is saved already" % name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    await asyncio.to_thread(_copy_package, got, dest)
+    say("saved %s" % name)
+    return package_result(dest)
+
+
+def delete_saved(ref, devices_dir=None):
+    """Remove one saved build."""
+    parts = split_name(str(ref))
+    path = os.path.join(devices_dir or DEVICES_DIR, SAVED, str(ref))
+    if not parts or parts[2] == LATEST or not os.path.isdir(path):
+        raise DeviceError("no saved build called %s" % ref)
+    shutil.rmtree(path)
 
 
 # ---- the CLI -----------------------------------------------------------------
@@ -864,36 +1087,55 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="simesh devices",
                                  description="the station builds a node can run")
     sub = ap.add_subparsers(dest="verb", required=True)
-    p = sub.add_parser("refresh", help="fetch the newest package of each catalogue "
-                       "(default: %s, then every catalogue in %s)"
-                       % (" ".join(WEB_SOURCES), BUILDS_DIR))
+    p = sub.add_parser("refresh", help="survey the catalogues for their newest builds "
+                       "(default: the web's, then every catalogue in %s); fetches nothing"
+                       % BUILDS_DIR)
     p.add_argument("sources", nargs="*", metavar="SOURCE",
                    help="a catalogue name, a catalogue URL, or a local catalogue directory")
-    sub.add_parser("list", help="the devices there are")
-    p = sub.add_parser("import", help="a device zip into the `imported` catalogue")
+    sub.add_parser("list", help="the latest and the saved builds")
+    p = sub.add_parser("fetch", help="download a <project>_<catalogue>_latest build now")
+    p.add_argument("device")
+    p = sub.add_parser("save", help="keep a <project>_<catalogue>_latest build as a saved one")
+    p.add_argument("device")
+    p = sub.add_parser("delete", help="remove a saved build")
+    p.add_argument("device")
+    p = sub.add_parser("import", help="a device zip into the saved builds")
     p.add_argument("zip")
-    p = sub.add_parser("resolve", help="what a node's device: value runs, as JSON")
+    p = sub.add_parser("resolve", help="what a device name runs, as JSON")
     p.add_argument("device")
     p.add_argument("--base-dir", default=None,
                    help="the directory relative paths are taken from")
     args = ap.parse_args(argv)
 
-    if args.verb == "refresh":
-        results = asyncio.run(refresh(args.sources))
-        return 1 if any(r["state"] == "failed" for r in results) else 0
-    if args.verb == "list":
-        for row in listing():
-            mark = "" if row.get("runs_here") else "   (not this machine's arch)"
-            mark += "   (newest %s)" % row["newest_of"] if row.get("newest_of") else ""
-            mark += "   ! %s" % row["error"] if row.get("error") else ""
-            print("%-10s %-50s %s%s" % (row["catalogue"], row["ref"], row.get("name", ""), mark))
-        return 0
     try:
+        if args.verb == "refresh":
+            asyncio.run(survey(args.sources or None))
+            return 0
+        if args.verb == "list":
+            shown = listing()
+            for row in shown["latest"]:
+                state = "fetched" if row.get("fetched") else "not fetched"
+                mark = "   ! %s" % row["error"] if row.get("error") else ""
+                print("%-40s %-15s %-12s %s%s" % (row["ref"], row.get("stamp") or "", state,
+                                                  row.get("name") or "", mark))
+            for row in shown["saved"]:
+                mark = "   ! %s" % row["error"] if row.get("error") else ""
+                print("%-40s %-15s %-12s %s%s" % (row["ref"], row["stamp"], "saved",
+                                                  row.get("name") or "", mark))
+            return 0
         if args.verb == "import":
             got = import_zip(args.zip, os.path.basename(args.zip))
             print("imported %s as %s" % (got["name"], got["ref"]))
             return 0
-        got = resolve(args.device, args.base_dir)
+        if args.verb == "fetch":
+            got = asyncio.run(ensure(args.device))
+        elif args.verb == "save":
+            got = asyncio.run(save(args.device))
+        elif args.verb == "delete":
+            delete_saved(args.device)
+            return 0
+        else:
+            got = resolve(args.device, args.base_dir)
     except DeviceError as err:
         print("simesh devices: %s" % err, file=sys.stderr)
         return 1

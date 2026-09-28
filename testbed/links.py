@@ -15,7 +15,7 @@ nodes declare) unless --all-carriers. For them:
 - neighbours per station (the receivers of its usable links) with the
   nearest and farthest of them;
 - hop diameter over usable links both ways, and through forwarding
-  stations only (those whose declared role is transport);
+  stations only (those carrying a role tag: transport, router, repeater);
 - the run's own medium beside them (`model`): the pairs the ether would
   deliver on the calling channel by the run's loss table, offsets and
   antenna gains, each transmitter at its declared power, SF and bandwidth, against the

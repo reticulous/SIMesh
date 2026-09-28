@@ -1,10 +1,10 @@
 //! Road/rail overlay layer.
 //!
-//! Source: an Overpass JSON export (fetched at pack-build time — the
-//! compiler itself never talks to the network, same rule as the DEM tiles).
-//! Stored PROJECTED into the pack CRS as f32 metres so the renderer needs no
-//! per-frame reprojection; f32 gives ~0.5 m at UTM northings, far below a
-//! display pixel.
+//! Source: the OpenStreetMap extract the build is given (`osm.rs` selects the
+//! ways; the compiler never talks to the network, same rule as the DEM
+//! tiles). Stored PROJECTED into the pack CRS as f32 metres so the renderer
+//! needs no per-frame reprojection; f32 gives ~0.5 m at UTM northings, far
+//! below a display pixel.
 //!
 //! Binary format (little-endian):
 //!   magic "PRD1" | u32 way_count
@@ -23,13 +23,16 @@ pub enum RoadClass {
 }
 
 impl RoadClass {
+    /// The class of a way from its `highway` and `railway` tags:
+    /// motorway/trunk/primary/secondary and their `_link`s, and
+    /// rail/light_rail/subway. Every other way is not on the layer.
     pub fn from_tag(highway: Option<&str>, railway: Option<&str>) -> Option<Self> {
         Some(match (highway, railway) {
             (Some("motorway"), _) | (Some("motorway_link"), _) => RoadClass::Motorway,
             (Some("trunk"), _) | (Some("trunk_link"), _) => RoadClass::Trunk,
             (Some("primary"), _) | (Some("primary_link"), _) => RoadClass::Primary,
             (Some("secondary"), _) | (Some("secondary_link"), _) => RoadClass::Secondary,
-            (_, Some(_)) => RoadClass::Rail,
+            (_, Some("rail" | "light_rail" | "subway")) => RoadClass::Rail,
             _ => return None,
         })
     }
@@ -54,58 +57,6 @@ pub struct Way {
 
 pub const OSM_NOTICE: &str =
     "Road and rail geometry \u{a9} OpenStreetMap contributors, ODbL 1.0 (opendatacommons.org/licenses/odbl)";
-
-/// Parse an Overpass `out geom;` JSON export, projecting with `to_xy`.
-/// Deliberately a hand-rolled scan rather than a JSON dependency: the export
-/// is ~36 MB of mostly-tags and we want only geometry and one tag each.
-pub fn parse_overpass(
-    json: &str,
-    mut to_xy: impl FnMut(f64, f64) -> (f64, f64),
-) -> Vec<Way> {
-    let mut ways = Vec::new();
-    // Elements are separated by `"type": "way"`; within one element we take
-    // the highway/railway tag and the geometry array.
-    for chunk in json.split("\"type\":").skip(1) {
-        let highway = extract_str(chunk, "\"highway\":");
-        let railway = extract_str(chunk, "\"railway\":");
-        let Some(class) = RoadClass::from_tag(highway.as_deref(), railway.as_deref()) else {
-            continue;
-        };
-        let Some(geo_start) = chunk.find("\"geometry\":") else { continue };
-        let geo = &chunk[geo_start..];
-        let Some(end) = geo.find(']') else { continue };
-        let mut points = Vec::new();
-        for pt in geo[..end].split('{').skip(1) {
-            let (Some(lat), Some(lon)) = (extract_num(pt, "\"lat\":"), extract_num(pt, "\"lon\":"))
-            else {
-                continue;
-            };
-            let (x, y) = to_xy(lat, lon);
-            points.push((x as f32, y as f32));
-        }
-        if points.len() >= 2 {
-            ways.push(Way { class, points });
-        }
-    }
-    ways
-}
-
-fn extract_str(s: &str, key: &str) -> Option<String> {
-    let i = s.find(key)? + key.len();
-    let rest = s[i..].trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn extract_num(s: &str, key: &str) -> Option<f64> {
-    let i = s.find(key)? + key.len();
-    let rest = s[i..].trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == '+'))
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
 
 pub fn write_binary<W: Write>(w: &mut W, ways: &[Way]) -> Result<(), PackError> {
     w.write_all(b"PRD1")?;
@@ -158,30 +109,25 @@ pub fn read_binary<R: Read>(r: &mut R) -> Result<Vec<Way>, PackError> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{"elements":[
-      {"type":"way","id":1,"tags":{"highway":"motorway","ref":"A100"},
-       "geometry":[{"lat":52.5,"lon":13.3},{"lat":52.51,"lon":13.31}]},
-      {"type":"way","id":2,"tags":{"highway":"residential"},
-       "geometry":[{"lat":52.4,"lon":13.2},{"lat":52.41,"lon":13.21}]},
-      {"type":"way","id":3,"tags":{"railway":"rail","usage":"main"},
-       "geometry":[{"lat":52.6,"lon":13.4},{"lat":52.61,"lon":13.41}]}
-    ]}"#;
-
     #[test]
-    fn parses_classes_and_skips_minor_roads() {
-        // Identity "projection" so the test checks parsing, not proj.
-        let ways = parse_overpass(SAMPLE, |lat, lon| (lon, lat));
-        assert_eq!(ways.len(), 2, "residential must be skipped");
-        assert_eq!(ways[0].class, RoadClass::Motorway);
-        assert_eq!(ways[1].class, RoadClass::Rail);
-        assert_eq!(ways[0].points.len(), 2);
-        assert!((ways[0].points[0].0 - 13.3).abs() < 1e-4);
-        assert!((ways[0].points[0].1 - 52.5).abs() < 1e-4);
+    fn classes_follow_the_highway_and_railway_selection() {
+        assert_eq!(RoadClass::from_tag(Some("motorway_link"), None), Some(RoadClass::Motorway));
+        assert_eq!(RoadClass::from_tag(Some("secondary"), None), Some(RoadClass::Secondary));
+        assert_eq!(RoadClass::from_tag(Some("tertiary"), None), None);
+        assert_eq!(RoadClass::from_tag(Some("residential"), None), None);
+        assert_eq!(RoadClass::from_tag(None, Some("subway")), Some(RoadClass::Rail));
+        assert_eq!(RoadClass::from_tag(None, Some("light_rail")), Some(RoadClass::Rail));
+        assert_eq!(RoadClass::from_tag(None, Some("tram")), None);
+        assert_eq!(RoadClass::from_tag(None, Some("abandoned")), None);
+        assert_eq!(RoadClass::from_tag(None, Some("platform")), None);
     }
 
     #[test]
     fn binary_roundtrip() {
-        let ways = parse_overpass(SAMPLE, |lat, lon| (lon * 1000.0, lat * 1000.0));
+        let ways = vec![
+            Way { class: RoadClass::Motorway, points: vec![(13300.0, 52500.0), (13310.0, 52510.0)] },
+            Way { class: RoadClass::Rail, points: vec![(13400.0, 52600.0), (13410.0, 52610.0)] },
+        ];
         let mut buf = Vec::new();
         write_binary(&mut buf, &ways).unwrap();
         let back = read_binary(&mut &buf[..]).unwrap();

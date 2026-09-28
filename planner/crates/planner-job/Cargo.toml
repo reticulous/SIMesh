@@ -1,0 +1,12 @@
+[package]
+name = "planner-job"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The front's batch jobs: build a pack from files on disk, turn a saved node list into nodes"
+
+[dependencies]
+planner-pack.workspace = true
+planner-import.workspace = true
+serde.workspace = true
+serde_json.workspace = true

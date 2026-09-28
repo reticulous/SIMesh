@@ -56,15 +56,16 @@ A YAML mapping.
 
 | Key | Required | Value |
 |---|---|---|
-| `kind` | yes | the station kind that runs it (`reticulous`, `berlinmesh`, …) |
+| `kind` | yes | the station kind that runs it (`reticulous`, `sergeyculum`, …) |
 | `arch` | yes | the architecture it runs on, as in the filename |
 | `stamp` | yes | the build stamp, as in the filename; a string of digits (an integer is read as its digits) |
 | `elf` | yes | the executable's path in the archive |
 | `fixed` | no | the path in the archive of a read-only data tree the kind hands the station (a `reticulous` station reads it as its `/fixed`); absent, the station has none |
-| `tools` | no | a mapping of tool name to its path in the archive: the programs the kind talks to the station with (`rncfg` for `berlinmesh`) |
+| `tools` | no | a mapping of tool name to its path in the archive: the programs the kind talks to the station with (`rncfg` for `sergeyculum`) |
 | `env` | no | a mapping of environment variable to value, given to the station; a value starting `./` or `../` is a path in the archive |
 | `name` | no | what a reader calls the device; absent, its project, catalogue and build time (`Reticulous dev 2026-09-25 03:50`) |
-| `stands_for` | no | the hardware the station plays (`ESP32`); a reader shows it as a virtual one of that |
+| `virtual_hardware` | no | the hardware the station plays (`ESP32-S3`); a reader shows it as a virtual one of that |
+| `virtual_radio` | no | the radio chip the station drives (`SX1262`); a reader shows it as a virtual one of that |
 | `project` | no | the project's name, as its catalogue gives it |
 | `catalogue` | no | the catalogue it was built for (`stable`, `dev`, …) |
 | `entry` | no | the catalogue entry it was built for, as in the filename |
@@ -81,7 +82,8 @@ arch: aarch64
 stamp: "20260925035045"
 elf: reticulous.elf
 fixed: fixed
-stands_for: ESP32
+virtual_hardware: ESP32-S3
+virtual_radio: SX1262
 project: Reticulous
 catalogue: dev
 entry: hw-simesh-aarch64

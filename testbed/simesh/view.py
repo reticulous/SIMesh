@@ -10,14 +10,15 @@ resolved, and the loss tables the ether read.
 - **Positions** are the geodata's metres (`geodata.to_xy`): synthetic
   ground's nautical-mile metres, or a pack's easting and northing. A pack's
   copy points at its pack, which has to be where it points.
-- **Radio, role.** A node's radio and role are its declared ones, each radio
-  figure falling back to the defaults in `simesh` where the node declares
-  none, and a node declaring no role a `client`. What a script's setup
-  changed beyond them is not seen here.
-- **Kind.** A node's kind is its device's, as the run resolved it; what its
+- **Radio, role.** A node's radio is the run's `globals.py` at the node's
+  maximum power, unless it is tagged `no-radio`; its role is its role tag,
+  a node with none a `client`. What a script set beyond them is not seen
+  here.
+- **Kind.** A node's kind is its firmware's, as the run resolved it; what its
   frames mean belongs to that kind's protocol (`simesh.protocol_for`).
 - **Levels** are the medium's own: an `Ether` holding the run's tables with
-  the nodeset's offsets, names and antenna gains, and the noise figure from
+  the nodeset's antennas (over the grounds the run kept) and offsets on
+  them, the names, and the noise figure from
   the run's `physics` (the ether's default when the run names none), asked
   through the ether's own `level` and `audible`. Nothing here recomputes a
   loss from positions.
@@ -28,8 +29,9 @@ import math
 import os
 import sys
 
-import kinds as kinds_module
+import boards as boards_module
 import losses as losses_module
+import nodeset as nodeset_module
 import runs
 import store
 
@@ -55,6 +57,7 @@ class RunView:
         self._geodata = None
         self._positions = None
         self._medium = None
+        self._shared = None
 
     @property
     def record_path(self):
@@ -83,7 +86,7 @@ class RunView:
     # ---- what each node is ----------------------------------------------
 
     def kind_type(self, name):
-        ref = kinds_module.device_of(self.nodes[name])
+        ref = (self.run.meta.get("firmware") or {}).get(name)
         return (self.builds.get(ref) or {}).get("kind_type")
 
     def protocol(self, name):
@@ -98,34 +101,42 @@ class RunView:
                 found.append(module)
         return found
 
+    def shared_radio(self):
+        """The run's globals.py radio (runs.Run.radio)."""
+        if self._shared is None:
+            self._shared = self.run.radio()
+        return self._shared
+
     def radio(self, name):
-        """Slot 0 of a node as it declares it: freq_hz, sf, bw_hz, power_dbm."""
-        radio = self.nodes[name].get("radio") or {}
-        said = {"freq_hz": int(round(radio["freq_mhz"] * 1e6)) if "freq_mhz" in radio else None,
-                "sf": radio.get("sf"),
-                "bw_hz": int(round(radio["bw_khz"] * 1e3)) if "bw_khz" in radio else None,
-                "power_dbm": radio.get("tx_dbm")}
-        defaults = {"freq_hz": simesh.DEFAULT_FREQ_HZ, "sf": simesh.DEFAULT_SF,
-                    "bw_hz": simesh.DEFAULT_BW_HZ, "power_dbm": simesh.DEFAULT_POWER_DBM}
-        return {k: (said[k] if said[k] is not None else v) for k, v in defaults.items()}
+        """Slot 0 of a node as the startup script sets it: freq_hz, sf,
+        bw_hz from the run's globals.py, power_dbm the node's maximum
+        (boards.max_dbm)."""
+        shared = self.shared_radio()
+        return {"freq_hz": int(round(shared["freq_mhz"] * 1e6)), "sf": shared["sf"],
+                "bw_hz": int(round(shared["bw_khz"] * 1e3)),
+                "power_dbm": boards_module.max_dbm(self.nodes[name].get("max_dbm"))}
+
+    def has_radio(self, name):
+        """False for a node tagged `no-radio`."""
+        return nodeset_module.has_radio(self.nodes[name])
 
     def roles(self):
-        """Station id -> role, for every node: its declared one, else client."""
-        return {sid: self.nodes[name].get("role") or "client" for name, sid in self.ids.items()}
+        """Station id -> role, for every node: its role tag, else client."""
+        return {sid: nodeset_module.tag_role(self.nodes[name]["tags"]) or "client"
+                for name, sid in self.ids.items()}
 
     def forwarders(self):
         """The station ids whose role forwards for others."""
         return {sid for sid, role in self.roles().items() if role in simesh.FORWARDING}
 
     def calling_hz(self):
-        """The carrier most nodes are set to: the calling channel."""
-        count = collections.Counter(self.radio(name)["freq_hz"] for name in self.nodes)
-        return count.most_common(1)[0][0] if count else simesh.DEFAULT_FREQ_HZ
+        """The carrier globals.py sets: the calling channel."""
+        return int(round(self.shared_radio()["freq_mhz"] * 1e6))
 
     # ---- the medium ------------------------------------------------------
 
     def medium(self):
-        """An `Ether` with the run's tables and offsets, names, gains and
+        """An `Ether` with the run's tables with antennas and offsets, names and
         noise figure, for its `level` and `audible`; it carries no traffic."""
         if self._medium is None:
             e = ether_module.Ether.__new__(ether_module.Ether)
@@ -133,9 +144,8 @@ class RunView:
             e.stations = {}
             tables = {band: slt.Table.read(self.run.table_path(band))
                       for band in self.run.bands()}
-            gains = {int(n["id"]): float((n.get("antenna") or {}).get("gain_dbi", 0.0))
-                     for n in self.nodes.values()}
-            e.set_losses(losses_module.with_offsets(tables, self.nodeset), self.ids, gains)
+            e.set_losses(losses_module.medium_tables(tables, self.geodata(), self.nodeset,
+                                                     self.run.meta.get("grounds")), self.ids)
             self._medium = e
         return self._medium
 
@@ -144,17 +154,19 @@ class RunView:
 
     def audible(self, a, b, freq_hz=None):
         """True when station b decodes station a on this carrier (a's own by
-        default) at a's declared power, SF and bandwidth."""
+        default) at a's power, SF and bandwidth (`radio`)."""
         r = self.radio(self.names[a])
         e = self.medium()
         level = e.level(a, b, freq_hz or r["freq_hz"], r["power_dbm"])
         return e.audible(level, r["bw_hz"], r["sf"])
 
     def radio_graph(self, freq_hz=None):
-        """Station id -> the ids that decode it, per `audible`."""
+        """Station id -> the ids that decode it, per `audible`; a node
+        without a radio is in it as neither."""
         adj = collections.defaultdict(set)
-        for a in self.names:
-            for b in self.names:
+        radios = [sid for sid, name in self.names.items() if self.has_radio(name)]
+        for a in radios:
+            for b in radios:
                 if a != b and self.audible(a, b, freq_hz):
                     adj[a].add(b)
         return adj

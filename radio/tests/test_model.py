@@ -19,6 +19,7 @@ import queue
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 
@@ -36,6 +37,7 @@ PIN_DIO1, PIN_BUSY = 1, 2
 SET_STANDBY, SET_RX, SET_TX, SET_RF_FREQUENCY = 0x80, 0x82, 0x83, 0x86
 SET_CAD_PARAMS, SET_PACKET_TYPE, SET_MODULATION = 0x88, 0x8A, 0x8B
 SET_PACKET_PARAMS, SET_RXTX_FALLBACK, SET_CAD = 0x8C, 0x93, 0xC5
+SET_TX_PARAMS, SET_PA_CONFIG = 0x8E, 0x95
 SET_DIO_IRQ_PARAMS, CLEAR_IRQ, WRITE_REGISTER, WRITE_BUFFER = 0x08, 0x02, 0x0D, 0x0E
 GET_IRQ, GET_RX_BUF_STATUS, GET_PACKET_STATUS, GET_RSSI_INST = 0x12, 0x13, 0x14, 0x15
 READ_REGISTER, READ_BUFFER, GET_STATUS = 0x1D, 0x1E, 0xC0
@@ -614,3 +616,67 @@ def test_reset_restores_the_mode_and_clears_the_irqs(chip):
     assert chip.dio1() == 0
     assert chip.edges[-1][1] == 0
     assert chip.lib.simradio_pin(chip.handle, PIN_BUSY) == 0
+
+
+# ---------------------------------------------------------------------------
+# 13. The front end
+# ---------------------------------------------------------------------------
+
+# The GC1109 front end, as testbed/boards.py tells a station whose maximum is 27 dBm.
+HELTEC_V4 = json.dumps({"chip": "sx1262", "max_dbm": 27,
+                        "fem_part": "gc1109",
+                        "fem_tx_cal": "gc1109 measured 1:7,5:12,10:20,12:23,14:24,"
+                                      "16:25,18:27,20:28,22:27",
+                        "fem_gain_db": 0, "fem_rx_gain_db": 20})
+
+
+def transmit_at(chip, pa_duty, hp_max, reg):
+    chip.configure()
+    chip.write(SET_PA_CONFIG, pa_duty, hp_max, 0x00, 0x01)
+    chip.write(SET_TX_PARAMS, reg & 0xFF, 0x04)
+    chip.ether.clear()
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    _, tx = chip.ether.expect("tx")
+    chip.wait_irq(TX_DONE)
+    chip.clear_irq()
+    return tx["power_dbm"]
+
+
+def test_without_a_board_the_connector_gets_what_the_chip_radiates(chip):
+    if os.environ.get("SIMESH_BOARD"):
+        pytest.skip("this process was given a board")
+    assert transmit_at(chip, 4, 7, 22) == 22
+    assert transmit_at(chip, 4, 7, 14) == 14
+
+
+def front_end_case(chip):
+    """Run in a child told it is a Heltec V4 (the model reads SIMESH_BOARD
+    once per process): the curve on transmit, the LNA on receive."""
+    assert transmit_at(chip, 4, 7, 22) == 27     # the curve's own top point
+    assert transmit_at(chip, 4, 7, 20) == 28     # it turns over near saturation
+    assert transmit_at(chip, 4, 7, 11) == 22     # between 10:20 and 12:23, rounded
+    assert transmit_at(chip, 4, 7, 0) == 7       # flat below the first point
+
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    chip.ether.rx_begin(501, -95, 10_000, 20_000, 150_000)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 150            # -2 x (-95 + 20)
+    chip.ether.rx_end(501, b"through the LNA", rssi=-95, snr=3)
+    chip.wait_irq(RX_DONE)
+    rssi, snr, _ = chip.read(GET_PACKET_STATUS, 3)
+    assert rssi == 150 and snr == 12                        # SNR as the ether gave it
+    settle(0.2)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 180            # the floor, -110 + 20
+
+
+def test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads(chip):
+    if os.environ.get("SIMESH_BOARD") == HELTEC_V4:
+        front_end_case(chip)
+        return
+    env = dict(os.environ, SIMESH_BOARD=HELTEC_V4)
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           "%s::%s" % (os.path.abspath(__file__),
+                                       "test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads")],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr

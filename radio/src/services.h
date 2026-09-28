@@ -26,6 +26,9 @@ extern "C" {
 
 enum { SIMRADIO_LOG_ERROR = 1, SIMRADIO_LOG_WARN = 2, SIMRADIO_LOG_INFO = 3 };
 
+/* The receive buffer `udp_open` asks of the kernel, in bytes. */
+enum { kRecvBufferBytes = 1 << 20 };
+
 struct simradio_services {
     int64_t (*now_us)(void);
     void*   (*timer_create)(void (*cb)(void*), void* arg, const char* name);

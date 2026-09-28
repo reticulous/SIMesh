@@ -18,7 +18,7 @@
  *                                            reaching the timeout
  *   pthread_cond_timedwait, pthread_cond_clockwait
  *                                            a signal, or node time reaching the
- *                                            deadline
+ *                                            deadline (ETIMEDOUT)
  *
  * A wait blocks on a descriptor of its own thread's (an eventfd), which a wake
  * the chip library runs when a grant reaches the instant writes to. So a thread
@@ -29,11 +29,14 @@
  * With SIMESH_IDLE=threads the shim also keeps a census of the process's
  * threads: every thread created through pthread_create, and the first. A
  * thread is blocked while it is inside one of the waits above, an untimed
- * pthread_cond_wait, or a read, recv or accept on a blocking descriptor; when
- * the last one blocks, the station is idle, and the shim says so to the chip
- * library, whose wakes already hold every deadline the blocked threads are
- * waiting for. A wake that fires counts its thread as running at once, so the
- * station cannot look idle between the grant and the thread getting the CPU.
+ * pthread_cond_wait, or a read, recv or accept on a blocking descriptor that
+ * is not a file (a regular file, directory or disk never waits on anything
+ * outside the process); when the last one blocks, the station is idle, and
+ * the shim says so to the chip library, whose wakes already hold every
+ * deadline the blocked threads are waiting for. A wake that fires counts its
+ * thread as running at once, and so does a pthread_cond_signal or
+ * pthread_cond_broadcast every thread waiting on that condition, so the
+ * station cannot look idle between the wake and the thread getting the CPU.
  *
  * With SIMESH_SEED in the environment as well, the shim is also the station's
  * randomness: getentropy, getrandom and syscall(SYS_getrandom) — what ESP-IDF's
@@ -95,6 +98,7 @@
 #include <sys/random.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
@@ -139,6 +143,8 @@ static int (*r_epoll_pwait)(int, struct epoll_event*, int, int, const sigset_t*)
 static int (*r_pthread_cond_timedwait)(pthread_cond_t*, pthread_mutex_t*, const struct timespec*);
 static int (*r_pthread_cond_clockwait)(pthread_cond_t*, pthread_mutex_t*, clockid_t, const struct timespec*);
 static int (*r_pthread_cond_wait)(pthread_cond_t*, pthread_mutex_t*);
+static int (*r_pthread_cond_signal)(pthread_cond_t*);
+static int (*r_pthread_cond_broadcast)(pthread_cond_t*);
 static int (*r_pthread_create)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 static ssize_t (*r_read)(int, void*, size_t);
 static ssize_t (*r_readv)(int, const struct iovec*, int);
@@ -241,6 +247,8 @@ struct thread_rec {
     atomic_int  blocked;
     int         cond_wake;
     pthread_cond_t* _Atomic cond;   /* the condition a timed wait is on */
+    pthread_mutex_t* mutex;         /* and its mutex; under s_condLock */
+    int         cond_fired;         /* its deadline came; under s_condLock */
     int         counted;    /* in the census */
 };
 
@@ -251,9 +259,32 @@ static pthread_mutex_t s_condLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t s_key;
 static pthread_once_t s_keyOnce = PTHREAD_ONCE_INIT;
 
+/* Every thread's record, for a signal to find the threads waiting on its
+ * condition (cond_waiters_run); under s_condLock. */
+#define MAX_RECS 1024
+static struct thread_rec* s_recs[MAX_RECS];
+
+static void recs_add(struct thread_rec* r)
+{
+    pthread_mutex_lock(&s_condLock);
+    for (int i = 0; i < MAX_RECS; i++) {
+        if (!s_recs[i]) {
+            s_recs[i] = r;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_condLock);
+}
+
 static void rec_gone(void* p)
 {
     struct thread_rec* r = (struct thread_rec*)p;
+    if (r) {
+        pthread_mutex_lock(&s_condLock);
+        for (int i = 0; i < MAX_RECS; i++)
+            if (s_recs[i] == r) s_recs[i] = NULL;
+        pthread_mutex_unlock(&s_condLock);
+    }
     if (r && r->counted) {
         if (atomic_exchange(&r->blocked, 0)) atomic_fetch_sub(&s_blocked, 1);
         atomic_fetch_sub(&s_live, 1);
@@ -271,18 +302,54 @@ static void wake_due(void* arg)
     (void)w;
 }
 
+#define COND_TRY_NS 10000000        /* how long a deadline tries for the waiter's mutex, wall */
+
+static int64_t real_mono_ns(void)
+{
+    struct timespec ts;
+    REAL(clock_gettime)(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* A timed wait's deadline has come: its thread is running again, and the
+ * condition is broadcast holding the waiter's mutex, as any signaller's is.
+ * The waiter tells the census it is blocked, which is what lets T reach its
+ * deadline, a moment before its wait gives the mutex up; a broadcast made in
+ * between would find nobody waiting and be lost, and a thread that counts as
+ * running and says nothing is what the busy watchdog lets T run away from.
+ * The mutex is only tried, with s_condLock let go in between, since the
+ * waiter takes s_condLock holding it; and only for COND_TRY_NS, after which
+ * the broadcast goes without it rather than wait on a thread that holds it
+ * and is itself waiting on this one, as a host that switches its threads by
+ * signals can. `cond_fired` is what the waiter goes by (cond_node_wait). */
 static void cond_due(void* arg)
 {
     struct thread_rec* r = (struct thread_rec*)arg;
     if (atomic_exchange(&r->blocked, 0)) atomic_fetch_sub(&s_blocked, 1);
     sigset_t all, old;
     sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, &old);
-    pthread_mutex_lock(&s_condLock);
-    pthread_cond_t* c = atomic_load(&r->cond);
-    if (c) pthread_cond_broadcast(c);
-    pthread_mutex_unlock(&s_condLock);
-    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    int64_t give_up = real_mono_ns() + COND_TRY_NS;
+    for (;;) {
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        pthread_mutex_lock(&s_condLock);
+        pthread_cond_t* c = atomic_load(&r->cond);
+        int done = 1;
+        if (c && r->mutex) {            /* a timed wait: an untimed one has no mutex here */
+            r->cond_fired = 1;
+            if (pthread_mutex_trylock(r->mutex) == 0) {
+                REAL(pthread_cond_broadcast)(c);
+                pthread_mutex_unlock(r->mutex);
+            } else if (real_mono_ns() >= give_up) {
+                REAL(pthread_cond_broadcast)(c);
+            } else {
+                done = 0;
+            }
+        }
+        pthread_mutex_unlock(&s_condLock);
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+        if (done) return;
+        sched_yield();
+    }
 }
 
 static struct thread_rec* rec(const struct simclock_ops* o)
@@ -299,6 +366,7 @@ static struct thread_rec* rec(const struct simclock_ops* o)
     pthread_once(&s_keyOnce, make_key);
     pthread_setspecific(s_key, r);
     t_rec = r;
+    recs_add(r);
     return r;
 }
 
@@ -342,6 +410,7 @@ static void* trampoline(void* p)
         r->counted = 1;
         pthread_setspecific(s_key, r);
         t_rec = r;
+        recs_add(r);
     }
     return s.fn(s.arg);
 }
@@ -433,10 +502,13 @@ static int node_wait(const struct simclock_ops* o, struct pollfd* extra, nfds_t 
 
 /* ---- Clocks ---- */
 
+static atomic_llong s_clockReads;
+
 int clock_gettime(clockid_t c, struct timespec* ts)
 {
     load_mode();
     if (!s_virtual || !(monotonic_clock(c) || wall_clock(c))) return REAL(clock_gettime)(c, ts);
+    atomic_fetch_add(&s_clockReads, 1);
     us_ts(clock_now(ops(), c), ts);
     return 0;
 }
@@ -445,6 +517,7 @@ int gettimeofday(struct timeval* tv, void* tz)
 {
     load_mode();
     if (!s_virtual) return REAL(gettimeofday)(tv, tz);
+    atomic_fetch_add(&s_clockReads, 1);
     us_tv(clock_now(ops(), CLOCK_REALTIME), tv);
     return 0;
 }
@@ -453,6 +526,7 @@ time_t time(time_t* out)
 {
     load_mode();
     if (!s_virtual) return REAL(time)(out);
+    atomic_fetch_add(&s_clockReads, 1);
     time_t t = (time_t)(clock_now(ops(), CLOCK_REALTIME) / 1000000);
     if (out) *out = t;
     return t;
@@ -688,6 +762,9 @@ int epoll_wait(int epfd, struct epoll_event* ev, int max, int timeout)
 
 /* ---- Condition variables ---- */
 
+/* A timed wait in node time: the C library's untimed wait on the condition,
+ * ended by a signal or broadcast of the host's or by the thread's wake at the
+ * deadline (cond_due), which says ETIMEDOUT as the real one does. */
 static int cond_node_wait(const struct simclock_ops* o, pthread_cond_t* c, pthread_mutex_t* m,
                           int64_t deadline)
 {
@@ -698,6 +775,8 @@ static int cond_node_wait(const struct simclock_ops* o, pthread_cond_t* c, pthre
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);
     pthread_mutex_lock(&s_condLock);
+    r->mutex = m;
+    r->cond_fired = 0;
     atomic_store(&r->cond, c);
     pthread_mutex_unlock(&s_condLock);
     pthread_sigmask(SIG_SETMASK, &old, NULL);
@@ -710,6 +789,8 @@ static int cond_node_wait(const struct simclock_ops* o, pthread_cond_t* c, pthre
     pthread_sigmask(SIG_BLOCK, &all, &old);
     pthread_mutex_lock(&s_condLock);
     atomic_store(&r->cond, NULL);
+    r->mutex = NULL;
+    if (rc == 0 && r->cond_fired) rc = ETIMEDOUT;
     pthread_mutex_unlock(&s_condLock);
     pthread_sigmask(SIG_SETMASK, &old, NULL);
     return rc;
@@ -738,19 +819,75 @@ int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m)
     const struct simclock_ops* o = ops();
     if (!o || !s_census) return REAL(pthread_cond_wait)(c, m);
     struct thread_rec* r = ready_rec(o);
+    if (!r) return REAL(pthread_cond_wait)(c, m);
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    pthread_mutex_lock(&s_condLock);
+    atomic_store(&r->cond, c);
+    pthread_mutex_unlock(&s_condLock);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
     census_block(o, r);
     int rc = REAL(pthread_cond_wait)(c, m);
     census_run(r);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    pthread_mutex_lock(&s_condLock);
+    atomic_store(&r->cond, NULL);
+    pthread_mutex_unlock(&s_condLock);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
     return rc;
+}
+
+/* A thread waiting on `c` is about to be woken: it counts as running from
+ * now, not from when it next gets the CPU. Otherwise the signaller blocking
+ * next would find every thread blocked and say the station is idle while the
+ * one it woke has work to do, and T would move under it. A signal wakes one
+ * waiter the C library chooses, so every waiter on `c` counts as running; one
+ * not woken is counted blocked again the next time it waits, and until then
+ * the busy watchdog stands in for its idle. */
+static void cond_waiters_run(pthread_cond_t* c)
+{
+    if (!s_census || !ops()) return;
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    pthread_mutex_lock(&s_condLock);
+    for (int i = 0; i < MAX_RECS; i++) {
+        struct thread_rec* r = s_recs[i];
+        if (r && atomic_load(&r->cond) == c && atomic_exchange(&r->blocked, 0))
+            atomic_fetch_sub(&s_blocked, 1);
+    }
+    pthread_mutex_unlock(&s_condLock);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+int pthread_cond_signal(pthread_cond_t* c)
+{
+    cond_waiters_run(c);
+    return REAL(pthread_cond_signal)(c);
+}
+
+int pthread_cond_broadcast(pthread_cond_t* c)
+{
+    cond_waiters_run(c);
+    return REAL(pthread_cond_broadcast)(c);
 }
 
 /* ---- Blocking reads, for the census ---- */
 
+/* Whether a read on `fd` can wait on something outside the process. A
+ * regular file, a directory or a disk never makes it wait, however long the
+ * read takes: a thread reading one is working, and counted blocked it could
+ * make the station look idle with its work half done. */
 static int blocking(int fd, int flags)
 {
     if (flags & MSG_DONTWAIT) return 0;
     int fl = fcntl(fd, F_GETFL);
-    return fl >= 0 && !(fl & O_NONBLOCK);
+    if (fl < 0 || (fl & O_NONBLOCK)) return 0;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode)))
+        return 0;
+    return 1;
 }
 
 /* `rc = call`, the thread counted as blocked around it when it can block. */
@@ -968,6 +1105,7 @@ static size_t iov_len(const struct iovec* v, int n)
 #define WATCH_RECHECK_NS (5 * 1000 * 1000)
 #define WATCH_SPIN_NS    (50LL * 1000 * 1000)
 #define WATCH_CAP_NS     (10LL * 1000 * 1000 * 1000)
+#define WATCH_SPIN_CLOCK_READS 1000
 
 static _Atomic signed char s_fdKind[1024];     /* 1: a timerfd, -1: not, 0: unknown */
 
@@ -1041,6 +1179,7 @@ static ssize_t hold_expiry(int fd, void* buf)
     int64_t start = mono_ns();
     long long user0, sys0, user, sys;
     long long io0 = atomic_load(&s_ioCalls);
+    long long clocks0 = atomic_load(&s_clockReads);
     if (!others_running(&user0, &sys0)) return sizeof(uint64_t);
     for (;;) {
         struct itimerspec again = { { 0, 0 }, { 0, WATCH_RECHECK_NS } };
@@ -1052,6 +1191,9 @@ static ssize_t hold_expiry(int fd, void* buf)
         if (spent >= WATCH_CAP_NS) break;
         if (spent >= WATCH_SPIN_NS && sys - sys0 >= user - user0
             && atomic_load(&s_ioCalls) == io0)
+            break;
+        if (spent >= WATCH_SPIN_NS
+            && atomic_load(&s_clockReads) - clocks0 >= WATCH_SPIN_CLOCK_READS)
             break;
     }
     return sizeof(uint64_t);

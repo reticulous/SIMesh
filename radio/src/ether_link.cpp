@@ -6,7 +6,9 @@
  * message does to which chip. In a virtual-time run every message the ether
  * sends carries the instant it happens at and a sequence number: the
  * conductor moves T there first, the message is applied, and the station owes
- * the ether an idle for that number.
+ * the ether an idle for that number. The link is UDP: messages are applied in
+ * their numbers' order and never twice, and a lost one on either side is
+ * recovered by an idle said again (conductor::resendIdle).
  */
 #include "ether_link.h"
 
@@ -88,7 +90,18 @@ void handleMessage(const char* text, size_t len)
         return;
     }
 
-    if (timed) conductor::advanceTo(msg.num("t", 0));
+    if (timed) {
+        /* Applied strictly in sequence: one said again is already applied,
+         * and one past a gap waits for what was lost, which an idle for the
+         * last number applied asks the ether for (conductor::resendIdle). */
+        uint64_t seq = (uint64_t)msg.num("seq", 0), have = conductor::lastSeq();
+        if (seq <= have) return;
+        if (seq > have + 1) {
+            conductor::resendIdle();
+            return;
+        }
+        conductor::advanceTo(msg.num("t", 0));
+    }
 
     if (type == "rx_begin") {
         simradio* chip = modelChip((int)msg.num("slot", 0));

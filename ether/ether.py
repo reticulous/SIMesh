@@ -55,11 +55,13 @@ a virtual one), direction, station id, JSON.
 
 import argparse
 import asyncio
+import contextlib
 import heapq
 import json
 import math
 import os
 import random
+import socket
 import sys
 import time
 from array import array
@@ -156,6 +158,15 @@ STANDING_QUANTUM_US = 10_000
 # came from a station that was busy: the station's own watchdog reports after
 # 20 ms. Counted per station, so a run that crawls can say who holds it.
 SLOW_IDLE_S = 0.018
+
+# The receive buffer asked of the kernel for the ether's socket, in bytes
+# (it gives no more than net.core.rmem_max). The default, some 200 KB, is less
+# than a hundred stations' radio settings arriving at one instant, and a
+# datagram the kernel drops is a message the ether never hears.
+RECV_BUFFER_BYTES = 4 * 1024 * 1024
+
+# The least wall time between two resends to one station of what it missed.
+RESEND_GAP_S = 0.1
 
 # Bytes written into a channel of the run (a station's console, a TCP
 # connection between two stations) hold T until their reader has taken them.
@@ -337,6 +348,10 @@ class Station:
         self.asked_at = 0       # its seq when it last asked
         self.standing = 0       # idles in a row that asked for T itself
         self.granted_at = 0.0   # the wall clock when it was last told anything
+        self.idle_said = None   # (seq, until) of the idle last taken from it
+        self.unanswered = []    # (seq, datagram) sent since its last idle, for a resend
+        self.resent_at = 0.0    # the wall clock of the last resend to it
+        self.stale_said = None  # the number of the last idle it said for an older message
         self.slow_idles = 0     # idles that took the busy watchdog's time or more
         # The power its last frame went out at. A station states this per
         # transmission rather than in its `state`, so it is learned by
@@ -473,6 +488,7 @@ class Ether(asyncio.DatagramProtocol):
         self.pace_timer = None
         self.pace_origin = None     # (wall seconds, T) a paced run is measured from
         self.barriers = 0           # times T has moved
+        self.resends = 0            # messages sent again to a station that missed them
         self.standing = 0           # steps in a row that left T where it was
         self.physics = physics or Physics()
         self.pairwise = bool(pairwise)
@@ -713,15 +729,39 @@ class Ether(asyncio.DatagramProtocol):
                 self.recv_tx(sid, addr, msg)
 
     def recv_idle(self, sid, msg):
+        """A station idle after the message numbered `seq`.
+
+        UDP may lose a datagram either way, so a station says its idle again
+        while it hears nothing back. An idle for a number older than the last
+        one sent is usually only crossing that message on the wire; said a
+        second time, it says the station missed what came after it, which is
+        sent again as it was (`unanswered`). A second idle for what is
+        already known changes nothing."""
         station = self.stations.get(sid)
-        if station is None or msg.get("seq") != station.seq:
+        seq = msg.get("seq")
+        if station is None or not isinstance(seq, int):
             return
+        if seq < station.seq:
+            # Once is the ordinary race, an idle crossing the next message on
+            # the wire; the same number again means that message never came.
+            if station.stale_said == seq:
+                self.resend(station, seq)
+            station.stale_said = seq
+            return
+        station.stale_said = None
+        if seq != station.seq:
+            return
+        station.unanswered = []
+        until = msg.get("until")
+        until = int(until) if isinstance(until, (int, float)) else None
+        if station.idle and (seq, until) == station.idle_said:
+            return
+        station.idle_said = (seq, until)
         if self.loop.time() - station.granted_at >= SLOW_IDLE_S:
             station.slow_idles += 1
         self.mark(station, True)
         self.dirty.add(sid)
-        until = msg.get("until")
-        station.until = int(until) if isinstance(until, (int, float)) else None
+        station.until = until
         if station.until is not None and station.until <= self.clock.t:
             # A station that keeps asking for the instant it already has is
             # working in no time at all; work takes time, so after a while it
@@ -739,6 +779,21 @@ class Ether(asyncio.DatagramProtocol):
             for callback in waiting:
                 callback()
         self.kick()
+
+    def resend(self, station, answered):
+        """What a station was sent after message `answered`, sent again as it
+        was, at most every RESEND_GAP_S of wall time."""
+        now = self.loop.time()
+        if now - station.resent_at < RESEND_GAP_S:
+            return
+        station.resent_at = now
+        missed = [data for seq, data in station.unanswered if seq > answered]
+        if missed:
+            self.resends += len(missed)
+            log("station %d missed %d message(s) after %d; sending them again"
+                % (station.sid, len(missed), answered))
+        for data in missed:
+            self.transport.sendto(data, station.addr)
 
     # ---- channels: input that does not come over the air -----------------
 
@@ -1102,6 +1157,10 @@ class Ether(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
 
     def datagram_received(self, data, addr):
         try:
@@ -1151,6 +1210,7 @@ class Ether(asyncio.DatagramProtocol):
         station = self.stations.get(sid)
         if station is None or self.transport is None:
             return
+        data = None
         if self.clock.virtual:
             station.seq += 1
             station.granted_at = self.loop.time()
@@ -1158,9 +1218,11 @@ class Ether(asyncio.DatagramProtocol):
             msg = dict(msg, seq=station.seq)
             msg.setdefault("t", self.clock.t)
             station.told = max(station.told, msg["t"])
+            data = json.dumps(msg).encode("utf-8")
+            station.unanswered.append((station.seq, data))
         if msg.get("type") != "run":
             self.write_record("out", sid, msg)
-        self.transport.sendto(json.dumps(msg).encode("utf-8"), station.addr)
+        self.transport.sendto(data or json.dumps(msg).encode("utf-8"), station.addr)
 
     def stamp(self):
         """What heads a record line: the wall clock, or T in a virtual run."""

@@ -260,6 +260,34 @@ def test_a_run_reaching_a_model_timer_fires_it(virtual):
     pin  # held
 
 
+def test_the_link_survives_a_lost_datagram_either_way(virtual):
+    lib, cond = virtual
+    seq = join(lib, cond)
+    first = idle(lib, cond)
+    # An idle the ether never heard: said again, a quarter second of wall on.
+    started = time.monotonic()
+    assert cond.expect("idle", timeout=1.0) == first
+    assert 0.2 <= time.monotonic() - started < 0.6
+
+    def raw(n, t):
+        cond.sock.sendto(json.dumps({"type": "run", "t": t, "seq": n}).encode(), cond.station)
+
+    # A message the station never got: the next waits, T stays, and an idle
+    # for the last one applied asks for it.
+    raw(seq + 2, T_JOIN + 2000)
+    asked = cond.expect("idle", timeout=1.0)
+    assert asked["seq"] == seq and lib.simradio_node_us() == T_JOIN
+    # Sent again, in order: applied once each.
+    raw(seq + 1, T_JOIN + 1000)
+    assert cond.expect("idle", timeout=1.0)["seq"] == seq + 1
+    raw(seq + 2, T_JOIN + 2000)
+    assert cond.expect("idle", timeout=1.0)["seq"] == seq + 2
+    assert lib.simradio_node_us() == T_JOIN + 2000
+    raw(seq + 1, T_JOIN + 1000)                     # a duplicate: nothing moves back
+    time.sleep(0.05)
+    assert lib.simradio_node_us() == T_JOIN + 2000
+
+
 def test_a_busy_station_reports_idle_anyway(virtual):
     lib, cond = virtual
     seq = join(lib, cond)

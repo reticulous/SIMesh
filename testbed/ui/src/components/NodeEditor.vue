@@ -20,7 +20,8 @@
     <template v-if="one?.live">
       <div class="ed-live">
         <div><span>status</span><b :class="'st-' + one.status">{{ one.status }}</b></div>
-        <div><span>device</span><b>{{ one.deviceName ?? one.device }}</b></div>
+        <div><span>firmware</span><b :class="{ 'ed-none': !one.firmware }">{{
+          one.firmware ? (one.deviceName ?? one.firmware) : 'none: no firmware() rule names it' }}</b></div>
         <div><span>role</span><b>{{ one.liveRole ?? '—' }}</b></div>
         <div><span>radio</span><b>{{ liveRadio }}</b></div>
         <div v-if="one.stale"><span>losses</span><b class="ed-stale">moved: its row is being recomputed</b></div>
@@ -42,14 +43,37 @@
     </template>
 
     <div class="ed-body">
+      <div class="ed-sub">Radio</div>
       <div class="ed-row">
-        <q-select :model-value="common(n => n.device) ?? null" :options="deviceOptions" dense outlined
-                  label="device" class="col" emit-value map-options use-input new-value-mode="add-unique"
-                  hide-dropdown-icon :placeholder="differs(n => n.device) ? MULTI : ''"
-                  @update:model-value="(v: string) => v && set({ device: v })" />
+        <q-input :model-value="common(n => n.max_dbm ?? null) ?? ''"
+                 :placeholder="differs(n => n.max_dbm ?? null) ? MULTI : String(CHIP_MAX_DBM)"
+                 type="number" step="any" :min="CHIP_MIN_DBM" :max="FEM_MAX_DBM"
+                 dense outlined clearable label="max power (dBm)" class="col"
+                 :hint="powerHint"
+                 @change="(v: string | number | null) => setMaxDbm(v)"
+                 @clear="setMaxDbm(null)" />
       </div>
-
       <div class="ed-sub">Antenna</div>
+      <div class="ed-row">
+        <q-select :model-value="common(n => n.antenna.type) ?? null" :options="antennaOptions" dense outlined
+                  label="antenna" class="col" emit-value map-options
+                  :placeholder="differs(n => n.antenna.type) ? MULTI : ''"
+                  @update:model-value="(v: string) => v && setAntennaType(v)">
+          <template #option="scope">
+            <q-item v-bind="scope.itemProps">
+              <q-item-section avatar><div class="ed-pic" v-html="scope.opt.svg" /></q-item-section>
+              <q-item-section>
+                <q-item-label>{{ scope.opt.label }}</q-item-label>
+                <q-item-label caption>{{ scope.opt.caption }}</q-item-label>
+              </q-item-section>
+            </q-item>
+          </template>
+        </q-select>
+      </div>
+      <AimDial v-if="directional && beam" :azimuth="picked[0]!.antenna.azimuth_deg ?? 0"
+               :elevation="picked[0]!.antenna.elevation_deg ?? 0" :hbw="beam.hbw_deg ?? 60" :vbw="beam.vbw_deg"
+               :mixed="{ az: differs(n => n.antenna.azimuth_deg ?? 0), el: differs(n => n.antenna.elevation_deg ?? 0) }"
+               @aim="aim" />
       <div v-if="one" class="ed-row">
         <q-input :model-value="round(one.lat, 7)" type="number" step="any" dense outlined label="latitude"
                  class="col" @change="(v: string | number | null) => set({ lat: Number(v) })" />
@@ -74,10 +98,6 @@
           </a>
           <span v-if="terrainShown === null" class="ed-dim">…</span>
         </div>
-        <q-input :model-value="common(n => n.antenna.gain_dbi) ?? ''"
-                 :placeholder="differs(n => n.antenna.gain_dbi) ? MULTI : ''" type="number" step="any"
-                 dense outlined label="gain (dBi)" class="ed-gain"
-                 @change="(v: string | number | null) => v !== '' && set({ gain_dbi: Number(v) })" />
       </div>
       <div class="ed-dim">All heights above sea level.</div>
 
@@ -127,6 +147,8 @@ import { useSim } from '../stores/sim'
 import { useGeodata } from '../stores/geodata'
 import { useCatalog } from '../stores/catalog'
 import { placeAt, type Place } from '../lib/roof'
+import AimDial from './AimDial.vue'
+import { CHIP_MAX_DBM, CHIP_MIN_DBM, FEM_MAX_DBM } from '../lib/boards'
 
 defineEmits<{
   inspect: [other: string]; remove: [names: string[]]
@@ -154,11 +176,42 @@ function common<T>(get: (n: NodeView) => T): T | undefined {
 }
 function differs<T>(get: (n: NodeView) => T): boolean { return picked.value.length > 1 && common(get) === undefined }
 
-const deviceOptions = computed(() => {
-  const opts = catalog.deviceChoices()
-  for (const n of picked.value) if (!opts.some(o => o.value === n.device)) opts.push({ value: n.device, label: n.device })
-  return opts
-})
+void catalog.ensureAntennas()
+const antennaOptions = computed(() => catalog.antennas.map(a => ({
+  value: a.type, label: `${a.label}, ${a.peak_dbi > 0 ? '+' : ''}${a.peak_dbi} dBi`,
+  caption: a.description, svg: a.svg ?? '',
+})))
+/** Whether every selected node's antenna is aimed: then its aim is edited here. */
+const directional = computed(() => picked.value.length > 0 && picked.value.every(
+  n => catalog.antennaByType[n.antenna.type]?.kind === 'directional'))
+
+/** What the maximum power means: an SX1262 on its own, or behind a front end above 22 dBm. */
+const powerHint = `an SX1262, ${CHIP_MAX_DBM} dBm when empty; above ${CHIP_MAX_DBM} dBm the node has `
+  + `a GC1109 front end as a Heltec V4 does, up to ${FEM_MAX_DBM}`
+
+/** The maximum power at the antenna connector on every selected node; empty clears it. */
+function setMaxDbm(raw: string | number | null) {
+  const v = raw === '' || raw === null ? null : Number(raw)
+  if (v !== null && (!Number.isFinite(v) || v < CHIP_MIN_DBM || v > FEM_MAX_DBM)) return
+  nodes.setMany(names.value, { max_dbm: v })
+}
+
+/** The first selected node's pattern, whose beam the aim dials draw. */
+const beam = computed(() => (picked.value[0] ? catalog.antennaByType[picked.value[0].antenna.type] : undefined))
+
+/** A new type on every selected node; a directional one keeps an aim it had. */
+function setAntennaType(type: string) {
+  for (const n of picked.value) {
+    const aimed = catalog.antennaByType[type]?.kind === 'directional'
+    nodes.setMany([n.name], { antenna: aimed
+      ? { type, azimuth_deg: n.antenna.azimuth_deg ?? 0, elevation_deg: n.antenna.elevation_deg ?? 0 }
+      : { type } })
+  }
+}
+/** One figure of the aim on every selected node, each keeping the other. */
+function aim(change: { azimuth_deg?: number; elevation_deg?: number }) {
+  for (const n of picked.value) nodes.setMany([n.name], { antenna: { ...n.antenna, ...change } })
+}
 const myOffsets = computed(() => nodes.offsets.filter(o => one.value && o.between.includes(one.value.name)))
 const tagCounts = computed<[string, number][]>(() => {
   const count = new Map<string, number>()
@@ -283,7 +336,9 @@ function addTag() {
 .ed-x { font-size: 18px; line-height: 1; color: #9ca3af; }
 .ed-body { padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
 .ed-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.ed-gain { width: 90px; }
+.ed-pic { width: 28px; height: 28px; color: #cbd5e1; }
+.ed-pic :deep(svg) { width: 100%; height: 100%; }
+.ed-none { color: #f59e0b; font-family: inherit; }
 .ed-height { align-items: flex-start; flex-wrap: nowrap; }
 .ed-height-in { width: 140px; }
 .ed-height-in :deep(.q-field__messages) { white-space: nowrap; }

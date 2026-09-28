@@ -14,7 +14,7 @@
 #   - Node 22 and npm (the page's Quasar/Vite build; Vite needs a newer Node
 #     than Ubuntu ships)
 #   - gcc, g++, make and cmake (the chip library and the time shim)
-#   - cargo via rustup, with the wasm32 target (the planner, the berlinmesh
+#   - cargo via rustup, with the wasm32 target (the planner, the sergeyculum
 #     kind)
 #   - the station runtime: libstdc++, zlib, libbsd
 FROM ubuntu:24.04

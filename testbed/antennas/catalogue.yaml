@@ -1,0 +1,143 @@
+# The antennas a node can carry: generic representatives of each kind at 868 MHz.
+#
+# Each is a pattern, gain in dBi by direction, from a handful of figures
+# (antennas.py says how they combine):
+#
+#   peak_dbi   gain on the main lobe, the kind's typical efficiency folded in
+#   vbw_deg    vertical half-power beamwidth
+#   tilt_deg   how far above the horizon the main lobe points, for an omni
+#              whose small or drooping ground plane lifts it
+#   hbw_deg    horizontal half-power beamwidth (directional only)
+#   floor_db   the most the pattern falls below its peak: side lobes, the
+#              back, and what the case and the hand fill in
+#
+# A directional antenna is aimed by its node (azimuth and elevation); an
+# omni is the same all round and needs no aiming.
+
+wire_quarter_wave:
+  label: Quarter-wave wire
+  description: Bare ~8.2 cm wire soldered to the RF pad, the classic DIY node antenna
+  kind: omni
+  peak_dbi: 1.0
+  vbw_deg: 80
+  tilt_deg: 10
+  floor_db: 15
+
+spring_helical:
+  label: Spring helical
+  description: Small coiled spring antenna soldered to the board, common on compact modules
+  kind: omni
+  peak_dbi: -4.0
+  vbw_deg: 90
+  tilt_deg: 5
+  floor_db: 12
+
+whip_sma_quarter_wave:
+  label: SMA whip, quarter wave
+  description: External straight or hinged whip on SMA/RP-SMA, the typical dev-board antenna
+  kind: omni
+  peak_dbi: 2.0
+  vbw_deg: 75
+  tilt_deg: 10
+  floor_db: 18
+
+whip_sma_half_wave:
+  label: SMA whip, half wave
+  description: Longer external half-wave whip (often sleeve-dipole style), a bit more gain and less ground-plane dependence
+  kind: omni
+  peak_dbi: 2.15
+  vbw_deg: 78
+  tilt_deg: 0
+  floor_db: 20
+
+rubber_duck:
+  label: Rubber duck
+  description: Enclosed flexible helical/whip, shorter than a full whip, lower efficiency
+  kind: omni
+  peak_dbi: 0.0
+  vbw_deg: 80
+  tilt_deg: 0
+  floor_db: 15
+
+pcb_meander_monopole:
+  label: PCB meander monopole
+  description: Meandered trace antenna on the board itself
+  kind: omni
+  peak_dbi: -3.0
+  vbw_deg: 100
+  tilt_deg: 0
+  floor_db: 10
+
+pcb_inverted_f:
+  label: PCB inverted-F
+  description: IFA trace antenna on the board
+  kind: omni
+  peak_dbi: -1.0
+  vbw_deg: 100
+  tilt_deg: 0
+  floor_db: 10
+
+ceramic_chip:
+  label: Ceramic chip
+  description: SMD chip antenna needing a matching network and keep-out area
+  kind: omni
+  peak_dbi: -4.0
+  vbw_deg: 110
+  tilt_deg: 0
+  floor_db: 8
+
+fpc_adhesive:
+  label: Flexible adhesive (FPC)
+  description: Flexible printed antenna stuck inside an enclosure, usually on a U.FL pigtail
+  kind: omni
+  peak_dbi: 1.0
+  vbw_deg: 90
+  tilt_deg: 0
+  floor_db: 12
+
+ground_plane_radials:
+  label: Ground plane with radials
+  description: Quarter-wave vertical with drooping radials, often used for fixed nodes or cheap gateways
+  kind: omni
+  peak_dbi: 2.5
+  vbw_deg: 70
+  tilt_deg: 0
+  floor_db: 20
+
+fiberglass_collinear:
+  label: Fibreglass collinear
+  description: Outdoor omni gateway antenna, typically 3 to 8 dBi, N-type connector
+  kind: omni
+  peak_dbi: 6.0
+  vbw_deg: 18
+  tilt_deg: 0
+  floor_db: 15
+
+magnetic_mount_whip:
+  label: Magnetic-mount whip
+  description: Vehicle or metal-surface mount for mobile trackers
+  kind: omni
+  peak_dbi: 3.0
+  vbw_deg: 50
+  tilt_deg: 5
+  floor_db: 18
+
+panel_directional:
+  label: Panel
+  description: Flat patch/panel for sectorised gateway coverage
+  kind: directional
+  peak_dbi: 9.0
+  hbw_deg: 65
+  vbw_deg: 60
+  tilt_deg: 0
+  floor_db: 20
+
+yagi_directional:
+  label: Yagi
+  description: Yagi for long point-to-point links or reaching a distant gateway
+  kind: directional
+  peak_dbi: 11.0
+  hbw_deg: 45
+  vbw_deg: 50
+  tilt_deg: 0
+  floor_db: 18

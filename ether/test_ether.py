@@ -926,10 +926,36 @@ def test_a_stale_idle_does_not_count(conductor):
     idle(b, 1, None)
     idle(a, 1, 5_000)
     assert a.expect("run")["seq"] == 2
-    idle(a, 1, 6_000)                           # an answer to the last grant, not this one
+    # An answer to the last grant, not this one: it does not count. Once is
+    # an idle crossing the run on the wire; said again, the station missed
+    # what came after it, which is sent again as it was.
+    idle(a, 1, 6_000)
     a.expect_nothing(0.3)
+    idle(a, 1, 6_000)
+    assert a.expect("run") == {"type": "run", "seq": 2, "t": 5_000}
     idle(a, 2, 6_000)
     assert a.expect("run")["t"] == 6_000
+
+
+def test_an_idle_said_twice_counts_once(conductor):
+    a, b = conductor(1), conductor(2)
+    join_virtual(a)
+    join_virtual(b)
+    idle(b, 1, None)
+    idle(a, 1, 5_000)
+    assert a.expect("run")["seq"] == 2
+    idle(a, 2, 6_000)
+    run = a.expect("run")
+    assert run == {"type": "run", "seq": 3, "t": 6_000}
+    # Said once more after the run went out: that run crossed it, nothing
+    # is sent; said yet again, the run was lost, and goes once more, and
+    # never a new grant.
+    idle(a, 2, 6_000)
+    a.expect_nothing(0.2)
+    idle(a, 2, 6_000)
+    assert a.expect("run") == run
+    idle(a, 2, 6_000)                           # within the resend gap: nothing
+    a.expect_nothing(0.3)
 
 
 def test_anything_a_station_says_retracts_its_idle(conductor):

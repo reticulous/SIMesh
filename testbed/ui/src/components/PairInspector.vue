@@ -57,6 +57,7 @@ import { link, type LinkReply } from '../lib/planner'
 import { useGeodata } from '../stores/geodata'
 import { useNodes } from '../stores/nodes'
 
+/** One end of the pair; `gain_dbi` is its antenna's gain toward the other end. */
 export interface PairEnd { name: string; lat: number; lon: number; height_m: number; gain_dbi: number }
 
 const props = defineProps<{ a: PairEnd; b: PairEnd; tableCell?: string | null }>()

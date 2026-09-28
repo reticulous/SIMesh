@@ -1,0 +1,13 @@
+[package]
+name = "planner-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node and measurement importers: the MeshCore map and PotatoMesh node lists, Meshtastic rangetest.csv, sensing logs"
+
+[dependencies]
+planner-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+csv.workspace = true

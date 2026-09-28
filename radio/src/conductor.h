@@ -60,6 +60,18 @@ void granted(uint64_t seq);
  *  takes as no longer idle. */
 void spoke();
 
+/** The sequence number of the last timed message applied: the ether's next
+ *  is one more. */
+uint64_t lastSeq();
+
+/** The last idle said again, now. The link is UDP, which may lose a datagram
+ *  either way: an idle the ether never heard, or a message it sent that never
+ *  arrived, would leave each waiting on the other. So an idle is said again
+ *  every kResendNs of wall time until the ether answers, and at once when a
+ *  message arrives out of sequence; an idle for an older number tells the
+ *  ether what this station missed, which it sends again. */
+void resendIdle();
+
 /* ---- The host's side ---- */
 
 int  wakeCreate(void (*due)(void*), void* arg);

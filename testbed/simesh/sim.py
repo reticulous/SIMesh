@@ -1,31 +1,21 @@
-"""A driver's hold on one running simulation: the stations, the clock, and
-what to do with them.
+"""The hold on one running simulation that the script library runs on
+(simesh.library, which a script uses; this is async, on the library's own
+loop): the stations, the clock, and what to do with them.
 
 ```
-driver ── ws /ws?sim=<name>&quiet=1 ─────────────────────► front ─► that simulation's simd
-simd ── snapshot {nodes, clock, …} ─────────────────────► driver   the stations, T
-driver ── meta {verb: announce, tag: lora, stagger: 300, id: 7} ─► simd
-simd ── command_result {id: 7, results: {name: reply}, t} ─► driver
+library ── ws /ws?sim=<name>&quiet=1 ────────────────────► front ─► that simulation's simd
+simd ── snapshot {nodes, clock, …} ─────────────────────► library   the stations, T
+library ── meta {verb: announce, names: [..], stagger: 300, id: 7} ─► simd
+simd ── command_result {id: 7, results: {name: reply}, t} ─► library
+library ── firmware | first_boot {rules, id} ─────────────► simd
 ```
 
-    import simesh
-
-    async def main(sim):
-        sim.plan(("warm", 900), ("traffic", 4500))
-        await sim.all_up()
-        await sim.nodes(tag="lora").announce(spread=300)
-        await sim.until(900)
-        for a, b in sim.pairs(sample=200, seed=17):
-            await sim.node(a).message(b, "hello", after=sim.rng.uniform(0, 3600))
-        await sim.until(4500)
-        await sim.snapshot("mitte7-1h")
-
-**Time** is the run's own: `sim.run_s` is seconds since the driver attached
+**Time** is the run's own: `sim.run_s` is seconds since the hold began
 (or since the load it asked for), and `until`, `after` and `spread` are
 seconds of it, so a real-time and a virtual-time run act at the same
 instants of the run.
 
-**A selection** is some of the stations: `sim.nodes(tag=, device=, kind=,
+**A selection** is some of the stations: `sim.nodes(tag=, firmware=, kind=,
 role=, names=)`, or `sim.node(name)` for one. What is done to a selection is
 done to each member that is up, spread over `spread` seconds and held back
 `after` seconds, and answers {name: reply}:
@@ -38,9 +28,9 @@ done to each member that is up, spread over `spread` seconds and held back
   that cannot say one answers `! …` for that station;
 - `reset()`, `factory_reset()`: pressed on each.
 
-`attach(name)` holds a running simulation; `start(geodata, nodeset, …)`
-asks the front for a new one and holds it. The runner (simesh.runner) hands
-a script's `main` the simulation it was run on.
+`attach(name)` holds a running simulation; `start(geodata, nodesets, …)`
+asks the front for a new one, with its time and its firmware and first-boot
+rules, and holds it.
 """
 
 import asyncio
@@ -70,12 +60,23 @@ class Station:
         self.name = msg["name"]
         self.id = msg.get("id")
         self.tags = list(msg.get("tags") or ())
-        self.device = msg.get("device")
+        self.firmware = msg.get("firmware")
         self.kind = msg.get("kind")
-        self.role = msg.get("role") or msg.get("declared_role")
-        self.radio = dict(msg.get("declared_radio") or {})
+        # What it reports, else its role tag (nodeset.tag_role).
+        self.role = msg.get("role") or next(
+            (t for t in self.tags if t in ("transport", "router", "repeater")), None)
         self.lat, self.lon = msg.get("lat"), msg.get("lon")
+        self.height_m = msg.get("height_m")
+        self.antenna = (msg.get("antenna") or {}).get("type")
+        self.max_dbm = msg.get("max_dbm")
         self.status = msg.get("status")
+
+    def facts(self):
+        """What a selection (simesh.select) can ask of it."""
+        return {"name": self.name, "id": self.id, "tags": self.tags, "firmware": self.firmware,
+                "kind": self.kind, "role": self.role, "antenna": self.antenna,
+                "max_dbm": self.max_dbm, "lat": self.lat,
+                "lon": self.lon, "height_m": self.height_m, "status": self.status}
 
     def __repr__(self):
         return "<station %s #%s %s %s>" % (self.name, self.id, self.kind, self.status)
@@ -160,6 +161,7 @@ class Sim:
         self.result = {"clock": []}      # what a driver that keeps a record reads
         self.errors = collections.deque(maxlen=50)
         self.reader = None
+        self.firmware_tasks = []         # firmware said and not yet awaited
 
     # ---- the stream ------------------------------------------------------
 
@@ -239,13 +241,13 @@ class Sim:
 
     # ---- choosing --------------------------------------------------------
 
-    def nodes(self, tag=None, device=None, kind=None, role=None, names=None):
+    def nodes(self, tag=None, firmware=None, kind=None, role=None, names=None):
         """The stations with every one of these that is given, in id order."""
         chosen = []
         for s in sorted(self.stations.values(), key=lambda s: s.id or 0):
             if tag is not None and tag not in s.tags:
                 continue
-            if device is not None and s.device != device:
+            if firmware is not None and s.firmware != firmware:
                 continue
             if kind is not None and s.kind != kind:
                 continue
@@ -260,6 +262,59 @@ class Sim:
         if name not in self.stations:
             raise SimError("no station called %s" % name)
         return Selection(self, [name])
+
+    def facts(self):
+        """Every station's facts, for a selection (simesh.select): {name: facts}."""
+        return {name: s.facts() for name, s in self.stations.items()}
+
+    # ---- firmware --------------------------------------------------------
+
+    def firmware(self, rules):
+        """Firmware rules said to the simulation, [{which, firmware}]: a task
+        to await, which everything that needs a station up awaits first."""
+        task = asyncio.ensure_future(self._firmware(rules))
+        self.firmware_tasks.append(task)
+        return task
+
+    async def _firmware(self, rules):
+        return await self._rules("firmware", rules)
+
+    async def first_boot(self, rules):
+        """First-boot rules said to the simulation, [{which, lines}]: kept
+        with the run, for every station that boots with no state from now on."""
+        return await self._rules("first_boot", rules)
+
+    async def _rules(self, verb, rules):
+        ident = next(self.ids)
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiting[ident] = waiter
+        await self.send({"type": verb, "rules": list(rules), "id": ident})
+        reply = await waiter
+        if reply.get("error"):
+            raise SimError(reply["error"])
+        return reply.get("results") or {}
+
+    async def ready(self, selection, timeout=None):
+        """The names of a selection's stations once every one is up, after
+        any firmware said is in. A station that runs nothing is refused: it
+        needs firmware() first."""
+        if self.firmware_tasks:
+            tasks, self.firmware_tasks = self.firmware_tasks, []
+            await asyncio.gather(*tasks)
+        names = selection.pick(self.facts())
+        bare = [n for n in names if not self.stations[n].firmware]
+        if bare:
+            raise SimError("%s run%s no firmware: say firmware() for %s first"
+                           % (", ".join(bare), "s" if len(bare) == 1 else "",
+                              "it" if len(bare) == 1 else "them"))
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while any(self.stations[n].status != "up" for n in names if n in self.stations):
+            if deadline is not None and loop.time() > deadline:
+                raise SimError("not up after %.0f s: %s" % (timeout, ", ".join(
+                    n for n in names if self.stations[n].status != "up")))
+            await asyncio.sleep(0.2)
+        return [n for n in names if n in self.stations]
 
     def pairs(self, selection=None, sample=None, seed=None):
         """Ordered pairs of distinct stations (of `selection`, else all), each
@@ -286,6 +341,21 @@ class Sim:
             msg["kind"] = kind
         await self.send(msg)
         return (await waiter)["results"]
+
+    async def sequence(self, steps, names, after=0.0):
+        """Several commands and intents on the named stations, one after the
+        other at one T inside simd: ([{name: reply}], one per step; the T in
+        µs they were done at). Each step is a `command` ({type, line}) or a
+        `meta` ({type, verb, args})."""
+        ident = next(self.ids)
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiting[ident] = waiter
+        msg = {"type": "sequence", "steps": list(steps), "id": ident, "names": list(names)}
+        if after:
+            msg["after"] = float(after)
+        await self.send(msg)
+        reply = await waiter
+        return reply["results"], reply.get("t")
 
     async def command(self, line, name=None, after=0.0, stagger=0.0, kind=None):
         """One line on one station, or on every station of `kind`: the whole
@@ -364,13 +434,18 @@ async def attach(name=None, port=None, session=None):
     return sim
 
 
-async def start(geodata, nodeset, script=None, time="real", name=None, build=None, port=None,
-                session=None):
-    """A new simulation from geodata and a nodeset (and a script's setup),
-    started by the front and held."""
+async def start(geodata, nodesets, script=None, time="real", name=None, build=None,
+                firmware_rules=None, first_boot_rules=None, port=None, session=None):
+    """A new simulation from geodata and one or more nodesets (several are
+    merged), its firmware and first-boot rules given from the start, started
+    by the front and held. `script` is the name of the script it keeps a
+    copy of."""
     port = port or DEFAULT_PORT
     session = session or aiohttp.ClientSession()
-    msg = {"type": "sim_new", "geodata": geodata, "nodeset": nodeset, "time": time}
+    layers = [nodesets] if isinstance(nodesets, str) else list(nodesets)
+    msg = {"type": "sim_new", "geodata": geodata, "nodesets": layers, "time": time,
+           "firmware_rules": list(firmware_rules or []),
+           "first_boot_rules": list(first_boot_rules or [])}
     for key, value in (("script", script), ("name", name), ("build", build)):
         if value:
             msg[key] = value

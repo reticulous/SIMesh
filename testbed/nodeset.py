@@ -1,31 +1,36 @@
-"""A nodeset: which nodes stand where, what they run, and how they are set.
+"""A nodeset: which nodes stand where, with what antenna, and what they are.
 
     testbed/nodesets/<name>.yaml
+    testbed/nodesets/<name>.py        its own setup, when it has one (script.py)
 
     nodes:
       gw-alex: { id: 1, lat: 52.5219, lon: 13.4132, height_m: 38, height_from: roof,
-                 antenna: { gain_dbi: 5 }, device: stable, role: transport,
-                 radio: { freq_mhz: 869.525, sf: 8, bw_khz: 125, cr: 5, tx_dbm: 14 },
-                 tags: [gateway] }
+                 max_dbm: 27,
+                 antenna: { type: panel_directional, azimuth_deg: 120, elevation_deg: -2 },
+                 tags: [transport, gateway] }
       n017: { id: 2, lat: 52.5301, lon: 13.4018, height_m: 15, height_from: assumed,
-              antenna: { gain_dbi: 2 }, device: dev, tags: [rooftop] }
+              antenna: { type: whip_sma_quarter_wave }, tags: [rooftop] }
     offsets:
       - { between: [gw-alex, n017], db: 40, note: "wall, measured 2026-09-20" }
 
 A node is its position, its antenna's height above the ground under it and
 where that figure came from (`measured`, `roof`, `raster`, `assumed`), its
-antenna gain, its tags, and three **declared settings** the page and the
-medium read without running anything:
+maximum power (`max_dbm`, dBm at the antenna connector, 22 when absent and
+at most 27; above 22 the node has a front end, boards.py), its antenna
+(antennas.py: a type of the catalogue, and a directional one's aim), and its
+tags. A node has no board: every node is the one board boards.py
+describes. Nothing in it is said to a station: scripts say everything, in
+the node's terms, keyed off its tags.
+Two tags mean something to the page and the analysis as well:
 
-- `device`: what it runs, a device reference (devices.py): a catalogue
-  (`stable`, `dev`), a package, a stamp, a local device or a path;
-- `role`: `transport` or `client`, or absent for the firmware's own default;
-- `radio`: slot 0's carrier, spreading factor, bandwidth, coding rate,
-  transmit power, and optionally sync word and preamble; absent, the radio
-  is left as the firmware starts it.
+- a role's name (`transport`, `router`, `repeater`) is the node's role
+  (`tag_role`), which the startup script tells it and the map rings;
+- `no-radio` is a node with no radio: the startup script sets up every
+  other node's, to globals.py's settings, and the page draws coverage and
+  links for those alone.
 
-The declared settings are applied at setup, in the device's own language, by
-its kind (kinds.Kind.declared), before any script's `setup`.
+What a node runs is not the nodeset's either: a script says it
+(`firmware()`), so one nodeset is run on any firmware.
 
 A nodeset names no geodata. It is offered on every geodata whose extent holds
 one of its nodes (`inside`); synthetic ground lies at 0°, 0°.
@@ -47,22 +52,24 @@ import copy
 import csv
 import hashlib
 import json
+import math
 import os
 
 import yaml
 
+import antennas as antennas_module
+import boards as boards_module
 import stations as stations_module
 import store
 
 HEIGHT_FROM = ("measured", "roof", "raster", "assumed")
-ROLES = ("transport", "client")
+# The tags that are a role: a node carrying one forwards for the others.
+ROLE_TAGS = ("transport", "router", "repeater")
+NO_RADIO = "no-radio"
 DEFAULT_HEIGHT_M = 2.0
-DEFAULT_DEVICE = "stable"
-# The radio's keys, in the order the file spells them, and what each one is.
-RADIO_KEYS = (("freq_mhz", float), ("sf", int), ("bw_khz", float), ("cr", int),
-              ("tx_dbm", float), ("sync", int), ("preamble", int))
-# The calling channel of the EU 868 plan at SF8, 125 kHz, 14 dBm.
-DEFAULT_RADIO = {"freq_mhz": 869.525, "sf": 8, "bw_khz": 125.0, "cr": 5, "tx_dbm": 14.0}
+MERGE_WITHIN_M = 5.0                # two layers' nodes this close are one node
+EARTH_RADIUS_M = 6371008.8
+KEEP = object()                     # set_node: a fact not given, left as it is
 
 
 def nodeset_path(name):
@@ -79,48 +86,29 @@ def blank():
 
 
 def node_record(node_id, lat, lon, height_m=DEFAULT_HEIGHT_M, height_from="assumed",
-                gain_dbi=0.0, device=DEFAULT_DEVICE, role=None, radio=None, tags=()):
-    """One node, in the shape the file and every caller use."""
-    return {"id": int(node_id), "lat": float(lat), "lon": float(lon),
-            "height_m": float(height_m), "height_from": str(height_from),
-            "antenna": {"gain_dbi": float(gain_dbi)}, "device": str(device),
-            "role": role, "radio": copy.deepcopy(radio) if radio else None,
-            "tags": list(tags)}
+                antenna=None, tags=(), max_dbm=None):
+    """One node, in the shape the file and every caller use: `max_dbm` is
+    there only when the node states one."""
+    out = {"id": int(node_id), "lat": float(lat), "lon": float(lon),
+           "height_m": float(height_m), "height_from": str(height_from),
+           "antenna": antennas_module.check(antenna, "a node"),
+           "tags": list(tags)}
+    max_dbm = boards_module.check(max_dbm, "a node")
+    if max_dbm is not None:
+        out["max_dbm"] = max_dbm
+    return out
+
+
+def tag_role(tags):
+    """The role a node's tags give it, or None: the first role tag it carries."""
+    return next((tag for tag in tags if tag in ROLE_TAGS), None)
+
+
+def has_radio(node):
+    return NO_RADIO not in node["tags"]
 
 
 # ---- the file ------------------------------------------------------------
-
-def parse_radio(radio, where):
-    """A radio mapping checked: its keys known, each of its kind. None or
-    an empty mapping is no radio."""
-    if radio in (None, {}):
-        return None
-    if not isinstance(radio, dict):
-        raise store.StoreError("%s: radio is a mapping of %s"
-                               % (where, ", ".join(k for k, _ in RADIO_KEYS)))
-    known = dict(RADIO_KEYS)
-    out = {}
-    for key, value in radio.items():
-        if key not in known:
-            raise store.StoreError("%s: radio has no %r (it takes %s)"
-                                   % (where, key, ", ".join(k for k, _ in RADIO_KEYS)))
-        if value is None:
-            continue
-        try:
-            out[key] = int(value, 0) if known[key] is int and isinstance(value, str) \
-                else known[key](value)
-        except (TypeError, ValueError) as err:
-            raise store.StoreError("%s: radio %s is a number, not %r" % (where, key, value)) from err
-    return {k: out[k] for k, _ in RADIO_KEYS if k in out} or None
-
-
-def parse_role(role, where):
-    if role in (None, ""):
-        return None
-    if role not in ROLES:
-        raise store.StoreError("%s: role is one of %s, not %r" % (where, ", ".join(ROLES), role))
-    return str(role)
-
 
 def check_tags(tags):
     tags = [str(tag) for tag in (tags or [])]
@@ -160,11 +148,22 @@ def parse(data, where):
             raise store.StoreError("%s: node %s: height_from is one of %s, not %r"
                                    % (where, name, ", ".join(HEIGHT_FROM), height_from))
         here = "%s: node %s" % (where, name)
+        if "device" in node:
+            raise store.StoreError("%s: a node names no device: a script's firmware() says "
+                                   "what each node runs" % here)
+        for key in ("radio", "role"):
+            if key in node:
+                raise store.StoreError(
+                    "%s: a node declares no %s: scripts/globals.py sets every radio, a "
+                    "`no-radio` tag marks a node without one, and a role is a tag "
+                    "(transport, router, repeater)" % (here, key))
+        if "board" in node:
+            raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
+                                   "`max_dbm` is its maximum power" % here)
         out["nodes"][name] = node_record(
             node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
-            (node.get("antenna") or {}).get("gain_dbi", 0.0),
-            str(node.get("device") or DEFAULT_DEVICE), parse_role(node.get("role"), here),
-            parse_radio(node.get("radio"), here), check_tags(node.get("tags")))
+            antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
+            boards_module.check(node.get("max_dbm"), here))
     for offset in data.get("offsets") or []:
         try:
             a, b = (str(n) for n in list(offset["between"])[:2])
@@ -197,13 +196,11 @@ def read(path):
     return parse(data, path)
 
 
-def dump_radio(radio):
-    parts = []
-    for key, kind in RADIO_KEYS:
-        if key not in radio:
-            continue
-        value = radio[key]
-        parts.append("%s: %s" % (key, "0x%02x" % value if key == "sync" else store.scalar(value)))
+def dump_antenna(antenna):
+    parts = ["type: %s" % antenna["type"]]
+    for key in ("azimuth_deg", "elevation_deg"):
+        if key in antenna:
+            parts.append("%s: %s" % (key, store.scalar(antenna[key])))
     return "{ %s }" % ", ".join(parts)
 
 
@@ -212,13 +209,10 @@ def dump_node(name, node):
     parts = ["id: %d" % node["id"], "lat: %s" % store.scalar(node["lat"]),
              "lon: %s" % store.scalar(node["lon"]),
              "height_m: %s" % store.scalar(node["height_m"]),
-             "height_from: %s" % node["height_from"],
-             "antenna: { gain_dbi: %s }" % store.scalar(node["antenna"]["gain_dbi"]),
-             "device: %s" % store.scalar(node["device"])]
-    if node.get("role"):
-        parts.append("role: %s" % node["role"])
-    if node.get("radio"):
-        parts.append("radio: %s" % dump_radio(node["radio"]))
+             "height_from: %s" % node["height_from"]]
+    if node.get("max_dbm") is not None:
+        parts.append("max_dbm: %s" % store.scalar(node["max_dbm"]))
+    parts.append("antenna: %s" % dump_antenna(node["antenna"]))
     parts.append("tags: %s" % store.flow(node["tags"]))
     return "  %s: { %s }" % (name, ", ".join(parts))
 
@@ -275,12 +269,6 @@ def geometry_hash(data):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def carrier_mhz(node):
-    """A node's declared carrier in MHz, or None when it declares no radio."""
-    radio = node.get("radio") or {}
-    return radio.get("freq_mhz")
-
-
 # ---- the loaded nodeset --------------------------------------------------
 
 class Nodeset:
@@ -326,10 +314,10 @@ class Nodeset:
         return sum(o["db"] for o in self.offsets if set(o["between"]) == pair)
 
     def inside(self, bbox):
-        """Whether any node stands inside [lon0, lat0, lon1, lat1]."""
+        """How many nodes stand inside [lon0, lat0, lon1, lat1]."""
         lon0, lat0, lon1, lat1 = bbox
-        return any(lat0 <= n["lat"] <= lat1 and lon0 <= n["lon"] <= lon1
-                   for n in self.nodes.values())
+        return sum(1 for n in self.nodes.values()
+                   if lat0 <= n["lat"] <= lat1 and lon0 <= n["lon"] <= lon1)
 
     def tags(self):
         """Every tag a node carries, with how many carry it."""
@@ -396,9 +384,10 @@ class Nodeset:
         self.dirty = True
 
     def set_node(self, name, id=None, lat=None, lon=None, height_m=None, height_from=None,
-                 gain_dbi=None, device=None, role=None, radio=None, tags=None):
-        """Change any of a node's facts; None leaves one as it is. An empty
-        `role` or `radio` ("" or {}) takes it away.
+                 antenna=None, tags=None, max_dbm=KEEP):
+        """Change any of a node's facts; None leaves one as it is, except
+        `max_dbm`, which None clears (the node then sends at most 22 dBm)
+        and which is left as it is when not given.
 
         Returns True when the id changed: the station then has a new address,
         and one with state must be restarted for it to take.
@@ -423,16 +412,14 @@ class Nodeset:
             if height_from not in HEIGHT_FROM:
                 raise store.StoreError("height_from is one of %s" % ", ".join(HEIGHT_FROM))
             node["height_from"] = height_from
-        if gain_dbi is not None:
-            node["antenna"]["gain_dbi"] = float(gain_dbi)
-        if device is not None:
-            if not str(device).strip():
-                raise store.StoreError("a node's device is a device reference, not empty")
-            node["device"] = str(device).strip()
-        if role is not None:
-            node["role"] = parse_role(role, "node %s" % name)
-        if radio is not None:
-            node["radio"] = parse_radio(radio, "node %s" % name)
+        if antenna is not None:
+            node["antenna"] = antennas_module.check(antenna, "node %s" % name)
+        if max_dbm is not KEEP:
+            max_dbm = boards_module.check(max_dbm, "node %s" % name)
+            if max_dbm is None:
+                node.pop("max_dbm", None)
+            else:
+                node["max_dbm"] = max_dbm
         if tags is not None:
             node["tags"] = check_tags(tags)
         self.dirty = True
@@ -500,6 +487,17 @@ def create(name):
     return ns
 
 
+def delete(name):
+    """A nodeset gone, with its own setup script (`nodesets/<name>.py`)."""
+    path = nodeset_path(name)
+    if not os.path.isfile(path):
+        raise store.StoreError("no nodeset called %r" % name)
+    os.remove(path)
+    setup = os.path.splitext(path)[0] + ".py"
+    if os.path.isfile(setup):
+        os.remove(setup)
+
+
 def summary(name):
     """What a listing says of one nodeset: its node count, extent and tags."""
     ns = load(name)
@@ -508,6 +506,70 @@ def summary(name):
     return {"name": name, "nodes": len(ns.nodes),
             "bbox": [min(lons), min(lats), max(lons), max(lats)] if lats else None,
             "tags": ns.tags()}
+
+
+def unique_name(base, taken):
+    """`base`, or `base-2`, `base-3`… cut to a name's length, whichever
+    `taken` does not hold."""
+    name = base[:32].rstrip("-")
+    suffix = 2
+    while name in taken:
+        tail = "-%d" % suffix
+        name = base[:32 - len(tail)].rstrip("-") + tail
+        suffix += 1
+    return name
+
+
+def lowest_free_id(taken):
+    node_id = 1
+    while node_id in taken:
+        node_id += 1
+    return node_id
+
+
+def distance_m(a, b):
+    """Metres between two nodes, on a sphere of the Earth's mean radius:
+    at the few metres merging asks about, the ellipsoid changes nothing."""
+    lat1, lon1, lat2, lon2 = (math.radians(v) for v in (a["lat"], a["lon"], b["lat"], b["lon"]))
+    return EARTH_RADIUS_M * math.hypot((lon2 - lon1) * math.cos((lat1 + lat2) / 2), lat2 - lat1)
+
+
+def merge(layers):
+    """Nodesets shown together as one, as Save visible as writes it.
+
+    `layers` is [(layer name, file mapping)], the top of the Layers panel
+    first. One layer is its own mapping unchanged. Of several, every node
+    keeps its tags and gains its layer's name as one; a node within
+    MERGE_WITHIN_M of a node of an earlier layer is that node, the earlier
+    layer's, and is left out; a name an earlier layer took gets the layer's
+    name appended (and a number, should that be taken too); an id taken gets
+    the lowest free one. An offset comes along where both its ends do.
+    """
+    layers = [(layer, parse(data, "layer %s" % layer)) for layer, data in layers]
+    if len(layers) == 1:
+        return layers[0][1]
+    out = blank()
+    ids = set()
+    for layer, data in layers:
+        earlier = list(out["nodes"].values())
+        renamed = {}
+        for name, node in sorted(data["nodes"].items(), key=lambda item: item[1]["id"]):
+            if any(distance_m(node, other) <= MERGE_WITHIN_M for other in earlier):
+                continue
+            new = name if name not in out["nodes"] else unique_name("%s-%s" % (name, layer),
+                                                                    out["nodes"])
+            node = copy.deepcopy(node)
+            if node["id"] in ids:
+                node["id"] = lowest_free_id(ids)
+            node["tags"] = check_tags(node["tags"] + [layer])
+            out["nodes"][new] = node
+            ids.add(node["id"])
+            renamed[name] = new
+        for offset in data["offsets"]:
+            a, b = offset["between"]
+            if a in renamed and b in renamed:
+                out["offsets"].append(dict(copy.deepcopy(offset), between=[renamed[a], renamed[b]]))
+    return out
 
 
 # ---- imports -------------------------------------------------------------
@@ -531,20 +593,19 @@ def _number(text):
         return None
 
 
-def _radio_with(power):
-    """The default radio, at a transmit power a CSV stated."""
-    if power is None:
-        return copy.deepcopy(DEFAULT_RADIO)
-    return dict(DEFAULT_RADIO, tx_dbm=float(power))
+def _board_at(power):
+    """The maximum power of a node whose CSV row states a transmit power:
+    that power, held to the range the board has."""
+    return None if power is None else \
+        max(float(boards_module.CHIP_DBM[0]), min(float(power), float(boards_module.FEM_MAX_DBM)))
 
 
-def import_sites_csv(path, height_m=DEFAULT_HEIGHT_M, device=DEFAULT_DEVICE, prefix="site"):
+def import_sites_csv(path, height_m=DEFAULT_HEIGHT_M, prefix="site"):
     """The planner optimiser's `sites.csv` as a nodeset.
 
     Columns `lat, lon, tx_power_dbm, surface_masl, cs_neighbours`. The file
     has no antenna height, so every site gets `height_m`, marked assumed.
-    Every node gets the default radio, at the file's transmit power where it
-    states one.
+    A transmit power the file states is the node's maximum power.
     """
     data = blank()
     for index, row in enumerate(_rows(path), 1):
@@ -553,20 +614,44 @@ def import_sites_csv(path, height_m=DEFAULT_HEIGHT_M, device=DEFAULT_DEVICE, pre
             continue
         name = "%s-%03d" % (prefix, index)
         data["nodes"][name] = node_record(
-            len(data["nodes"]) + 1, lat, lon, height_m, "assumed", 0.0, device,
-            radio=_radio_with(_number(row.get("tx_power_dbm"))))
+            len(data["nodes"]) + 1, lat, lon, height_m, "assumed",
+            max_dbm=_board_at(_number(row.get("tx_power_dbm"))))
     return data
 
 
-def import_nodes_csv(path, height_m=15.0, device=DEFAULT_DEVICE):
+def from_imported(rows, source, height_m=15.0):
+    """Nodes `planner-job nodes-import` read from a public node map, as a
+    nodeset.
+
+    Each row is {label, lat, lon, kind, position, height_m?}. A node is named
+    after its label, made usable and unique, else `<source>-<n>`; it
+    stands at the row's height where the source gives one
+    (measured) and else at `height_m` (assumed), and is tagged with the source, its kind and its position's quality
+    (`position-gps`, `position-fixed`, …).
+    """
+    data = blank()
+    for row in rows:
+        node_id = len(data["nodes"]) + 1
+        name = unique_name(store.slug(row.get("label"), "%s-%d" % (source, node_id)), data["nodes"])
+        height = row.get("height_m")
+        tags = [source, store.slug(row.get("kind"), ""),
+                store.slug("position-%s" % row.get("position"), "") if row.get("position") else ""]
+        data["nodes"][name] = node_record(
+            node_id, row["lat"], row["lon"], height if height is not None else height_m,
+            "measured" if height is not None else "assumed",
+            tags=check_tags(t for t in tags if t))
+    return data
+
+
+def import_nodes_csv(path, height_m=15.0):
     """The deployed-network CSV `planner nodes import` writes, as a nodeset.
 
     Header `id, name, kind, lat, lon, height_agl_m, tx_power_dbm,
     last_seen_unix`. A node is named after its own label, made usable (lower
     case, hyphens) and made unique; its kind becomes a tag. `height_agl_m`
     where the operator gave one is taken as measured; else `height_m`,
-    marked assumed. Every node gets the default radio, at the file's
-    transmit power where it states one.
+    marked assumed. A transmit power the file states is the node's maximum
+    power.
     """
     data = blank()
     for row in _rows(path):
@@ -574,16 +659,11 @@ def import_nodes_csv(path, height_m=15.0, device=DEFAULT_DEVICE):
         if lat is None or lon is None:
             continue
         node_id = len(data["nodes"]) + 1
-        base = store.slug(row.get("name"), "n%03d" % node_id)
-        name, suffix = base, 2
-        while name in data["nodes"]:
-            tail = "-%d" % suffix
-            name = base[:32 - len(tail)].rstrip("-") + tail
-            suffix += 1
+        name = unique_name(store.slug(row.get("name"), "n%03d" % node_id), data["nodes"])
         height = _number(row.get("height_agl_m"))
         kind = store.slug(row.get("kind"), "")
         data["nodes"][name] = node_record(
             node_id, lat, lon, height if height is not None else height_m,
-            "measured" if height is not None else "assumed", 0.0, device,
-            radio=_radio_with(_number(row.get("tx_power_dbm"))), tags=[kind] if kind else [])
+            "measured" if height is not None else "assumed",
+            max_dbm=_board_at(_number(row.get("tx_power_dbm"))), tags=[kind] if kind else [])
     return data

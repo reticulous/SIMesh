@@ -7,6 +7,7 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -25,10 +26,13 @@ import devices  # noqa: E402
 import front  # noqa: E402
 import geodata  # noqa: E402
 import proxy  # noqa: E402
+import sources  # noqa: E402
 import store  # noqa: E402
 import webrtc  # noqa: E402
 
 BERLIN_PACK = os.path.join(geodata.PACKS_DIR, "berlin-city")
+FOUR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "four.yaml")
+PLAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "plain-27.yaml")
 
 
 class Args:
@@ -229,32 +233,45 @@ def test_a_flow_crosses_the_front_and_the_child_to_the_station():
 # ---- loss tables before a child starts -------------------------------------
 
 def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatch):
-    """losses.py runs as a subprocess on the repository's smoke4, its
+    """losses.py runs as a subprocess on the tests' four stations, its
     progress goes out tagged with the simulation, and the run holds the
-    table, the script and the build it was given."""
+    table, the script, the build and the rules it was given."""
     monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(store, "NODESETS_DIR", str(tmp_path / "nodesets"))
+    monkeypatch.setattr(store, "SCRIPTS_DIR", str(tmp_path / "scripts"))
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    (tmp_path / "nodesets").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "geodata").mkdir()
+    shutil.copy(FOUR, str(tmp_path / "nodesets" / "four.yaml"))
+    shutil.copy(PLAIN, str(tmp_path / "geodata" / "plain-27.yaml"))
+    (tmp_path / "scripts" / "four.py").write_text("from simesh import *\n")
+    (tmp_path / "scripts" / "globals.py").write_text("FREQ_MHZ = 869.525\nSF = 8\n"
+                                                     "BW_KHZ = 125\nCR = 5\n")
     build = tmp_path / "build.linux"
     (build / "data_merged").mkdir(parents=True)
     (build / "reticulous.elf").write_text("")
+    rules = [{"which": {"all": True}, "firmware": "reticulous_dev_latest"}]
 
     async def go():
         f = make_front()
         f.sidecars = front.Sidecars(None)
         said = []
         f.broadcast = said.append
-        tables = await f.compute_losses("plain-27", "smoke4", ["868"], None, {"sim": "t"})
+        tables = await f.compute_losses(PLAIN, FOUR, ["868"], None, {"sim": "t"})
         path, cached = tables["868"]
         assert os.path.isfile(path)
         progress = [m for m in said if m["type"] == "losses_progress"]
         assert cached or (progress[-1]["sim"] == "t"
                           and progress[-1]["done"] == progress[-1]["total"] > 0)
-        spec = {"geodata": "plain-27", "nodeset": "smoke4", "script": "smoke4",
-                "build": str(build)}
+        spec = {"geodata": "plain-27", "nodeset": "four", "script": "four",
+                "build": str(build), "firmware_rules": rules}
         run, sidecar = await f.prepare_run("t", spec)
         assert sidecar is None and run.bands() == ["868"]
         assert run.dir == str(tmp_path / "runs" / "t")
-        assert run.meta["builds"]["stable"]["elf"] == str(build / "reticulous.elf")
-        assert run.meta["nodeset"] == "smoke4" and run.meta["script"] == "smoke4"
+        assert run.meta["build"] == str(build) and run.meta["builds"] == {}
+        assert run.meta["nodeset"] == "four" and run.meta["script"] == "four"
+        assert run.meta["firmware_rules"] == rules and run.meta["first_boot_rules"] == []
         assert run.script_path
         again, _ = await f.prepare_run("t", spec)
         assert again.dir == run.dir + "-2"
@@ -323,10 +340,13 @@ def stores(tmp_path, monkeypatch):
         monkeypatch.setattr(store, attr, str(path))
     monkeypatch.setattr(devices, "DEVICES_DIR", str(tmp_path / "devices"))
     monkeypatch.setattr(devices, "BUILDS_DIR", str(tmp_path / "builds"))
-    monkeypatch.setattr(devices, "WEB_SOURCES", ())
+    async def no_web(*args, **kwargs):
+        return []
+    monkeypatch.setattr(devices, "web_catalogues", no_web)
     monkeypatch.setattr(front, "planner_web", lambda: None)
     monkeypatch.setattr(geodata, "PLANNER_DIR", str(tmp_path / "planner"))
     monkeypatch.setattr(geodata, "PACKS_DIR", str(tmp_path / "packs"))
+    monkeypatch.setattr(sources, "CACHE_DIR", str(tmp_path / "packs" / ".cache"))
     (tmp_path / "geodata_dir" / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
     (tmp_path / "nodesets_dir" / "here.yaml").write_text(
         "nodes:\n  a: { id: 1, lat: 0, lon: 0, tags: [x] }\n")
@@ -373,10 +393,16 @@ def test_the_editors_list_open_and_save(stores):
         with open(path, "w") as handle:
             handle.write("# the prose\n# kept\nnodes:\n  a: { id: 1, lat: 0, lon: 0 }\n")
         reply = await ask(ws, "nodeset_save", name="here",
-                          data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0, "device": "dev"}}})
+                          data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0}}})
         assert reply["ok"] and open(path).read().startswith("# the prose\n# kept\nnodes:\n")
+        reply = await ask(ws, "nodeset_save", name="here",
+                          data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0, "device": "dev"}}})
+        assert not reply["ok"] and "firmware()" in reply["error"]
         reply = await ask(ws, "script_new", name="drive")
-        assert reply["ok"] and reply["script"]["main"] and "async def main" in reply["text"]
+        assert reply["ok"] and 'firmware("all"' in reply["text"]
+        assert reply["script"]["references"][0]["path"] == "simesh/library.py"
+        reply = await ask(ws, "module_open", path="simesh/library.py")
+        assert reply["ok"] and "def on_first_boot" in reply["text"]
         reply = await ask(ws, "script_save", name="drive", text="def (:\n")
         assert not reply["ok"] and "line 1" in reply["error"]
         reply = await ask(ws, "script_list")
@@ -389,7 +415,12 @@ def test_the_editors_list_open_and_save(stores):
         reply = await ask(ws, "coverage", geodata="flat", nodes=[])
         assert not reply["ok"] and "synthetic" in reply["error"]
         reply = await ask(ws, "device_list")
-        assert reply["ok"] and reply["devices"] == []
+        assert reply["ok"] and reply["latest"] == [] and reply["saved"] == []
+        reply = await ask(ws, "antenna_list")
+        kinds = {a["type"]: a for a in reply["antennas"]}
+        assert kinds["yagi_directional"]["kind"] == "directional"
+        assert kinds["wire_quarter_wave"]["description"].startswith("Bare ~8.2 cm wire")
+        assert all(a["svg"].startswith("<svg") for a in reply["antennas"])
         sims = await ask(ws, "sims")
         assert "script_runs" in sims and sims["nodesets"] == ["copy", "here", "there"]
     running_front(check)
@@ -400,7 +431,7 @@ def device_zip(arch):
     with zipfile.ZipFile(out, "w") as zf:
         zf.writestr("node.yaml", yaml.safe_dump({
             "kind": "reticulous", "arch": arch, "stamp": "20260925035045",
-            "elf": "reticulous.elf", "stands_for": "ESP32"}))
+            "elf": "reticulous.elf", "virtual_hardware": "ESP32"}))
         zf.writestr("reticulous.elf", "x")
     return out.getvalue()
 
@@ -412,14 +443,15 @@ def test_a_device_and_a_pack_are_imported_over_http(stores):
         async with session.post(base + "/api/devices/import", params={"name": "mine.zip"},
                                 data=device_zip(arch)) as resp:
             got = await resp.json()
-        assert got["ok"] and got["ref"] == \
-            "imported/reticulous_hw-simesh-%s_20260925035045" % arch
+        assert got["ok"] and got["ref"] == "reticulous_imported_20260925035045"
         async with session.post(base + "/api/devices/import", params={"name": "x.zip"},
                                 data=device_zip(arch)) as resp:
             got = await resp.json()
         assert not got["ok"] and "already" in got["error"]
         reply = await ask(ws, "device_list")
-        assert reply["devices"][0]["stands_for"] == "ESP32"
+        assert reply["saved"][0]["virtual_hardware"] == "ESP32"
+        reply = await ask(ws, "device_delete", ref="reticulous_imported_20260925035045")
+        assert reply["ok"] and (await ask(ws, "device_list"))["saved"] == []
 
         pack = io.BytesIO()
         with zipfile.ZipFile(pack, "w") as zf:
@@ -431,6 +463,73 @@ def test_a_device_and_a_pack_are_imported_over_http(stores):
         assert got["ok"] and got["geodata"]["kind"] == "pack"
         assert os.path.isfile(os.path.join(geodata.packs_dir(), "tiny", "manifest.json"))
         assert not [n for n in os.listdir(front.SIM_DIR) if n.startswith(".upload-")]
+
+        async with session.get(base + "/api/geodata/export", params={"name": "tiny"}) as resp:
+            assert resp.headers["Content-Disposition"] == 'attachment; filename="tiny.zip"'
+            exported = await resp.read()
+        with zipfile.ZipFile(io.BytesIO(exported)) as zf:
+            assert sorted(zf.namelist()) == ["geodata.yaml", "pack/manifest.json"]
+        async with session.post(base + "/api/geodata/import", params={"name": "tiny-again"},
+                                data=exported) as resp:
+            got = await resp.json()
+        assert got["ok"] and got["geodata"]["bbox"] == [13.3, 52.4, 13.5, 52.6]
+        async with session.get(base + "/api/geodata/export", params={"name": "none"}) as resp:
+            assert resp.status == 404
+    running_front(check)
+
+
+# ---- layers: a public node map imported, shown layers saved as one ------------
+
+FAKE_NODES_JOB = r'''#!/usr/bin/env python3
+import json, sys
+job = json.load(sys.stdin)
+assert sys.argv[1] == "nodes-import"
+rows = json.load(open(job["file"]))
+lon0, lat0, lon1, lat1 = job["bbox"]
+inside = [r for r in rows if lon0 <= r["lon"] <= lon1 and lat0 <= r["lat"] <= lat1]
+print(json.dumps({"nodes": [dict(r, position="gps") for r in inside
+                            if job["companions"] or r["kind"] != "companion"],
+                  "report": {"kept": len(inside)}}))
+'''
+
+
+def test_a_node_map_becomes_a_layer_and_shown_layers_save_as_one(stores, monkeypatch):
+    job = stores / "planner-job"
+    job.write_text(FAKE_NODES_JOB)
+    job.chmod(0o755)
+    monkeypatch.setattr(front, "planner_job", lambda: str(job))
+    meta = stores / "packs" / ".cache" / "meta"
+    meta.mkdir(parents=True)
+    (meta / front.MESHCORE_META).write_text(json.dumps([
+        {"label": "Alex Repeater 🗼", "lat": 0.01, "lon": 0.01, "kind": "repeater"},
+        {"label": "", "lat": 0.02, "lon": 0.02, "kind": "room-server"},
+        {"label": "phone", "lat": 0.03, "lon": 0.03, "kind": "companion"},
+        {"label": "far away", "lat": 52.5, "lon": 13.4, "kind": "repeater"}]))
+
+    async def check(f, session, base, ws):
+        async with session.get(base + "/api/nodes/sources") as resp:
+            assert (await resp.json())["meshcore"]["fetched"] is not None
+        reply = await ask(ws, "nodeset_import", name="mc", source="meshcore", geodata="flat",
+                          height_m=12)
+        assert reply["ok"], reply
+        nodes = reply["nodeset"]["nodes"]
+        assert sorted(nodes) == ["alex-repeater", "meshcore-2"]
+        assert nodes["alex-repeater"]["tags"] == ["meshcore", "repeater", "position-gps"]
+        assert nodes["alex-repeater"]["height_m"] == 12
+        assert nodes["alex-repeater"]["height_from"] == "assumed"
+        reply = await ask(ws, "nodeset_import", name="mc", source="meshcore", geodata="flat")
+        assert not reply["ok"] and "already" in reply["error"]
+
+        reply = await ask(ws, "nodeset_merge", name="both", layers=[
+            {"name": "here", "data": {"nodes": {"a": {"id": 1, "lat": 0, "lon": 0}}}},
+            {"name": "mc", "data": {"nodes": nodes}}])
+        assert reply["ok"], reply
+        merged = reply["nodeset"]["nodes"]
+        assert sorted(merged) == ["a", "alex-repeater", "meshcore-2"]
+        assert sorted(n["id"] for n in merged.values()) == [1, 2, 3]
+        assert "mc" in merged["alex-repeater"]["tags"] and "here" in merged["a"]["tags"]
+        assert open(os.path.join(store.NODESETS_DIR, "both.yaml")).read().startswith(
+            "# from here, mc\n")
     running_front(check)
 
 

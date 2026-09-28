@@ -1,6 +1,7 @@
 /* What every other node would hear from one, from the loss table, by the
- * ether's own rule (ether/ether.py): the level is transmit power plus both
- * antenna gains less the path loss, corrected from the table's centre to the
+ * ether's own rule (ether/ether.py): the level is transmit power plus the
+ * pair's antenna gains (each antenna's pattern toward the other, as the
+ * testbed puts them on the table) less the path loss, corrected from the table's centre to the
  * carrier by 20·log10(f/f0); a frame is decodable at or above the noise floor
  * (kTB plus the noise figure) plus its spreading factor's demodulation
  * threshold, and anything weaker still counts towards the receiver's
@@ -29,14 +30,37 @@ export function threshold(bwHz: number, sf: number | undefined, noiseFigureDb = 
 
 /**
  * The marks for `from`, over every other node in the table.
- * `gains` maps a node to its antenna gain; `heard`, when a running
- * simulation has answered a `levels` request, is the ether's own list of who
- * decodes and at what level, and overrides the computed figure for those.
+ * `pairGain(other)` is what the two antennas add between `from` and that
+ * node; `heard`, when a running simulation has answered a `levels` request,
+ * is the ether's own list of who decodes and at what level, and overrides
+ * the computed figure for those.
  */
-export function linksFrom(table: LossTable, from: string, gains: Record<string, number>,
+export function linksFrom(table: LossTable, from: string, pairGain: (other: string) => number,
                           radio: Radio, heard: Record<string, number> | null = null,
                           noiseFigureDb = 6): LinkMark[] {
-  const f0 = Number(table.header.f0_hz) || 0
+  return linksOver(table.names, (name) => cell(table, from, name), Number(table.header.f0_hz) || 0,
+                   from, pairGain, radio, heard, noiseFigureDb)
+}
+
+/** A row the front computed for one node (the `links` verb): its loss to
+ *  and from each other node, by name, null where it is never heard. */
+export interface LinkRow {
+  node: string
+  f0_hz: number
+  cells: Record<string, { to: number | null; from: number | null; flags: number }>
+}
+
+export function linksFromRow(row: LinkRow, pairGain: (other: string) => number, radio: Radio,
+                             heard: Record<string, number> | null = null, noiseFigureDb = 6): LinkMark[] {
+  return linksOver(Object.keys(row.cells), (name) => {
+    const c = row.cells[name]
+    return c ? { loss: c.to ?? Infinity, flags: c.flags } : null
+  }, row.f0_hz, row.node, pairGain, radio, heard, noiseFigureDb)
+}
+
+function linksOver(names: string[], cellOf: (name: string) => { loss: number; flags: number } | null,
+                   f0: number, from: string, pairGain: (other: string) => number, radio: Radio,
+                   heard: Record<string, number> | null, noiseFigureDb: number): LinkMark[] {
   const freq = radio.freq || f0
   const correction = f0 && freq ? 20 * Math.log10(freq / f0) : 0
   const bw = radio.bw || 125_000
@@ -44,15 +68,15 @@ export function linksFrom(table: LossTable, from: string, gains: Record<string, 
   const decode = threshold(bw, radio.sf, noiseFigureDb)
   const floor = noiseFloor(bw, noiseFigureDb) - SHOWN_UNDER_FLOOR_DB
   const out: LinkMark[] = []
-  for (const name of table.names) {
+  for (const name of names) {
     if (name === from) continue
-    const c = cell(table, from, name)
+    const c = cellOf(name)
     if (!c) continue
     const los = (c.flags & FLAG_LOS_CLEAR) !== 0
     const said = heard?.[name]
     if (said !== undefined) { out.push({ name, level: said, decodable: true, los }); continue }
     if (!Number.isFinite(c.loss)) continue
-    const level = power + (gains[from] ?? 0) + (gains[name] ?? 0) - c.loss - correction
+    const level = power + pairGain(name) - c.loss - correction
     if (level < floor) continue
     out.push({ name, level, decodable: heard ? false : level >= decode, los })
   }

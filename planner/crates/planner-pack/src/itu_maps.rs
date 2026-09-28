@@ -98,14 +98,13 @@ mod tests {
         assert!(ItuMap::parse("1 2 3").is_err());
     }
 
-    /// Real-map spot check (skips when the local ITU maps are absent).
-    /// Cross-validated 2026-08-30 against Py1812's own npz lookup for a
-    /// Berlin path centre: DN 37.4037, N0 319.9004 — we must land within a
+    /// Real-map spot check (skips when the ITU maps are not in the download
+    /// cache). Cross-validated 2026-08-30 against Py1812's own npz lookup for
+    /// a Berlin path centre: DN 37.4037, N0 319.9004 — we must land within a
     /// whisker of those.
     #[test]
     fn berlin_values_from_real_maps() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../Py1812/src/Py1812/maps");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packs/.cache/itu");
         if !dir.join("DN50.TXT").exists() {
             eprintln!("SKIP: ITU maps not present at {}", dir.display());
             return;

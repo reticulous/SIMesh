@@ -1,12 +1,11 @@
-//! Pack compiler v0: GLO-30 DSM tile(s) → one UTM-resampled bootstrap layer +
-//! manifest. Runs on the build server (may sit next to curl/GDAL); output
-//! packs are static directories the fully-offline device side consumes.
+//! The pack compiler: GLO-30 surface tiles resampled onto a UTM grid and split
+//! into terrain and clutter, with whatever else the build is given merged in
+//! (buildings from LoD2 where its tiles cover the grid and from OpenStreetMap
+//! everywhere else, Berlin's 1 m lidar, WorldCover land
+//! cover, the Zensus grid, OpenStreetMap roads and places), and the manifest.
 //!
-//! v0 honesty notes, all tracked in TODO.md: single SurfaceDsm layer (the
-//! DTM/clutter split lands later), ΔN/N0 are world-median defaults until the
-//! ITU-map extraction step exists, and inputs are pre-downloaded files (the
-//! fetch command is documented in the README — the compiler does not phone
-//! home).
+//! Every input is a file already on disk; the compiler never reaches the
+//! network. `planner-job pack-build` is its caller.
 
 use crate::{
     CalibrationRef, DataQuality, LayerKind, LayerMeta, LicenseNotice, PackError, PackManifest,
@@ -22,6 +21,47 @@ use std::path::{Path, PathBuf};
 pub const GLO30_NOTICE: &str = "\u{a9} DLR e.V. 2010-2014 and \u{a9} Airbus Defence and Space GmbH 2014-2018 \
 provided under COPERNICUS by the European Union and ESA; all rights reserved. \
 Produced using Copernicus WorldDEM-30.";
+
+/// One progress report from [`build`].
+///
+/// A step reports as it starts (`done` = steps finished before it) and as it
+/// ends (`done` one higher); `total` is the number of steps this build has.
+/// A long step may report in between with `part = Some((i, n))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress<'a> {
+    pub step: &'a str,
+    pub done: usize,
+    pub total: usize,
+    pub part: Option<(u64, u64)>,
+}
+
+pub type ProgressFn = dyn Fn(&Progress) + Send + Sync;
+
+/// The steps a build runs, in order, and where it has got to.
+struct Steps<'a> {
+    names: Vec<&'static str>,
+    done: usize,
+    report: Option<&'a ProgressFn>,
+}
+
+impl Steps<'_> {
+    fn send(&self, step: &str, part: Option<(u64, u64)>) {
+        if let Some(f) = self.report {
+            f(&Progress { step, done: self.done, total: self.names.len(), part });
+        }
+    }
+    fn begin(&self, step: &'static str) {
+        debug_assert!(self.names.contains(&step), "step {step} not planned");
+        self.send(step, None);
+    }
+    fn part(&self, step: &'static str, i: u64, n: u64) {
+        self.send(step, Some((i, n)));
+    }
+    fn end(&mut self, step: &'static str) {
+        self.done += 1;
+        self.send(step, None);
+    }
+}
 
 pub struct BuildParams {
     /// Pre-downloaded GLO-30 tiles covering the region (EPSG:4326).
@@ -46,15 +86,18 @@ pub struct BuildParams {
     pub berlin_1m_dir: Option<PathBuf>,
     /// Directory of extracted LoD2 CityGML files: per-building sidecar
     /// (`buildings.jsonl`) + building-height merged into the clutter layer
-    /// (cell-mean, before any 1 m override).
+    /// (cell-mean, before any 1 m override). Only the 1 km tiles meeting the
+    /// grid are read, and only buildings meeting it are kept. The tiles read
+    /// are the ground LoD2 covers: with `osm_buildings` as well, an
+    /// OpenStreetMap building whose centroid lies in one of them is left out.
     pub lod2_dir: Option<PathBuf>,
-    /// Write footprint POLYGONS into `buildings.jsonl` as well as centroids.
+    /// Write LoD2 footprint POLYGONS into `buildings.jsonl` as well as
+    /// centroids. OpenStreetMap buildings always carry theirs.
     ///
-    /// Off by default because it is a large, one-way cost: a full-city
-    /// sidecar goes from 137 MB to several hundred, and most consumers only
-    /// read the centroid. On, the pack can answer where a building's edges
-    /// are — which is the difference between colouring a street and
-    /// colouring a 5 m cell that is part street and part Vorderhaus.
+    /// A full-city LoD2 sidecar goes from 137 MB to about 300 MB with them.
+    /// With them the pack can answer where a building's edges are — which is
+    /// the difference between colouring a street and colouring a 5 m cell
+    /// that is part street and part Vorderhaus.
     pub lod2_geometry: bool,
     /// Zensus 2022 100 m population CSV (extracted): Population layer for
     /// household-weighted siting.
@@ -62,35 +105,18 @@ pub struct BuildParams {
     /// ESA WorldCover tiles (EPSG:4326 COGs): ClutterClass layer for
     /// per-class calibration.
     pub worldcover_tiles: Vec<PathBuf>,
-    /// Overpass JSON export of roads/rail (fetched separately; see the
-    /// runbook). Adds a display-only orientation layer.
-    pub roads_json: Option<PathBuf>,
-    /// Overpass JSON export of place nodes, named highways and
-    /// `boundary=postal_code` areas: builds the offline search index.
-    pub places_json: Option<PathBuf>,
-    /// CSV of the network already on the air (scraped adverts exported by the
-    /// importer, plus community corrections; see nodes.rs for the columns).
-    /// Bakes the deployed nodes into the pack so the planner can answer
-    /// "what does a site HERE add" with no network.
-    pub nodes_csv: Option<PathBuf>,
-    /// Worker threads for the parallel stages (0 = auto: min(100, available)
-    /// — the build server starts at ~100 of its 384 cores; scaling numbers
-    /// stay configurable per the maintainer's directive).
+    /// OpenStreetMap PBF extract holding the region (`osm.rs`): the roads
+    /// layer and the gazetteer, and the buildings when `osm_buildings`.
+    pub osm_pbf: Option<PathBuf>,
+    /// Buildings from `osm_pbf`: the same sidecar, clutter merge,
+    /// `BuiltFraction` and `BuildingTop` that LoD2 fills, on the ground the
+    /// LoD2 tiles of `lod2_dir` do not cover.
+    pub osm_buildings: bool,
+    /// Worker threads for the parallel stages (0 = auto: min(100, available)).
     pub threads: usize,
-}
-
-/// Read a build INPUT, naming the file if it is not there.
-///
-/// Every path here comes from an operator's command line, and a pack build is
-/// minutes of work that only reaches some of these inputs at the very end —
-/// nodes are read after the LoD2 parse, the 1 m override, WorldCover, roads
-/// and places. A bare `?` on `read_to_string` reports `io: No such file or
-/// directory (os error 2)` with no path at all, so a single mistyped argument
-/// costs a full rebuild AND gives nothing to correct. Naming the file turns
-/// that into a one-line fix.
-fn read_input(path: &Path, what: &str) -> Result<String, PackError> {
-    std::fs::read_to_string(path)
-        .map_err(|e| PackError::Invalid(format!("{what} {}: {e}", path.display())))
+    /// Where progress goes; `None` reports nothing. Diagnostics go to
+    /// standard error regardless.
+    pub progress: Option<Box<ProgressFn>>,
 }
 
 /// Resolve the thread count and install the global rayon pool (idempotent).
@@ -119,10 +145,10 @@ impl BuildParams {
             lod2_geometry: false,
             zensus_csv: None,
             worldcover_tiles: Vec::new(),
-            roads_json: None,
-            places_json: None,
-            nodes_csv: None,
+            osm_pbf: None,
+            osm_buildings: false,
             threads: 0,
+            progress: None,
         }
     }
 }
@@ -162,28 +188,20 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     let n_threads = init_threads(params.threads);
     eprintln!("pack build: {n_threads} worker threads");
 
-    // Validate every DSM tile opens before the parallel stage (workers then
-    // open their own handles — CogReader caches are not shared).
-    for p in &params.dsm_tiles {
-        CogReader::open(p)?;
-    }
     if params.dsm_tiles.is_empty() {
         return Err(PackError::Invalid("no DSM input tiles given".into()));
     }
+    if params.osm_buildings && params.osm_pbf.is_none() {
+        return Err(PackError::Invalid(
+            "OpenStreetMap buildings asked for without an OpenStreetMap extract".into(),
+        ));
+    }
 
-    // Check EVERY operator-supplied path before doing any work.
-    //
-    // The DSM tiles above were already validated up front; the rest were read
-    // where they are used, which is scattered across the whole build. The
-    // deployed-nodes CSV is read LAST, after the LoD2 parse, the 1 m override,
-    // WorldCover, roads and places — so a single mistyped path failed a
-    // full-city build minutes in, having already written a 386 MB sidecar and
-    // a 392 MB raster, and reported only `io: No such file or directory (os
-    // error 2)` with no path to correct. Every one of these is a string an
-    // operator typed, so every one of them can be wrong.
-    //
-    // Reported ALL AT ONCE rather than one per attempt: three wrong paths
-    // should cost one run, not three.
+    // Check EVERY input path before doing any work, and report them ALL AT
+    // ONCE. Most inputs are read where they are used, scattered across the
+    // whole build, so a wrong path found there fails a build minutes in with
+    // a bare `No such file or directory` — three wrong paths should cost one
+    // run, not three, and each should be named.
     {
         let mut missing: Vec<String> = Vec::new();
         let mut check = |p: Option<&PathBuf>, what: &str, dir: bool| {
@@ -202,15 +220,16 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 }
             }
         };
-        check(params.itu_maps_dir.as_ref(), "--itu-maps", true);
-        check(params.berlin_1m_dir.as_ref(), "--berlin-1m", true);
-        check(params.lod2_dir.as_ref(), "--lod2", true);
-        check(params.zensus_csv.as_ref(), "--zensus", false);
-        check(params.roads_json.as_ref(), "--roads", false);
-        check(params.places_json.as_ref(), "--places", false);
-        check(params.nodes_csv.as_ref(), "--nodes", false);
+        for p in &params.dsm_tiles {
+            check(Some(p), "dsm_tiles", false);
+        }
+        check(params.itu_maps_dir.as_ref(), "itu_maps_dir", true);
+        check(params.berlin_1m_dir.as_ref(), "berlin_1m_dir", true);
+        check(params.lod2_dir.as_ref(), "lod2_dir", true);
+        check(params.zensus_csv.as_ref(), "zensus_csv", false);
+        check(params.osm_pbf.as_ref(), "osm_pbf", false);
         for p in &params.worldcover_tiles {
-            check(Some(p), "--worldcover", false);
+            check(Some(p), "worldcover_tiles", false);
         }
         if !missing.is_empty() {
             return Err(PackError::Invalid(format!(
@@ -220,6 +239,32 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             )));
         }
     }
+
+    // Validate every DSM tile opens before the parallel stage (workers then
+    // open their own handles — CogReader caches are not shared).
+    for p in &params.dsm_tiles {
+        CogReader::open(p)
+            .map_err(|e| PackError::Invalid(format!("DSM tile {}: {e}", p.display())))?;
+    }
+
+    let mut steps = Steps {
+        names: [
+            Some("terrain"),
+            params.osm_pbf.as_ref().map(|_| "osm"),
+            (params.lod2_dir.is_some() || params.osm_buildings).then_some("buildings"),
+            params.berlin_1m_dir.as_ref().map(|_| "lidar"),
+            (!params.worldcover_tiles.is_empty()).then_some("landcover"),
+            Some("clutter"),
+            params.zensus_csv.as_ref().map(|_| "population"),
+            Some("manifest"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        done: 0,
+        report: params.progress.as_deref(),
+    };
+    steps.begin("terrain");
 
     // Target grid: north-up UTM, row 0 at the northern edge. Square from
     // center/half, or the (possibly non-square) shape of an explicit bbox.
@@ -259,6 +304,38 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         origin.x + (nx as f64 - 1.0) * res / 2.0,
         origin.y - (ny as f64 - 1.0) * res / 2.0,
     )?;
+    // The grid's outer edges in the pack CRS, [min_e, min_n, max_e, max_n].
+    let x0 = origin.x - res / 2.0;
+    let x1 = x0 + nx as f64 * res;
+    let y1 = origin.y + res / 2.0;
+    let y0 = y1 - ny as f64 * res;
+    let grid_extent = [x0, y0, x1, y1];
+    // The same in WGS84, from the four corners.
+    let bbox = {
+        let mut lons: Vec<f64> = Vec::new();
+        let mut lats: Vec<f64> = Vec::new();
+        for (x, y) in [(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
+            let (lon, lat) = to_lonlat(&utm, &ll, x, y)?;
+            lons.push(lon);
+            lats.push(lat);
+        }
+        [
+            lons.iter().cloned().fold(f64::MAX, f64::min),
+            lats.iter().cloned().fold(f64::MAX, f64::min),
+            lons.iter().cloned().fold(f64::MIN, f64::max),
+            lats.iter().cloned().fold(f64::MIN, f64::max),
+        ]
+    };
+    let cell_of = |x: f64, y: f64| -> Option<usize> {
+        let col = ((x - origin.x) / res).round();
+        let row = ((origin.y - y) / res).round();
+        if col < 0.0 || row < 0.0 || col >= nx as f64 || row >= ny as f64 {
+            None
+        } else {
+            Some(row as usize * nx + col as usize)
+        }
+    };
+    let project = |lat: f64, lon: f64| to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN));
 
     // Parallel resample: one row per task, per-worker tile readers.
     use rayon::prelude::*;
@@ -315,132 +392,171 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     for i in 0..clutter.data.len() {
         clutter.data[i] = (clutter.data[i] - dtm.data[i]).max(0.0);
     }
+    steps.end("terrain");
 
-    // LoD2 buildings: per-building sidecar + building heights merged into
-    // clutter as cell-means (sum over the res×res cell area). Runs BEFORE
-    // the 1 m override so measured bDOM clutter wins where present.
-    // Cells whose clutter comes from MEASURED building/surface data (LoD2 or
-    // 1 m DGM1/bDOM). Everything else falls back to class defaults below.
+    // OpenStreetMap: roads and places are written here; buildings wait for
+    // the merge below, and for the final terrain under them.
+    let mut used_roads = false;
+    let mut used_places = false;
+    let mut osm_buildings: Vec<crate::lod2::Lod2Building> = Vec::new();
+    if let Some(pbf) = &params.osm_pbf {
+        steps.begin("osm");
+        let layers = crate::osm::read_pbf(pbf, bbox, params.osm_buildings, &project, &|i, n| {
+            steps.part("osm", i, n)
+        })?;
+        if !layers.roads.is_empty() {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(
+                params.out_dir.join("roads.bin"),
+            )?);
+            crate::roads::write_binary(&mut f, &layers.roads)?;
+            used_roads = true;
+            let pts: usize = layers.roads.iter().map(|w| w.points.len()).sum();
+            eprintln!("roads: {} ways / {pts} points → roads.bin", layers.roads.len());
+        }
+        if !layers.places.entries.is_empty() {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(
+                params.out_dir.join("places.bin"),
+            )?);
+            crate::places::write_binary(&mut f, &layers.places)?;
+            used_places = true;
+            eprintln!(
+                "places: {} searchable names / {} postal areas → places.bin",
+                layers.places.entries.len(),
+                layers.places.areas.len()
+            );
+        }
+        osm_buildings = layers
+            .buildings
+            .into_iter()
+            .filter(|b| meets(crate::lod2::extent(b), grid_extent))
+            .collect();
+        steps.end("osm");
+    }
+
+    // Buildings (LoD2 where its tiles cover the grid, OpenStreetMap on the
+    // rest): per-building sidecar + building heights merged into clutter.
+    // Runs BEFORE the 1 m override so measured bDOM clutter wins where present.
+    //
+    // Cells whose clutter comes from MEASURED building/surface data. Everything
+    // else falls back to class defaults below.
     let mut measured_clutter = vec![false; nx * ny];
     // Per-cell provenance of the terrain/clutter split, written out as its own
     // layer. Without it a pack advertises one `res_m` for the whole region and
     // says nothing about the fact that the high-resolution sources usually
-    // cover a tiny part of it: the Berlin pack built from one cached tile pair
-    // had REAL detail over 4 km2 of 2556 km2 (0.16%) and looked, in the UI,
-    // exactly like a uniformly 10 m product. A planner cannot weigh a coverage
-    // prediction without knowing whether the clutter under it was measured or
+    // cover a tiny part of it: a Berlin pack with one 1 m tile pair has REAL
+    // detail over 4 km2 of 2556 km2 (0.16%) and looks, in the UI, exactly like
+    // a uniformly 10 m product. A planner cannot weigh a coverage prediction
+    // without knowing whether the clutter under it was measured or
     // synthesized from a 30 m DSM.
     let mut quality = vec![DataQuality::Glo30Pseudo as u8; nx * ny];
-    let mut used_lod2 = false;
-    let mut n_buildings = 0usize;
-    // Empty unless LoD2 ran: a pack without footprints has no honest way to
-    // say where a building starts, and an all-zero layer would read as "no
-    // buildings anywhere" rather than "not measured".
+    let raise = |q: &mut u8, to: DataQuality| {
+        if DataQuality::from_code(*q).map_or(true, |cur| cur.rank() < to.rank()) {
+            *q = to as u8;
+        }
+    };
+    let mut n_lod2 = 0usize;
+    // Empty unless buildings were merged: a pack without footprints has no
+    // honest way to say where a building starts, and an all-zero layer would
+    // read as "no buildings anywhere" rather than "not measured".
     let mut built_fraction: Vec<f32> = Vec::new();
     let mut building_top: Vec<f32> = Vec::new();
-    if let Some(dir) = &params.lod2_dir {
-        // Building height summed over 1 m samples, plus the built AREA, so
-        // the cell reports the height of its buildings rather than that
-        // height smeared across courtyards and streets (P.1812 §3.2.1
-        // representative clutter height).
-        let mut bldg_sum = vec![0f32; nx * ny];
-        let mut bldg_area = vec![0f32; nx * ny];
-        let mut sidecar = std::io::BufWriter::new(std::fs::File::create(
-            params.out_dir.join("buildings.jsonl"),
-        )?);
-        use std::io::Write as _;
-        let files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| PackError::Invalid(format!("LoD2 directory {}: {e}", dir.display())))?
-            .flatten()
-            .map(|f| f.path())
-            .filter(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                name.ends_with(".xml") || name.ends_with(".gml")
-            })
-            .collect();
-        // Parse in parallel, chunked to bound in-flight memory; scatter
-        // serially (fast) to keep the shared accumulator race-free.
-        for chunk in files.chunks(n_threads.max(1)) {
-            let parsed: Result<Vec<_>, PackError> = chunk
-                .par_iter()
-                .map(|path| {
-                    crate::lod2::parse_citygml(std::io::BufReader::new(std::fs::File::open(
-                        path,
-                    )?))
+    if params.lod2_dir.is_some() || params.osm_buildings {
+        steps.begin("buildings");
+        let mut acc = BuiltAccum::new(nx * ny);
+        // The ground LoD2 covers: each tile read, by its name, or for a file
+        // named otherwise the extent of its buildings.
+        let mut covered: Vec<[f64; 4]> = Vec::new();
+        if let Some(dir) = &params.lod2_dir {
+            let mut sidecar = std::io::BufWriter::new(std::fs::File::create(
+                params.out_dir.join("buildings.jsonl"),
+            )?);
+            use std::io::Write as _;
+            // Only the 1 km tiles meeting the grid: a district of a city-wide
+            // LoD2 set reads megabytes, not the whole set.
+            let files: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map_err(|e| PackError::Invalid(format!("LoD2 directory {}: {e}", dir.display())))?
+                .flatten()
+                .map(|f| f.path())
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    (name.ends_with(".xml") || name.ends_with(".gml"))
+                        && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_extent))
                 })
                 .collect();
-            // One 1 m sample must be counted ONCE per cell per building, and
-            // the rasterizer cannot guarantee that: it fills each ground
-            // polygon independently, and LoD2 splits a block into
-            // `BuildingPart`s whose footprints touch and overlap at shared
-            // walls. Measured on the cached Berlin tile, that is 263 299 sink
-            // calls against 246 007 distinct 1 m cells — 7.0% of the built
-            // area counted twice, a few cells four times. `built_fraction`
-            // inherited the inflation (hidden by its `.min(1.0)`, which turns
-            // an over-count into a silently saturated cell) and
-            // `building_top` double-weighted the height of whichever part
-            // overlapped.
-            // The key is the 1 m SAMPLE, not the pack cell. A pack cell holds
-            // 25 samples at 5 m resolution and `bldg_area` counts samples —
-            // deduplicating by cell would credit each cell one sample per
-            // building and collapse every built fraction to 1/25.
-            let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-            for buildings in parsed? {
-                for b in &buildings {
-                    writeln!(sidecar, "{}", b.to_json_line(params.lod2_geometry)?)?;
-                    seen.clear();
-                    crate::lod2::rasterize_building(b, |x, y, h| {
-                        // Per BUILDING, not globally: two DIFFERENT buildings
-                        // covering the same ground are two real contributions
-                        // and both belong in the mean. Only one building's
-                        // own overlapping parts are the double count.
-                        if !seen.insert((x.floor() as i32, y.floor() as i32)) {
-                            return;
+            // Parse in parallel, chunked to bound in-flight memory; scatter
+            // serially (fast) to keep the shared accumulator race-free.
+            let mut parsed_files = 0u64;
+            for chunk in files.chunks(n_threads.max(1)) {
+                let parsed: Result<Vec<_>, PackError> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        crate::lod2::parse_citygml(std::io::BufReader::new(
+                            std::fs::File::open(path)?,
+                        ))
+                    })
+                    .collect();
+                for (path, buildings) in chunk.iter().zip(parsed?) {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let tile = crate::lod2::tile_extent(name);
+                    let mut reach = tile;
+                    for b in &buildings {
+                        let e = crate::lod2::extent(b);
+                        if tile.is_none() {
+                            reach = Some(reach.map_or(e, |r| union(r, e)));
                         }
-                        let col = ((x - origin.x) / res).round();
-                        let row = ((origin.y - y) / res).round();
-                        if col >= 0.0 && row >= 0.0 && (col as usize) < nx && (row as usize) < ny
-                        {
-                            let k = row as usize * nx + col as usize;
-                            bldg_sum[k] += h as f32;
-                            bldg_area[k] += 1.0; // one 1 m sample
+                        if !meets(e, grid_extent) {
+                            continue;
                         }
-                    });
+                        writeln!(sidecar, "{}", b.to_json_line(params.lod2_geometry)?)?;
+                        acc.add(b, &cell_of);
+                        n_lod2 += 1;
+                    }
+                    covered.extend(reach);
                 }
-                n_buildings += buildings.len();
+                parsed_files += chunk.len() as u64;
+                steps.part("buildings", parsed_files, files.len() as u64);
             }
+            sidecar.flush()?;
+            eprintln!("lod2: {} files parsed, {n_lod2} buildings", files.len());
         }
-        eprintln!("lod2: {} files parsed", files.len());
-        if n_buildings > 0 {
+        let before = osm_buildings.len();
+        osm_buildings.retain(|b| !lod2_covers(&covered, b));
+        if before > osm_buildings.len() {
+            eprintln!(
+                "osm buildings: {} of {before} left out, on ground LoD2 covers",
+                before - osm_buildings.len()
+            );
+        }
+        for b in &osm_buildings {
+            acc.add(b, &cell_of);
+        }
+        if n_lod2 + osm_buildings.len() > 0 {
             let cell_area = (res * res) as f32;
             // Keep the two facts SEPARATELY as well as blended.
             //
             // `clutter` below mixes "how tall" with "how much of the cell",
             // which is the right input for an area sweep that treats every
             // cell as a receiver and the wrong one for deciding whether a
-            // particular point is on a street or inside a building. Both
-            // numbers already exist here; only the blend used to survive, so
-            // every downstream consumer was forced to reason about a city
-            // through a single averaged height.
+            // particular point is on a street or inside a building.
             built_fraction = vec![0f32; nx * ny];
             building_top = vec![0f32; nx * ny];
             for i in 0..nx * ny {
-                if bldg_area[i] <= 0.0 {
+                if acc.area[i] <= 0.0 {
                     continue;
                 }
-                built_fraction[i] = (bldg_area[i] / cell_area).min(1.0);
-                building_top[i] = bldg_sum[i] / bldg_area[i];
+                built_fraction[i] = (acc.area[i] / cell_area).min(1.0);
+                building_top[i] = acc.sum[i] / acc.area[i];
             }
             for i in 0..nx * ny {
-                if bldg_area[i] <= 0.0 {
+                if acc.area[i] <= 0.0 {
                     continue;
                 }
                 // Mean height OF THE BUILDINGS, applied when they occupy a
-                // meaningful share of the cell. Area-averaging instead (the
-                // previous behaviour) reported central Berlin at ~3.6 m
-                // against a real 18.4 m median and made the city transparent.
-                let built_fraction = bldg_area[i] / cell_area;
-                let representative = bldg_sum[i] / bldg_area[i];
+                // meaningful share of the cell. An area average reports
+                // central Berlin at ~3.6 m against a real 18.4 m median and
+                // makes the city transparent.
+                let built_fraction = acc.area[i] / cell_area;
+                let representative = acc.sum[i] / acc.area[i];
                 let value = if built_fraction >= 0.15 {
                     representative
                 } else {
@@ -452,24 +568,64 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     clutter.data[i] = value;
                 }
                 measured_clutter[i] = true;
-                quality[i] = DataQuality::Lod2Buildings as u8;
+                // Most of the cell's built area decides: LoD2, else OSM
+                // heights tagged, else OSM defaults.
+                let q = if 2.0 * acc.lod2[i] >= acc.area[i] {
+                    DataQuality::Lod2Buildings
+                } else if 2.0 * acc.tagged[i] >= acc.area[i] {
+                    DataQuality::OsmTaggedHeights
+                } else {
+                    DataQuality::OsmDefaultHeights
+                };
+                raise(&mut quality[i], q);
             }
-            used_lod2 = true;
-            eprintln!("lod2: {n_buildings} building records → buildings.jsonl + clutter merge");
+            if n_lod2 > 0 {
+                eprintln!("lod2: {n_lod2} building records → buildings.jsonl + clutter merge");
+            }
+            if !osm_buildings.is_empty() {
+                let census = crate::osm::height_census(&osm_buildings);
+                let n = |s| census.get(&s).copied().unwrap_or(0);
+                use planner_buildings::HeightSource as H;
+                eprintln!(
+                    "osm buildings: {} footprints ({} height tag, {} levels, {} class default) → clutter merge",
+                    osm_buildings.len(),
+                    n(H::OsmHeight),
+                    n(H::OsmLevels),
+                    n(H::Default)
+                );
+            }
         }
+        steps.end("buildings");
     }
+    let used_lod2 = n_lod2 > 0;
+    let used_osm_buildings = !osm_buildings.is_empty();
 
     // Real 1 m override where Berlin DGM1+bDOM pairs cover the region
     // (EPSG:25833 ≈ 32633 within <1 m — used as-is; berlin1m.rs).
     let mut used_berlin_1m = false;
     if let Some(dir) = &params.berlin_1m_dir {
-        let pairs = crate::berlin1m::find_pairs(dir)?;
+        steps.begin("lidar");
+        // Only the tiles meeting the grid. A key is the tile's south-west
+        // corner in km; tiles are 1 or 2 km, so 2 km is the safe extent.
+        let pairs: Vec<_> = crate::berlin1m::find_pairs(dir)?
+            .into_iter()
+            .filter(|(key, _, _)| {
+                let mut it = key.split('_').map(|v| v.parse::<f64>().ok());
+                match (it.next().flatten(), it.next().flatten()) {
+                    (Some(e), Some(n)) => {
+                        meets([e * 1000.0, n * 1000.0, (e + 2.0) * 1000.0, (n + 2.0) * 1000.0], grid_extent)
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
         if !pairs.is_empty() {
             let mut dtm_acc = crate::berlin1m::MeanAccum::new(nx * ny);
             let mut clut_acc = crate::berlin1m::MeanAccum::new(nx * ny);
             // Parse tile pairs in parallel (the expensive part: two ~116 MB
             // XYZ texts each), scatter serially per chunk; chunking bounds
             // in-flight grids to ~32 MB × threads.
+            let mut pairs_done = 0u64;
             for chunk in pairs.chunks(n_threads.max(1)) {
                 let parsed: Result<Vec<_>, PackError> = chunk
                     .par_iter()
@@ -481,22 +637,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     .collect();
                 for (key, dgm, dom) in parsed? {
                     eprintln!("berlin-1m: ingesting tile {key}");
-                    crate::berlin1m::accumulate_grids(
-                        &dgm,
-                        &dom,
-                        |x, y| {
-                            let col = ((x - origin.x) / res).round();
-                            let row = ((origin.y - y) / res).round();
-                            if col < 0.0 || row < 0.0 || col >= nx as f64 || row >= ny as f64 {
-                                None
-                            } else {
-                                Some(row as usize * nx + col as usize)
-                            }
-                        },
-                        &mut dtm_acc,
-                        &mut clut_acc,
-                    );
+                    crate::berlin1m::accumulate_grids(&dgm, &dom, cell_of, &mut dtm_acc, &mut clut_acc);
                 }
+                pairs_done += chunk.len() as u64;
+                steps.part("lidar", pairs_done, pairs.len() as u64);
             }
             // Override cells with meaningful sample coverage (≥ 25% of a
             // full res×res cell's 1 m samples).
@@ -512,9 +656,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         clutter.data[i] = v.max(0.0);
                         measured_clutter[i] = true;
                     }
-                    // Wins over LoD2: this is lidar-derived terrain AND
-                    // surface at 1 m, the best evidence the pack can carry.
-                    quality[i] = DataQuality::Lidar1m as u8;
+                    // Wins over any building source: this is lidar-derived
+                    // terrain AND surface at 1 m, the best evidence the pack
+                    // can carry.
+                    raise(&mut quality[i], DataQuality::Lidar1m);
                     overridden += 1;
                 }
             }
@@ -525,12 +670,14 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 nx * ny
             );
         }
+        steps.end("lidar");
     }
 
     // WorldCover clutter-class layer (categorical; nearest-neighbor codes).
     let mut used_worldcover = false;
     let mut class_codes: Option<Vec<f32>> = None;
     if !params.worldcover_tiles.is_empty() {
+        steps.begin("landcover");
         // Validate once; workers open their own readers (as with the DSM).
         crate::worldcover::WorldCoverTiles::open(&params.worldcover_tiles)?;
         let mut codes = vec![f32::NAN; nx * ny];
@@ -559,14 +706,16 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             used_worldcover = true;
             eprintln!("worldcover: {hits}/{} cells classified → clutter_class.tif", nx * ny);
         }
+        steps.end("landcover");
     }
 
+    steps.begin("clutter");
     // P.1812 §3.2.1 / Table 2: where no MEASURED building data covers a
     // cell, use the Recommendation's representative clutter heights for the
     // ground-cover class instead of whatever the DSM-opening proxy produced.
-    // Without this, cities with no LoD2 coverage propagate like open plain
-    // (measured on this pack: central Berlin at 3.6 m mean against a real
-    // 18.4 m median building height).
+    // Without this, cities with no building data propagate like open plain
+    // (central Berlin at 3.6 m mean against a real 18.4 m median building
+    // height).
     if let Some(codes) = &class_codes {
         use planner_core::profile::ClutterClass;
         let table2 = |c: ClutterClass| -> f32 {
@@ -599,93 +748,39 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         }
     }
 
-    // Roads/rail: display-only orientation layer, projected into pack CRS.
-    let mut used_roads = false;
-    if let Some(path) = &params.roads_json {
-        let json = read_input(path, "roads export")?;
-        let ways = crate::roads::parse_overpass(&json, |lat, lon| {
-            to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN))
-        });
-        if !ways.is_empty() {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(
-                params.out_dir.join("roads.bin"),
-            )?);
-            crate::roads::write_binary(&mut f, &ways)?;
-            used_roads = true;
-            let pts: usize = ways.iter().map(|w| w.points.len()).sum();
-            eprintln!("roads: {} ways / {pts} points → roads.bin", ways.len());
+    // The OpenStreetMap sidecar, now that the terrain under each building is
+    // final (the 1 m override may have replaced it), after LoD2's lines when
+    // this build wrote any (the LoD2 step starts the file afresh).
+    if used_osm_buildings {
+        use std::io::Write as _;
+        let lod2_started = params.lod2_dir.is_some();
+        let mut sidecar = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(lod2_started)
+                .truncate(!lod2_started)
+                .open(params.out_dir.join("buildings.jsonl"))?,
+        );
+        for b in &mut osm_buildings {
+            // The nearest cell: a building on the grid's edge may have its
+            // centroid just off it.
+            let col = ((b.e - origin.x) / res).round().clamp(0.0, (nx - 1) as f64) as usize;
+            let row = ((origin.y - b.n) / res).round().clamp(0.0, (ny - 1) as f64) as usize;
+            b.ground_z = dtm.data[row * nx + col] as f64;
+            writeln!(sidecar, "{}", b.to_json_line(true)?)?;
         }
+        sidecar.flush()?;
+        eprintln!("osm buildings: {} records → buildings.jsonl", osm_buildings.len());
     }
-
-    // Gazetteer: the offline answer to "where is X?". Same rule as roads —
-    // the export is fetched beforehand, the compiler never reaches the network.
-    let mut used_places = false;
-    if let Some(path) = &params.places_json {
-        let json = read_input(path, "places export")?;
-        let gaz = crate::places::parse_overpass(&json, |lat, lon| {
-            to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN))
-        });
-        if !gaz.entries.is_empty() {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(
-                params.out_dir.join("places.bin"),
-            )?);
-            crate::places::write_binary(&mut f, &gaz)?;
-            used_places = true;
-            eprintln!(
-                "places: {} searchable names / {} postal areas → places.bin",
-                gaz.entries.len(),
-                gaz.areas.len()
-            );
-        }
-    }
-
-    // The deployed network. Same rule again: the advert map is scraped at
-    // build time, the compiler only reads a file. Positions are projected with
-    // the same closure as roads/places so every vector layer shares one CRS.
-    let mut used_nodes = false;
-    if let Some(path) = &params.nodes_csv {
-        let csv = read_input(path, "deployed-nodes CSV")?;
-        let nodes = crate::nodes::parse_csv(&csv, |lat, lon| {
-            to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN))
-        })?;
-        if !nodes.is_empty() {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(
-                params.out_dir.join("nodes.bin"),
-            )?);
-            crate::nodes::write_binary(&mut f, &nodes)?;
-            used_nodes = true;
-            let repeaters = nodes
-                .iter()
-                .filter(|n| n.kind == crate::nodes::NodeKind::Repeater)
-                .count();
-            let with_height = nodes.iter().filter(|n| n.height_agl_m.is_some()).count();
-            // Report the height count, not just the node count: an advert
-            // gives a position and nothing else, so this number is how much of
-            // the layer propagation can actually use without an operator
-            // filling in the rest.
-            eprintln!(
-                "nodes: {} deployed ({repeaters} repeaters), {with_height} with a known antenna height → nodes.bin",
-                nodes.len()
-            );
-        } else {
-            // Say so. A pack with no Nodes layer is indistinguishable from a
-            // region where nothing is deployed, and the planner then answers
-            // "is this hill covered" instead of "what does a site here ADD" —
-            // which is the question the layer exists for. The operator asked
-            // for this file, so silence here is a wrong answer, not an absence.
-            eprintln!(
-                "nodes: WARNING {} parsed to zero nodes; the pack will have NO deployed-network layer",
-                path.display()
-            );
-        }
-    }
+    drop(osm_buildings);
 
     write_geotiff_f32(&params.out_dir.join("dtm.tif"), &dtm)?;
     write_geotiff_f32(&params.out_dir.join("clutter_h.tif"), &clutter)?;
 
-    // The unblended halves of the clutter layer. Written only when LoD2 ran,
-    // so their presence in the manifest IS the statement that this pack knows
-    // where buildings begin and end.
+    // The unblended halves of the clutter layer. Written only when buildings
+    // were merged, so their presence in the manifest IS the statement that
+    // this pack knows where buildings begin and end.
     if !built_fraction.is_empty() {
         let f = Grid::with_axes(origin, res, -res, nx, ny, std::mem::take(&mut built_fraction))?;
         write_geotiff_f32(&params.out_dir.join("built_fraction.tif"), &f)?;
@@ -736,31 +831,27 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         let count = |code: DataQuality| {
             quality.iter().filter(|&&c| c == code as u8).count() as f64
         };
-        let (pseudo, lod2c, lidar) = (
-            count(DataQuality::Glo30Pseudo),
-            count(DataQuality::Lod2Buildings),
-            count(DataQuality::Lidar1m),
-        );
-        eprintln!(
-            "data quality: {:.2}% lidar 1 m, {:.2}% LoD2 buildings, {:.2}% GLO-30 SYNTHESIZED \
-             -> data_quality.tif",
-            100.0 * lidar / total,
-            100.0 * lod2c / total,
-            100.0 * pseudo / total
-        );
-        if pseudo / total > 0.5 {
+        let census: Vec<String> = DataQuality::ALL
+            .iter()
+            .rev()
+            .map(|&q| format!("{:.2}% {}", 100.0 * count(q) / total, q.label()))
+            .collect();
+        eprintln!("data quality: {} -> data_quality.tif", census.join(", "));
+        if count(DataQuality::Glo30Pseudo) / total > 0.5 {
             eprintln!(
                 "  WARNING: most of this pack's clutter is synthesized from a 30 m DSM. \
                  Coverage predictions outside the measured area carry that uncertainty; \
-                 fetch the full DGM1/bDOM and LoD2 sets (see SERVER_RUNBOOK) for a \
+                 building footprints or 1 m lidar, where they exist, make a \
                  planning-grade pack."
             );
         }
     }
+    steps.end("clutter");
 
     // Zensus population layer (persons per pack cell).
     let mut used_zensus = false;
     if let Some(csv) = &params.zensus_csv {
+        steps.begin("population");
         let laea = crate::zensus::laea_proj()?;
         let mut pop = vec![0f32; nx * ny];
         let total = crate::zensus::accumulate_population(
@@ -773,15 +864,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     .map_err(|e| PackError::Proj(format!("ll→utm: {e}")))?;
                 Ok((pt.0, pt.1))
             },
-            |x, y| {
-                let col = ((x - origin.x) / res).round();
-                let row = ((origin.y - y) / res).round();
-                if col < 0.0 || row < 0.0 || col >= nx as f64 || row >= ny as f64 {
-                    None
-                } else {
-                    Some(row as usize * nx + col as usize)
-                }
-            },
+            cell_of,
             res,
             &mut pop,
         )?;
@@ -790,27 +873,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         write_geotiff_f32(&params.out_dir.join("population.tif"), &grid)?;
         used_zensus = total > 0;
         eprintln!("zensus: {total} residents inside the region → population.tif");
+        steps.end("population");
     }
 
-    // Region bbox in WGS84 from the four grid-extent corners.
-    let x0 = origin.x - res / 2.0;
-    let x1 = x0 + nx as f64 * res;
-    let y1 = origin.y + res / 2.0;
-    let y0 = y1 - ny as f64 * res;
-    let mut lons: Vec<f64> = Vec::new();
-    let mut lats: Vec<f64> = Vec::new();
-    for (x, y) in [(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
-        let (lon, lat) = to_lonlat(&utm, &ll, x, y)?;
-        lons.push(lon);
-        lats.push(lat);
-    }
-    let bbox = [
-        lons.iter().cloned().fold(f64::MAX, f64::min),
-        lats.iter().cloned().fold(f64::MAX, f64::min),
-        lons.iter().cloned().fold(f64::MIN, f64::max),
-        lats.iter().cloned().fold(f64::MIN, f64::max),
-    ];
-
+    steps.begin("manifest");
     // ΔN/N0: per-region scalars from the ITU maps when available (§3.5;
     // never redistributed — only the two numbers enter the manifest).
     let (delta_n, n0) = match &params.itu_maps_dir {
@@ -821,9 +887,8 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         }
         None => {
             eprintln!(
-                "WARNING: no --itu-maps dir — using world-median ΔN=45 / N0=325 \
-                 (small accuracy cost; see planner-propag tests/oracle/README.md \
-                 for obtaining the maps)"
+                "WARNING: no ITU maps — using world-median ΔN=45 / N0=325 \
+                 (small accuracy cost)"
             );
             (45.0, 325.0)
         }
@@ -847,7 +912,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: Some(res),
                 },
             ];
-            if used_lod2 {
+            if used_lod2 || used_osm_buildings {
                 layers.push(LayerMeta {
                     kind: LayerKind::Buildings,
                     path: "buildings.jsonl".into(),
@@ -899,13 +964,6 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: None,
                 });
             }
-            if used_nodes {
-                layers.push(LayerMeta {
-                    kind: LayerKind::Nodes,
-                    path: "nodes.bin".into(),
-                    res_m: None,
-                });
-            }
             layers
         },
         licenses: {
@@ -949,10 +1007,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     notice: crate::places::OSM_NOTICE.into(),
                 });
             }
-            if used_nodes {
+            if used_osm_buildings {
                 l.push(LicenseNotice {
-                    source: "Deployed mesh nodes (community adverts)".into(),
-                    notice: crate::nodes::NODES_NOTICE.into(),
+                    source: "OpenStreetMap buildings".into(),
+                    notice: crate::osm::OSM_BUILDINGS_NOTICE.into(),
                 });
             }
             l
@@ -961,7 +1019,83 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     };
     manifest.validate()?;
     std::fs::write(params.out_dir.join("manifest.json"), manifest.to_json())?;
+    steps.end("manifest");
     Ok(manifest)
+}
+
+/// Whether two extents `[min_x, min_y, max_x, max_y]` meet.
+fn meets(a: [f64; 4], b: [f64; 4]) -> bool {
+    a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
+}
+
+/// The extent holding both.
+fn union(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// Whether a building stands on ground LoD2 covers: its centroid inside one
+/// of the covered extents (half-open, so a centroid on a shared tile edge
+/// belongs to one tile).
+fn lod2_covers(covered: &[[f64; 4]], b: &crate::lod2::Lod2Building) -> bool {
+    covered.iter().any(|t| t[0] <= b.e && b.e < t[2] && t[1] <= b.n && b.n < t[3])
+}
+
+/// Building heights summed over 1 m samples per pack cell, plus the built
+/// AREA, so a cell reports the height of its buildings rather than that
+/// height smeared across courtyards and streets (P.1812 §3.2.1
+/// representative clutter height).
+struct BuiltAccum {
+    sum: Vec<f32>,
+    /// 1 m samples of building in the cell.
+    area: Vec<f32>,
+    /// Of those, the samples whose height is tagged or measured rather than a
+    /// class default.
+    tagged: Vec<f32>,
+    /// Of those, the samples of LoD2 buildings.
+    lod2: Vec<f32>,
+    seen: std::collections::HashSet<(i32, i32)>,
+}
+
+impl BuiltAccum {
+    fn new(n: usize) -> Self {
+        BuiltAccum {
+            sum: vec![0.0; n],
+            area: vec![0.0; n],
+            tagged: vec![0.0; n],
+            lod2: vec![0.0; n],
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// One 1 m sample must be counted ONCE per cell per building, and the
+    /// rasterizer cannot guarantee that: it fills each ground polygon
+    /// independently, and LoD2 splits a block into `BuildingPart`s whose
+    /// footprints touch and overlap at shared walls (on the cached Berlin tile,
+    /// 263 299 sink calls against 246 007 distinct 1 m cells). The key is the
+    /// 1 m SAMPLE, not the pack cell — deduplicating by cell would credit
+    /// each cell one sample per building and collapse every built fraction to
+    /// 1/(res²). And it is per BUILDING, not global: two DIFFERENT buildings
+    /// covering the same ground are two real contributions.
+    fn add(&mut self, b: &crate::lod2::Lod2Building, cell_of: &impl Fn(f64, f64) -> Option<usize>) {
+        self.seen.clear();
+        let tagged = b.source.is_tagged();
+        let lod2 = b.source == planner_buildings::HeightSource::Lod2;
+        crate::lod2::rasterize_building(b, |x, y, h| {
+            if !self.seen.insert((x.floor() as i32, y.floor() as i32)) {
+                return;
+            }
+            if let Some(k) = cell_of(x, y) {
+                self.sum[k] += h as f32;
+                self.area[k] += 1.0;
+                if tagged {
+                    self.tagged[k] += 1.0;
+                }
+                if lod2 {
+                    self.lod2[k] += 1.0;
+                }
+            }
+        });
+    }
 }
 
 /// GLO-30 tiles covering the UTM-ALIGNED grid a `--bbox` build actually
@@ -1081,41 +1215,84 @@ fn separable_pass(g: &mut Grid, half: usize, min_pass: bool) {
 mod tests {
     use super::*;
 
-    /// A mistyped input path must fail in the first second, naming the path.
-    ///
-    /// It used to fail minutes in, after writing hundreds of megabytes, with
-    /// `io: No such file or directory (os error 2)` and nothing to correct —
-    /// the deployed-nodes CSV is read after the LoD2 parse, the 1 m override,
-    /// WorldCover, roads and places, so it is the LAST thing checked and the
-    /// most expensive to get wrong.
+    /// A mistyped input path must fail in the first second, naming the path,
+    /// and every wrong path at once — before any tile is opened or any layer
+    /// written.
     #[test]
     fn every_bad_input_path_is_named_before_any_work_happens() {
         let dir = std::env::temp_dir().join("planner_pack_badinputs");
         std::fs::create_dir_all(&dir).unwrap();
-        // A real DSM is not needed: validation must come before the grid is
-        // ever touched, and the DSM check ahead of it takes its own path.
-        let dsm = dir.join("fake.tif");
-        std::fs::write(&dsm, b"not a tiff").unwrap();
-        let mut p = BuildParams::berlin_test(vec![dsm], dir.join("out"));
-        p.nodes_csv = Some(dir.join("nope-nodes.csv"));
-        p.roads_json = Some(dir.join("nope-roads.json"));
+        let mut p = BuildParams::berlin_test(vec![dir.join("nope-dsm.tif")], dir.join("out"));
+        p.osm_pbf = Some(dir.join("nope-berlin.osm.pbf"));
+        p.zensus_csv = Some(dir.join("nope-zensus.csv"));
         p.lod2_dir = Some(dir.join("nope-lod2"));
-
         let err = build(&p).unwrap_err().to_string();
-        // The DSM is opened first and this fake one fails there, so drop a
-        // real-enough DSM check by asserting only that we never got as far as
-        // a bare io error with no path.
-        assert!(
-            !err.contains("os error 2") || err.contains("nope-"),
-            "unhelpful error: {err}"
-        );
+        assert!(err.starts_with("manifest invalid: 4 build input(s) unusable"), "{err}");
+        for name in ["nope-dsm.tif", "nope-berlin.osm.pbf", "nope-zensus.csv", "nope-lod2"] {
+            assert!(err.contains(name), "{name} not named: {err}");
+        }
 
-        // With the DSM list empty the input check is what must speak, and it
-        // must name ALL THREE at once rather than one per run.
-        let mut p2 = BuildParams::berlin_test(vec![], dir.join("out"));
-        p2.nodes_csv = Some(dir.join("nope-nodes.csv"));
+        let p2 = BuildParams::berlin_test(vec![], dir.join("out"));
         let e2 = build(&p2).unwrap_err().to_string();
         assert!(e2.contains("no DSM input tiles"), "{e2}");
+
+        let mut p3 = BuildParams::berlin_test(vec![dir.join("nope-dsm.tif")], dir.join("out"));
+        p3.osm_buildings = true;
+        let e3 = build(&p3).unwrap_err().to_string();
+        assert!(e3.contains("without an OpenStreetMap extract"), "{e3}");
+    }
+
+    /// An OpenStreetMap building on a LoD2 tile is LoD2's; one beside the
+    /// tiles is OpenStreetMap's. A centroid on the edge two tiles share
+    /// belongs to one of them only.
+    #[test]
+    fn lod2_tiles_decide_where_openstreetmap_buildings_stay() {
+        let at = |e: f64, n: f64| crate::lod2::Lod2Building {
+            id: "w1".into(),
+            e,
+            n,
+            ground_z: 0.0,
+            area_m2: 100.0,
+            height_m: 9.0,
+            source: planner_buildings::HeightSource::Default,
+            rings: Vec::new(),
+        };
+        let covered = [
+            crate::lod2::tile_extent("LoD2_33_390_5820_1_BE.xml").unwrap(),
+            crate::lod2::tile_extent("LoD2_33_391_5820_1_BE.xml").unwrap(),
+        ];
+        assert!(lod2_covers(&covered, &at(390_500.0, 5_820_500.0)));
+        assert!(lod2_covers(&covered, &at(391_000.0, 5_820_000.0)));
+        assert!(!lod2_covers(&covered, &at(392_000.0, 5_820_500.0)));
+        assert!(!lod2_covers(&covered, &at(390_500.0, 5_821_000.0)));
+        assert!(!lod2_covers(&[], &at(390_500.0, 5_820_500.0)));
+        assert_eq!(union([0.0, 1.0, 2.0, 3.0], [-1.0, 2.0, 1.0, 5.0]), [-1.0, 1.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn a_step_reports_as_it_starts_and_as_it_ends() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let f: Box<ProgressFn> = Box::new(move |p: &Progress| {
+            sink.lock().unwrap().push((p.step.to_string(), p.done, p.total, p.part));
+        });
+        let mut s = Steps { names: vec!["terrain", "osm", "manifest"], done: 0, report: Some(&*f) };
+        s.begin("terrain");
+        s.end("terrain");
+        s.begin("osm");
+        s.part("osm", 1, 3);
+        s.end("osm");
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                ("terrain".to_string(), 0, 3, None),
+                ("terrain".to_string(), 1, 3, None),
+                ("osm".to_string(), 1, 3, None),
+                ("osm".to_string(), 1, 3, Some((1, 3))),
+                ("osm".to_string(), 2, 3, None),
+            ]
+        );
     }
 
     #[test]

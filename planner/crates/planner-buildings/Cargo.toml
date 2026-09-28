@@ -1,0 +1,12 @@
+[package]
+name = "planner-buildings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Building heights: where a building's height came from, and the OpenStreetMap height rules"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

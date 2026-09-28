@@ -15,6 +15,7 @@ Its intents, in its CLI:
     name        hostname {name}
     radio       lora 0 freq|sf|bw|cr|txp|sync|preamble for each figure the
                 radio gives, then lora up to start it
+    tx_power    lora 0 txp <dBm>
     role        set s.rnsd.transport_enabled 1 (transport) or 0 (client)
     announce    lora 0 a
     message     lxmf send <dest> <text>
@@ -55,13 +56,16 @@ class Reticulous(Kind):
     def env(self, station):
         env = super().env(station)
         # What this firmware reads: its board (hw-linux) takes its identity,
-        # directory, address, ether and /fixed tree from these names.
+        # directory, address, ether, /fixed tree and board (its radio's front
+        # end and ceiling) from these names.
         env.update(SPANGAP_NODE_ID=str(station.node_id),
                    SPANGAP_NODE_DIR=station.dir,
                    SPANGAP_BIND_ADDR=station.addr,
                    SPANGAP_ETHER=station.ether_addr)
         if self.fixed:
             env["SPANGAP_FIXED_DIR"] = self.fixed
+        if env.get("SIMESH_BOARD"):
+            env["SPANGAP_BOARD"] = env["SIMESH_BOARD"]
         return env
 
     def client(self, station):
@@ -160,7 +164,11 @@ class Reticulous(Kind):
             return ["hostname {name}"]
         if verb == "radio":
             return [line % args[key] for key, line in RADIO_LINES
-                    if args.get(key) is not None] + self.radio_start()
+                    if args.get(key) is not None]
+        if verb == "radio_up":
+            return ["lora up"]
+        if verb == "tx_power":
+            return ["lora 0 txp %g" % float(args["dbm"])]
         if verb == "role":
             return ["set %s %d" % (TRANSPORT_KEY, 1 if args["role"] == "transport" else 0)]
         if verb == "announce":
@@ -172,9 +180,6 @@ class Reticulous(Kind):
         if verb == "peer_tcp":
             return ["tcp peer add %s:%d" % (args["addr"], int(args.get("port") or 4965))]
         return super().lines(verb, **args)
-
-    def radio_start(self):
-        return ["lora up"]
 
     def web_port(self):
         return 80

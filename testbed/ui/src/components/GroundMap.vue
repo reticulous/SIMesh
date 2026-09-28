@@ -26,6 +26,13 @@
       </div>
       <div v-if="note" class="wmap-note">{{ note }}</div>
     </div>
+    <div v-if="credits.length" class="wmap-credits" :title="creditsOpen ? '' : 'the sources’ notices'"
+         @click="creditsOpen = !creditsOpen">
+      <template v-if="creditsOpen">
+        <div v-for="l in ground.current?.licences ?? []" :key="l.source"><b>{{ l.source }}</b> {{ l.notice }}</div>
+      </template>
+      <template v-else>{{ credits.join(' · ') }} ⓘ</template>
+    </div>
     <div v-if="busy" class="wmap-busy">loading ground…</div>
   </div>
 </template>
@@ -55,6 +62,8 @@
  *   links      for the one selected node, every other node coloured by the
  *              level it would be heard at: decodable, or only interfering,
  *              solid where the first Fresnel zone is clear
+ *   layers     the other shown layers' nodes, hollow in their layer's
+ *              colour, named on hover; a click on one is reported
  *   nodes      a dot each, a second ring round a node that carries others'
  *              traffic, its name and, smaller, its height and tags
  *   live       rings while a station transmits, flashes where a frame lands,
@@ -78,7 +87,7 @@ import type { Display } from '../stores/display'
 import { COVERAGE_BANDS, type CoverageSource } from '../stores/coverage'
 import type { Offset } from '../stores/nodes'
 import { M_PER_DEGREE } from '../lib/proj'
-import type { GroundPoint, LinkMark, MapNode, Pick } from '../lib/marks'
+import { forwardingRole, type GroundPoint, type LinkMark, type MapNode, type OtherNode, type Pick } from '../lib/marks'
 import {
   baseImage, buildings, greyed, inside, populationImage, roads,
   type BaseImage, type Box, type Footprint, type Footprints, type Heatmap, type Way,
@@ -86,6 +95,8 @@ import {
 
 const props = withDefaults(defineProps<{
   nodes?: MapNode[]
+  /** The other shown layers' nodes, drawn hollow in their layer's colour. */
+  others?: OtherNode[]
   offsets?: Offset[]
   selected?: string[]
   /** Nodes can be dragged. */
@@ -104,6 +115,7 @@ const props = withDefaults(defineProps<{
   viewKey?: string
 }>(), {
   nodes: () => [],
+  others: () => [],
   offsets: () => [],
   selected: () => [],
   editable: false,
@@ -127,6 +139,8 @@ const emit = defineEmits<{
   /** A right-click, with the node under it when there is one. */
   context: [at: GroundPoint, name: string | null]
   hover: [name: string | null]
+  /** A click on another layer's node. */
+  other: [layer: string, name: string]
 }>()
 
 const ground = useGeodata()
@@ -143,7 +157,6 @@ const BLDG_FILL_VIEW_M = 4000
 const SETTLE_MS = 160
 const DRAG_SEND_HZ = 6
 const COVERAGE_PX = 4
-const FORWARDING = ['transport', 'router', 'repeater']
 
 /* ── the view: centre in ground metres, metres per CSS pixel ── */
 const view = ref({ cx: 0, cy: 0, mpp: 20 })
@@ -153,6 +166,12 @@ const note = ref<string | null>(null)
 /** The pointer is over one of the selected node's link lines: it opens the pair. */
 const overLink = ref(false)
 /** Which heatmap's key is shown, if either. */
+/* The notices of the ground on show, which its sources' licences ask to be
+ * seen where it is drawn: one short line, each source once (OpenStreetMap's
+ * as its own attribution asks), opening to the notices in full. */
+const creditsOpen = ref(false)
+const credits = computed(() => [...new Set((ground.current?.licences ?? []).map(l =>
+  l.source.startsWith('OpenStreetMap') ? '© OpenStreetMap contributors' : l.source))])
 const legend = computed<'coverage' | 'population' | null>(() =>
   props.display.population && ground.isPack ? 'population'
   : props.display.coverage && props.coverage ? 'coverage' : null)
@@ -185,6 +204,12 @@ const positions = computed(() => {
   return out
 })
 const chosen = computed(() => new Set(props.selected))
+function otherKey(o: OtherNode) { return `${o.layer}\u0000${o.name}` }
+const otherXY = computed(() => {
+  const f = ground.frame
+  return new Map(props.others.map(o => [otherKey(o), f.toXY(o.lat, o.lon)]))
+})
+const hoveredOther = ref<string | null>(null)
 function posOf(name: string): [number, number] | null {
   const p = positions.value.get(name) ?? null
   if (p && drag?.moving && drag.shift && drag.group.has(name)) {
@@ -193,12 +218,24 @@ function posOf(name: string): [number, number] | null {
   return p
 }
 
-/* ── the view is remembered per geodata ── */
+/* ── the view is remembered per geodata ──
+ * Maps with the same viewKey share it (the Geodata and Nodes tabs do): each
+ * keeps the last one in the geodata store as it moves, and one coming on
+ * show, or on show when the other moved, takes it up. */
 function storageKey() { return `simesh.view.${ground.current?.name ?? '-'}.${props.viewKey}` }
 function saveView() {
+  ground.views[storageKey()] = { ...view.value }
   try { localStorage.setItem(storageKey(), JSON.stringify(view.value)) } catch { /* private window */ }
 }
+function adoptShared(): boolean {
+  const held = ground.views[storageKey()]
+  if (!held || (held.cx === view.value.cx && held.cy === view.value.cy && held.mpp === view.value.mpp)) return !!held
+  view.value = { ...held }
+  settled()
+  return true
+}
 function restoreView() {
+  if (adoptShared()) return
   try {
     const held = localStorage.getItem(storageKey())
     if (held) { view.value = JSON.parse(held); settled(); return }
@@ -237,7 +274,14 @@ function fitToNodes() {
 function goTo(x: number, y: number, span?: number) {
   view.value = { cx: x, cy: y, mpp: span ? span / Math.max(size.w, 200) : view.value.mpp }
   pin = [x, y]
+  saveView()
   settled()
+}
+
+/** Fit the view to the nodes when asked to, and keep it. */
+function fitAndKeep() {
+  fitToNodes()
+  saveView()
 }
 
 /** The footprint at a ground point, from what is loaded. */
@@ -256,7 +300,7 @@ function groundAt(x: number, y: number): number | null {
   return Number.isFinite(v) ? v : null
 }
 
-defineExpose({ fitToNodes, goTo, footprintAt, groundAt })
+defineExpose({ fitToNodes: fitAndKeep, goTo, footprintAt, groundAt })
 
 /* ── the ground, fetched when the view settles ── */
 interface Held { image: BaseImage; grid: BaseImage['grid']; key: string; res: number
@@ -725,9 +769,10 @@ function draw() {
   }
   if (props.display.offsets) drawOffsets()
   drawPair()
-  if (props.display.links) drawLinks()
+  drawLinks()
   if (props.live) drawPulses()
   drawPin()
+  drawOthers()
   drawNodes()
   drawBand()
 }
@@ -954,8 +999,7 @@ function drawNodes() {
         ? `rgba(34, 197, 94, ${0.6 * (1 - flash.age)})` : `rgba(239, 68, 68, ${0.6 * (1 - flash.age)})`
       ctx.beginPath(); ctx.arc(sx, sy, NODE_R + 9, 0, Math.PI * 2); ctx.fill()
     }
-    const role = n.liveRole ?? n.role
-    if (role && FORWARDING.includes(role)) {
+    if (forwardingRole(n)) {
       // A node that carries others' traffic: its second ring is the whole of
       // that difference, read at a glance across a big map.
       // Black, so it stands out on the light ground and on a heatmap alike.
@@ -1011,6 +1055,27 @@ function drawNodes() {
   ctx.textAlign = 'left'
 }
 
+/* The other shown layers' nodes: hollow, in their layer's colour, named
+ * only while the pointer is on one. */
+function drawOthers() {
+  if (!ctx || !props.others.length) return
+  ctx.lineWidth = 2
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'top'
+  for (const o of props.others) {
+    const [x, y] = otherXY.value.get(otherKey(o))!
+    const [sx, sy] = toScreen(x, y)
+    if (sx < -20 || sy < -20 || sx > size.w + 20 || sy > size.h + 20) continue
+    ctx.strokeStyle = o.colour
+    ctx.beginPath(); ctx.arc(sx, sy, NODE_R - 1, 0, Math.PI * 2); ctx.stroke()
+    if (hoveredOther.value === otherKey(o)) {
+      ctx.font = '12px ui-sans-serif, system-ui, sans-serif'
+      text(`${o.name} · ${o.layer}`, sx, sy + NODE_R + 4, o.colour)
+    }
+  }
+  ctx.textAlign = 'left'
+}
+
 function drawBand() {
   if (!ctx || !drag?.band || !drag.moving) return
   const { from, to } = drag.band
@@ -1061,25 +1126,37 @@ interface Drag {
 }
 let drag: Drag | null = null
 
-/** The other end of the selected node's link line under a screen point, or null. */
-function linkAt(sx: number, sy: number): string | null {
-  if (!props.display.links || !props.links || props.selected.length !== 1) return null
-  const from = posOf(props.selected[0]!)
-  if (!from) return null
-  const [fx, fy] = toScreen(from[0], from[1])
-  let best: string | null = null
+/** The selected node's link line under a screen point, as its two ends, or null. */
+function linkAt(sx: number, sy: number): [string, string] | null {
+  let best: [string, string] | null = null
   let bestD = LINK_HIT_PX
-  for (const m of props.links) {
-    if (!Number.isFinite(m.level)) continue
-    const to = posOf(m.name)
-    if (!to) continue
-    const [tx, ty] = toScreen(to[0], to[1])
+  const consider = (a: string, b: string) => {
+    const pa = posOf(a), pb = posOf(b)
+    if (!pa || !pb) return
+    const [fx, fy] = toScreen(pa[0], pa[1])
+    const [tx, ty] = toScreen(pb[0], pb[1])
     // Distance from the point to the segment, the ends included.
     const vx = tx - fx, vy = ty - fy
     const len2 = vx * vx + vy * vy
     const t = len2 ? Math.max(0, Math.min(1, ((sx - fx) * vx + (sy - fy) * vy) / len2)) : 0
     const d = Math.hypot(sx - (fx + t * vx), sy - (fy + t * vy))
-    if (d <= bestD) { best = m.name; bestD = d }
+    if (d <= bestD) { best = [a, b]; bestD = d }
+  }
+  if (props.links && props.selected.length === 1) {
+    const from = props.selected[0]!
+    for (const m of props.links) if (Number.isFinite(m.level)) consider(from, m.name)
+  }
+  return best
+}
+
+function otherAt(sx: number, sy: number): OtherNode | null {
+  let best: OtherNode | null = null
+  let bestD = HIT_R
+  for (const o of props.others) {
+    const [x, y] = otherXY.value.get(otherKey(o))!
+    const [nx, ny] = toScreen(x, y)
+    const dist = Math.hypot(nx - sx, ny - sy)
+    if (dist <= bestD) { best = o; bestD = dist }
   }
   return best
 }
@@ -1140,6 +1217,9 @@ function onMove(event: PointerEvent) {
       emit('hover', name)
       redrawWanted = true
     }
+    const other = name ? null : otherAt(at.x, at.y)
+    const key = other ? otherKey(other) : null
+    if (key !== hoveredOther.value) { hoveredOther.value = key; redrawWanted = true }
     return
   }
   const dx = at.x - drag.from.x, dy = at.y - drag.from.y
@@ -1204,8 +1284,10 @@ function onUp(event: PointerEvent) {
     } else {
       const name = nodeAt(at.x, at.y)
       const other = name ? null : linkAt(at.x, at.y)
+      const layered = name || other ? null : otherAt(at.x, at.y)
       if (name) emit('select', name, event.shiftKey ? 'toggle' : 'replace')
-      else if (other) emit('link', props.selected[0]!, other)
+      else if (other) emit('link', other[0], other[1])
+      else if (layered) emit('other', layered.layer, layered.name)
       else {
         if (!event.shiftKey) emit('select', null, 'replace')
         emit('ground', groundPoint(at.x, at.y))
@@ -1249,7 +1331,10 @@ function resize() {
   const element = wrap.value, surface = canvas.value
   if (!element || !surface) return
   const dpr = window.devicePixelRatio || 1
+  const shown = size.w === 0 && element.clientWidth > 0
   size = { w: element.clientWidth, h: element.clientHeight, dpr }
+  // Coming on show (its tab chosen): where the other map sharing the view left it.
+  if (shown) adoptShared()
   surface.width = Math.round(size.w * dpr)
   surface.height = Math.round(size.h * dpr)
   surface.style.width = `${size.w}px`
@@ -1300,7 +1385,8 @@ watch(() => [props.display.coverage, props.coverage?.version], () => {
   if ((props.coverage?.version ?? '') !== coverageVersion || !coverageSurface.on) paintCoverage()
 })
 watch(() => ground.problem, (p) => { if (p) note.value = p })
-watch(() => [props.nodes, props.offsets, props.selected, props.links, props.pair, props.display, sim.levels],
+watch(() => [props.nodes, props.others, props.offsets, props.selected, props.links, props.pair,
+             props.display, sim.levels],
       () => { redrawWanted = true }, { deep: true })
 </script>
 
@@ -1331,6 +1417,13 @@ watch(() => [props.nodes, props.offsets, props.selected, props.links, props.pair
 .wmap-legend i.wmap-ramp {
   width: 70px; background: linear-gradient(90deg, rgba(120, 40, 170, 0.4), rgb(188, 125, 105), rgb(255, 210, 40));
 }
+.wmap-credits {
+  position: absolute; right: 10px; bottom: 26px; max-width: min(560px, 60%);
+  font-size: 10px; line-height: 1.4; color: #9ca3af; text-align: right; cursor: pointer;
+  background: rgba(18, 20, 23, 0.8); padding: 2px 6px; border-radius: 3px;
+}
+.wmap-credits div { text-align: left; margin: 2px 0; }
+.wmap-credits b { font-weight: 500; color: #d1d5db; }
 .wmap-busy {
   position: absolute; right: 10px; top: 8px; font-size: 11px; color: #9ca3af;
   background: rgba(18, 20, 23, 0.8); padding: 2px 6px; border-radius: 3px; pointer-events: none;

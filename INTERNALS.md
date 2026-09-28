@@ -17,7 +17,7 @@ path loss, which follows from where the nodes stand on their geodata. Two
 firmwares meet on one medium this way, each above its own driver:
 
 ```
-reticulous (ESP-IDF host target)            berlinmesh (Rust, std)
+reticulous (ESP-IDF host target)            sergeyculum (Rust, std)
 Reticulum / LXMF / web UI                   Node, LoRaIface
         │                                           │
    iface-lora, RadioLib                        Sx1262Radio
@@ -41,6 +41,13 @@ set. What it cannot catch is anything that depends on the chip being a chip:
 timing at the microsecond, memory layout, cache behaviour, a peripheral's
 errata.
 
+The other ways there are were weighed and are not used. Wokwi runs in the
+cloud on a budget of minutes, sandboxes custom chips with no sockets, and has
+no diagram of several microcontrollers. A QEMU (Quick Emulator) fork with a
+register-level SX1262 inherits the emulator's ceiling and adds a fork to keep.
+Mininet-WiFi and wmediumd model 802.11 only, with no LoRa physics and no
+virtual time.
+
 ## Its own launcher, and its own container
 
 SIMesh simulates whatever firmware has a station kind. Reticulous is one;
@@ -48,9 +55,16 @@ Sergeyculum is another, and a Meshtastic or MeshCore node would be as much
 its business. So it is not a verb of the tool that builds one of those
 firmwares: it has its own launcher (`simesh`), its own image and its own
 supply of prebuilt stations, and a clone runs with no firmware tree beside
-it. A workspace is for building a station of one's own, and a local device
-(`devices/local/<name>.yaml`) names its build by path; everything else about
-SIMesh is the same without one.
+it. A workspace is for building a station of one's own, into a catalogue of
+its `builds/` like any other build; everything else about SIMesh is the same
+without one.
+
+**A build is a stamped device file, not a build tree.** What was last
+compiled in a tree is anyone's guess, so a firmware that publishes simesh
+builds is only run from a catalogue, where each build has a stamp and a
+name. A compiled build (`devices/local/<project>_<catalogue>.yaml`, run in
+place from its tree) stands in only for a project that publishes none yet,
+Sergeyculum today, until it does.
 
 **Stations need Linux.** Each binds a `127.x.y.z` address of its own and
 the virtual-time shim is an `LD_PRELOAD` library, and neither exists on
@@ -62,8 +76,8 @@ dynamically linked against that release's C library, C++ runtime, zlib and
 libbsd; the host's own architecture, because a package runs only on the one
 it was built for; python3 with aiohttp and pyyaml, Node for the page, a C
 toolchain and cmake for the chip library, cargo for the planner and the
-`berlinmesh` kind. It copies nothing from the tree. `simesh` mounts the
-directory holding SIMesh at its own path, so a local device's `../../../reticulous`
+`sergeyculum` kind. It copies nothing from the tree. `simesh` mounts the
+directory holding SIMesh at its own path, so a compiled build's `../../../sergey`
 resolves to the same files inside the image as outside it, and runs as the host's user, so what it writes is theirs. The
 image is tagged by the Dockerfile's checksum and rebuilt when it changes.
 
@@ -77,14 +91,30 @@ keep in step. The listing marks each link with its target, so a flasher
 leaves the packages out, and SIMesh finds them by the entry's prefix. One
 file format serves every firmware, so a kind knows nothing of where its
 binary came from: a device imported on the page, fetched from a catalogue or
-described by a local `node.yaml` resolves to the same executable, `/fixed`,
-tools and environment.
+described by a compiled build's `node.yaml` resolves to the same executable,
+`/fixed`, tools and environment.
 
-**A package ref carries its catalogue.** One `make-builds` run stamps every
+**A device's name carries its catalogue.** One `make-builds` run stamps every
 catalogue it builds with the same datetime, so `stable` and `dev` packages
-of one run share a filename. A package is therefore named as
-`<catalogue>/<package>`; its bare name resolves only while one catalogue has
-it.
+of one run share a filename and differ only in where they came from. A
+build is therefore named `<project>_<catalogue>_<stamp>`, and what a script
+usually wants is `<project>_<catalogue>_latest`: the newest in that
+catalogue, whichever that is when it is used.
+
+**Latest is surveyed, and fetched only when used.** A catalogue publishes a
+build a day or more; downloading each one ahead of need would fill a disk
+with builds nobody ran, and keeping several per catalogue made every listing
+a question of which one a name meant. So a survey reads the listings only
+and notes the newest build per project and catalogue, with its `node.yaml`
+read out of the zip (by range requests on the web: the central directory at
+its end, then that one member) so a listing says what it plays without the
+catalogue having to carry it; a `_latest` build is
+downloaded the first time a simulation uses it, and removed as soon as a
+survey sees a newer one, fetched or not, so there is never more than one per
+catalogue and never a question of which. A build worth keeping is saved,
+which is a copy under its stamped name that nothing removes. A run keeps
+where each build was and, when that has been removed, resolves the name
+again on resume.
 
 **The port is 8800.** Round, and clear of everything else that runs beside
 it: spangap's 9000–9011, the planner's 8787, the front's per-simulation
@@ -174,9 +204,12 @@ simulation loaded, its stations' statuses, its clock and its plan, and sends
 the whole registry to every socket on the front once a wall second.
 
 **A child starts on a whole run.** Before it starts, the front loads and
-checks the geodata, the nodeset and the script, resolves every node's device, takes the
+checks the geodata, the nodeset and the script, takes the
 loss tables from the cache or computes them, and lays the run directory out;
-the child then loads that directory as it would one it was handed by hand.
+the child then loads that directory as it would one it was handed by hand,
+and settles each node's firmware from the run's rules (the script's, handed
+over by its runner), fetching what they name, before a station of it
+starts: a fetch is a wait the child's own loop can take.
 All of that is work a person waits on with a page open, so it is the
 front's, with its progress on every page, and none of it can stall a
 running simulation's loop. The table is a subprocess (`losses.py`) whose
@@ -215,12 +248,39 @@ pauses and then reports, so a script run from a shell ends the same way as
 one run from the page; the front pauses only what a runner that died left
 running.
 
-**Scripts run beside the front, not in it.** A script's `main` is a process
-of its own (`simesh.runner`) that attaches to its simulation over the front's
-port like any other driver; its output is read line by line and sent to
-every page. A script that loops, blocks or dies takes nothing else with it.
-A script's `setup` is the one exception: it runs inside the simulation's
-simd, where the stations are, and so may only await.
+**Scripts run beside the front and the simulation, never in them.** A script
+is a process of its own (`simesh.runner`) that starts its simulation, or
+attaches to one, over the front's port like any other driver; its output is
+read line by line and sent to every page. A script that loops, blocks or
+dies takes nothing else with it. What a station must be given at its first
+boot, which happens inside simd whenever a station comes up with no state,
+travels there as data (`on_first_boot()`'s rules: a selection and lines),
+not as the script's code, so no script code ever runs in simd's loop.
+
+**A script is synchronous.** It reads as it runs: `firmware(...)`, then
+`exec(...)`, then `wait(60)`, each returning when it is done, with no
+`await` to forget (a forgotten one silently does nothing) and no `async
+def main` to wrap it in. The library holds the simulation on an event loop
+of its own in a thread beside the script's and hands each call to it. What
+a script loses is easy concurrency; what a driver needs of it, many sends
+at their own instants, is `after=` and `wait=False`, and the traffic driver
+keeps its own async core on the library's loop.
+
+**What must happen at one instant is one message.** A driver's asks cross
+a websocket to simd and its answers come back the same way, and in a
+virtual-time run T does not wait for that: while every station is idle the
+ether moves T straight to the next thing any of them needs, which can be
+minutes on. A driver that asks a sender for its route, waits for the
+answer, then asks it to send, sends minutes late, and its sends bunch into
+bursts. So steps that belong together travel as one `sequence`
+(`Sim.sequence`), which simd runs back to back at the T the first is due:
+the traffic driver's route and send are one.
+
+**Declarations start the simulation.** `time()`, `firmware()` and
+`on_first_boot()` are collected until the script first does something, and
+that starts its simulation with them, so a simulation is always started
+knowing what its nodes run and in what time; `time()` after that is
+refused, because the ether keeps one clock for its whole run.
 
 **The estimate.** simd knows T and the pace but not what the run is for; only
 the driver knows when its traffic hour ends. So a driver sends `plan`, its
@@ -297,12 +357,12 @@ to choose from.
 
 ```
 geodata ──┐
-          ├──► loss table (derived, per band, cached) ── + offsets ──┐
-nodeset ──┘  (positions, heights)                                     │
-nodeset: device, role, radio, tags ─────────────────────────────────┤
-script (setup) ─────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the nodes' device refs) ───────────────────────────┘
-snapshot = geodata + nodeset + script + tables + every station's store
+          ├──► loss table (derived, per band, cached) ── + antennas + offsets ──┐
+nodeset ──┘  (positions, heights)                                               │
+nodeset: antenna, role, radio, tags ───────────────────────────────────────────┤
+script: firmware() rules, setup ───────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+device files (by the rules' device names, fetched when used) ──────────────────┘
+snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
 A simulated network is several things that change for different reasons,
@@ -315,19 +375,71 @@ and each is its own file so that changing one leaves the others alone:
   a nodeset stands on any geodata whose extent holds one of its nodes, and
   synthetic ground lies at 0°, 0° so that a nodeset made on one synthetic
   ground stands on every other;
-- the **nodeset** is which nodes stand where, with their antennas, and what
-  the page must know about each without running anything: its device, its
-  role, its radio. Those three are **declared settings**, which setup says in
-  each device's own language, so the map can draw a transport's second ring,
-  the coverage and the bands without a station running;
-- the **script** is everything else the software is told, as Python: its
-  `setup` names nodes through tags and, as an escape hatch, by name, so one
-  script fits any nodeset, and the three `town100` scripts are one nodeset
-  and three setups of a few lines each;
+- the **nodeset** is which nodes stand where, with their maximum powers,
+  antennas and tags, and nothing that is said to a station. What the page must know
+  without running anything comes from tags and one shared file: a role tag
+  (`transport`) is the transport's second ring, a `no-radio` tag a node
+  without a radio, and `scripts/globals.py`'s radio the coverage, the links
+  and the bands for every other node;
+- the **script** is everything else the software is told, as Python,
+  starting with what each node runs (`firmware()`): which firmware a
+  network runs is the experiment, not the network, and the same nodeset run
+  on Reticulous, on Sergeyculum and on a mix is three scripts of a line
+  each, not three copies of every node. Its rules name nodes through tags
+  and, as an escape hatch, by name, so one script fits any nodeset, and one
+  nodeset serves scripts that differ by a few lines;
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
-  those, and relabelling a node, changing its gain, device, role, radio or
-  offsets, or changing the script, never recomputes it.
+  those, and relabelling a node, changing its antenna, role, radio,
+  firmware or offsets, or changing the script, never recomputes it.
+
+**A firmware rule is a condition, kept.** `firmware(which, device)` holds
+its selection as a condition over each node's facts (`simesh.select`), not
+as the list of names it matches today, and the run keeps its rules. So a
+node placed later or retagged runs what the rules say of it, and a rule
+written at a script's top, before there is a simulation, means the same
+thing whenever it is applied. The selection is Python's set algebra (`&`,
+`|`, `-`, `~` over `nodes(field=value)`) because that is what a Python
+reader already knows for "these and those", and a rule sent to a simulation
+is that condition as plain data, which is why a function in it is refused.
+
+**There is one board, and a node's maximum power says which way it is
+built.** What sits between the firmware and the antenna connector is an
+SX1262, and it is a node's property and not a build's: one device serves
+every node. A node's `max_dbm` is its maximum power at the connector, 22 dBm
+when it states none. At 22 dBm or below the node is a bare SX1262, whose
+chip puts out that maximum itself; above it, up to 27 dBm, the node is an
+SX1262 behind a GC1109 front-end module, as a Heltec V4 is, since no bare
+SX1262 reaches past 22 dBm and the GC1109 is the front end the testbed has
+measured. A figure above 27 dBm describes no node and is refused. A node is
+sent at its maximum: the coverage draws it, and the startup script's radio
+sets it (`tx_dbm="max"`) — said by the script, since a station is told
+nothing behind a script's back. A lower power for one node is a lower
+`max_dbm`, which the map then draws too. The station is told its board
+(`SIMESH_BOARD`) by `testbed/boards.py`, whose front-end figures are the
+Heltec V4 board straddle's own.
+
+**A front end is modelled twice, with one curve.** The chip model
+(`radio/src/model.cpp`) puts the board's transmit curve between what the
+chip radiates and what the medium is handed, and adds its receive gain to
+every level the chip reads, so the medium only ever deals in connector
+power. Reticulous on `hw-linux` takes the same figures (`SPANGAP_BOARD`,
+which the kind copies from `SIMESH_BOARD`) in place of its build's Kconfig
+and converts the other way, antenna dBm to chip drive and chip RSSI to
+connector RSSI, as it does on the board. Both round the curve the same way,
+so a station asked for 27 dBm behind the GC1109 drives the chip at 18 and
+the medium carries 27; a station told no front end is a bare SX1262, 22 dBm
+at most. The node's maximum is the firmware's ceiling too, so a station left at its default power sends at its node's maximum.
+
+**Antennas are a layer, like offsets.** A pattern's gain depends on the
+direction to the other end, so a pair's gains are not one figure per node
+but one per pair and direction, from the two antennas' tips in three
+dimensions. They are taken off the model's loss when the tables are handed
+to the medium (`losses.with_antennas`), as the offsets are added, so a new
+antenna or a new aim never recomputes the model, and the medium still reads
+one figure a pair. The tips need the ground under each node, which on a
+pack is the terrain there, asked of the sidecar once per node and kept in
+the run.
 
 **Offsets are a layer, never baked in.** A nodeset's offsets (dB added to
 one pair's computed loss, both ways) are where measurements correct the
@@ -373,8 +485,8 @@ The stations run in a run directory, `runs/<name>/`, never in a nodeset or a
 snapshot. Without a working copy there would be no moment at which the thing
 on disk was not already changed, since the stations are always writing. The
 run holds its own copies of everything the simulation reads — the geodata,
-the nodeset, the script, the loss tables, and which device each ref resolved
-to — so that an edit made during the
+the nodeset, the script, the loss tables, the firmware rules and which build
+each firmware resolved to — so that an edit made during the
 run changes the run and not the files it started from, and so that the
 analysis tools read the network as it was run and not as the files stand
 now. A run is never written over: a new one goes beside it.
@@ -388,6 +500,16 @@ to meet for a power cut.
 Logs and the record stay in the run and are never copied into a snapshot:
 they are an account of one run, and a snapshot is something to run.
 
+**Nothing a run writes goes on a bind mount.** Stations' stores, the record
+and the logs are written constantly, and a bind mount on Docker Desktop is
+virtiofs: slow, with file semantics of its own that a store on flash never
+meets.
+
+**Two runs are compared by one version of the tools.** Every column of a
+comparison is recomputed from both runs' records by the current analysis
+code, never taken from an older report, so a difference between the columns
+is a difference between the runs.
+
 ## Real ground: the planner as a sidecar
 
 The ground data and the propagation model are SIMesh's own planner, the Rust
@@ -395,10 +517,10 @@ workspace in `planner/`: packs compiled from public terrain, clutter,
 building and road data, and ITU-R (International Telecommunication Union,
 radio sector) Recommendation P.1812-8 over a real profile. The crates came
 from Sergey's planner and keep their names; SIMesh carries the ones it runs
-(core, terrain, propag, opt, coverage, pack, render, web, wasm) and changes
-them as it needs, since SIMesh is to take over planning and simulation from
-the tools it grew out of. Building packs from their sources is not among
-them yet. The front runs the workspace's web server, `planner-web`, as a
+(core, terrain, propag, opt, coverage, pack, buildings, import, render, web,
+wasm, and its own job) and changes them as it needs, since SIMesh takes over
+planning and simulation from the tools it grew out of, building the packs
+included. The front runs the workspace's web server, `planner-web`, as a
 **sidecar**, and asks it.
 
 ```
@@ -444,7 +566,9 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
   coverage raster is `planner-coverage`'s point-to-area sweep from its
   antenna, cut to a square around it by `loss.bin` and cached by the
   pack, the node's position and its height: path loss only, so a change of
-  power, gain or radio reuses it, and the page adds those. The sidecar holds
+  power, antenna or radio reuses it, and the page adds those, the antenna's
+  gain toward each cell over the terrain under it, which it fetches on the
+  raster's own grid. The sidecar holds
   one sweep and a new one cancels the last, so the front asks for one node
   at a time per sidecar; nothing is swept until a page asks with the layer on.
   The cache is keyed by what the sweep is asked, not by the code that
@@ -470,6 +594,71 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 - **A snapshot carries its tables**, so it reloads without the planner, and
   a simulation on synthetic ground never needs one.
 
+## Building a pack, and the node maps
+
+```
+front ── fetch into packs/.cache/<source>/ ─────────────► the sources' hosts (sources.py)
+front ── planner-job pack-build, one JSON object on stdin ─► planner-job   (packbuild.py)
+planner-job ── {"step","done","total"[,"part","parts"]} per line ─► front ── geodata_progress ─► pages
+planner-job ── {"manifest": path} | {"error": sentence}, last ─► front: packs/<name>/, geodata/<name>.yaml
+front ── planner-job nodes-import {source, file, bbox, companions, max_age_days, now_unix} ─► planner-job
+planner-job ── {"nodes": [...], "report": {...}} ─► front ── nodeset.from_imported ─► nodesets/<name>.yaml
+```
+
+`planner-job` is one binary crate with two verbs, each one JSON object in on
+standard input and JSON lines out on standard output, diagnostics on
+standard error, exit 0 or non-zero with a last `{"error"}` line. It holds no
+fetching: **the front fetches, the compiler compiles.** That keeps the
+compiler testable from files, keeps every request to a public host in one
+place (sources.py: one user agent, polite retries, a cache shared by every
+build), and lets the front show a download's bytes and a compile's steps in
+one row.
+
+pack-build's steps, each only when it applies: `terrain`, `osm`,
+`buildings`, `lidar`, `landcover`, `clutter`, `population`, `manifest`. Its
+input names every file (the GLO-30 tiles, the WorldCover tiles, the ITU
+maps' directory, the PBF extract, a directory of LoD2 CityGML, one of
+Berlin's 1 m XYZ pairs, the Zensus CSV); it reads only the LoD2 tiles and
+lidar pairs that meet its grid, and the front hands it a directory of links
+to just the tiles this rectangle needs, since the cache holds every tile any
+build fetched.
+
+**The front chooses the sources; the compiler takes what it is given.**
+`sources.plan` picks the best source for each part of the rectangle (Berlin's
+1 m pairs and LoD2 where it touches Berlin, the Zensus grid where it touches
+Germany, GLO-30 and OpenStreetMap everywhere) and says what each is used
+for, so the page offers no choice and the dialog after **Build** reads the
+same list. Given both `lod2_dir` and `osm_buildings`, the compiler takes
+LoD2's buildings on the 1 km tiles in that directory that meet the grid and
+OpenStreetMap's everywhere else: an OpenStreetMap building whose centroid
+lies on one of those tiles is left out, so no building is counted twice.
+The tile is the unit of LoD2's coverage, not the city boundary, so on a
+tile that Berlin's border crosses the part outside Berlin has no buildings.
+Both write to one `buildings.jsonl`, LoD2's lines first, each line's
+`source` saying which, and the manifest carries both notices. A cell's
+DataQuality code follows most of its built area: LoD2, else OSM tagged,
+else OSM default.
+
+**OpenStreetMap is one Geofabrik PBF extract, not Overpass.** One file per
+region serves roads, places, peaks and masts, and buildings alike, and
+Geofabrik's index gives every extract's outline, so the smallest one holding
+the rectangle is chosen. Overpass would be four queries per region, is
+rate-limited, and times out on a city's buildings. The selection is at the
+top of `planner-pack/src/osm.rs`.
+
+**Nodes are never ground.** A planner pack could carry a `Nodes` layer, the
+deployed network baked in at build time. SIMesh's compiler never writes one,
+and export, import and what the page is told all leave one out: nodes are
+nodesets, which stand on any ground that holds them, and which the layers
+on the Nodes tab show, merge and edit. The public node maps come in as
+nodesets through `nodes-import`, whose report counts every row into one
+bucket (kept, or dropped and why).
+
+**The DataQuality layer's codes are wire values; `rank()` orders them.**
+0 GLO-30 synthesized, 1 LoD2, 2 lidar 1 m, 3 OSM default heights, 4 OSM
+tagged heights. A cell takes the best-ranked evidence it has: GLO-30 < OSM
+default < OSM tagged < LoD2 < lidar.
+
 ## A table of every pair
 
 The medium reads every level from a table: every ordered pair of nodes,
@@ -489,7 +678,13 @@ computed.
 **A table, not a model in the medium.** Synthetic ground's log-distance loss
 and a pack's P.1812 are written into the same format, so the ether has
 one code path and no propagation model of its own, and a table computed
-once serves every run of that nodeset on that geodata. A run works on its own
+once serves every run of that nodeset on that geodata. It serves the
+nodeset's next edit too: a pair's loss depends on its two ends and the
+model alone, so a nodeset with a few nodes moved, added or taken away takes
+every pair whose ends are unchanged from the nearest cached table
+(`losses.nearest_cached`: the most nodes at the same name, position and
+height, under the same ground and model) and computes the rest
+(`update_nodes`). A run works on its own
 copy: a node moved during a run has its row and column recomputed into the
 copy, never into the cache, and the ether keeps the old row until the new
 one is in.
@@ -521,8 +716,9 @@ there, in two questions and two tests. [`ether/INTERNALS.md`](ether/INTERNALS.md
 is the whole of it; this is its shape.
 
 **The received power** of a transmission at a receiver is the transmit power
-the frame states, plus both antennas' gains, minus the table's loss for that
-direction and the within-band correction.
+the frame states, plus each antenna's gain toward the other end, minus the
+table's loss for that direction and the within-band correction; the gains
+are on the table the medium is handed, as the offsets are.
 
 **Who is affected, and who can decode, are two questions.** Every
 transmission whose channel overlaps the receiver's counts towards its
@@ -601,15 +797,15 @@ twice. What replaces it is **Run command**, which types one CLI line at the
 stations chosen and shows what each said, and a script's intents, which say
 one thing to every kind in its own lines. That is more versatile — retune
 the whole testbed, survey it, create something on all of it — and it is
-honest about being a thing you did rather than a state you restored. The one
-exception is a node's declared role or radio changed on a running
-simulation: that is said to its station at once, because the map already
-shows the new value and a station that disagreed with it would be lying.
+honest about being a thing you did rather than a state you restored. A
+node's tags changed on a running simulation are no exception: what they
+mean to the first-boot rules takes effect at its next first boot, a
+factory reset.
 
 ## Why the store is flushed before anything is taken away
 
 What follows is the `reticulous` kind's; a kind whose store writes through
-(`berlinmesh`) has nothing to flush, and its `flush` does nothing.
+(`sergeyculum`) has nothing to flush, and its `flush` does nothing.
 
 `s.storage.flash_delay` is 60 seconds by default: a write sits in RAM for up to
 a minute before the store commits. On a board that is a power-cut window and
@@ -634,22 +830,36 @@ be worse than losing the last minute.
 setting. Everything a script says describes what a station *is*; `save` is
 about making that description stick.
 
-## Setup: declared settings, the script, the radio last
+## First boot: the name, then the first-boot rules in order
 
 ```
 simd ── framed RPC probe … s.sys.reset_reason answers ──► station   up: booted
-simd ── the node's name, role and radio figures, in its kind's lines ─► station
-simd ── script setup(node): node.run(…), node.set_role(…), … ─────────► station
-simd ── what starts the radio (lora up) ───────────────────────────────► station
+simd ── its name, in its kind's lines ─────────────────────────────────► station
+simd ── what the first-boot rules give it, in the rules' order ────────► station
+        startup.py's: role(…), radio(…), each nodeset's own lines, radio_up()
+        then the script's own lines
 simd ── save, and again once what setup asked for has landed ──────────► station
 ```
 
 A station is set up by typing at it. The alternative — a schema of settings
 the testbed knows the names of — would have to grow every time the firmware
-grew one, and would be a second place for a setting's name to live. So only
-what the page must know without a station running is declared (the name, the
-role, the radio), each kind says those in its own lines, and everything else
-is a script's `setup`, which types what it likes.
+grew one, and would be a second place for a setting's name to live. So
+nothing is declared in the nodeset: every setting is a script's first-boot
+rule, a line typed as written or an **intent** (`role`, `radio`,
+`radio_up`) each kind says in its own lines, so one rule serves every
+firmware. What the page must know without a station running is read from
+the same places the rules are written from: the tags the rules select on,
+and `scripts/globals.py`, whose radio the startup script sets. Per-node
+differences are selections (`nodes(tag=...)`) and macros, never code, which
+is what lets the rules travel to simd as data.
+
+**Every world starts from one script.** `scripts/startup.py` says the
+roles, the radio from `globals.py`, then includes each nodeset's own
+`nodesets/<name>.py` (`for nodeset in nodesets(): include(...)`), then
+starts the radios. A script includes it among its declarations, so what a
+traffic study runs on any world is readable in three files the editor opens
+together, and a world's peculiarities (a TCP gateway, a sync word) live
+with the world, not in the study.
 
 **Up means booted, not answering.** A `reticulous` station answers framed
 RPC from early in boot, before its services' `onInit` has run, and a setting
@@ -660,21 +870,24 @@ service's init, and which on a first boot, the only one that is set up, is
 absent until then.
 
 **The radio is started last.** A radio reads its settings when it starts —
-the community radius it hands to rnsd, whether SUPE is on — so a setting a
-script makes after the radio is up waits for the next start. Setup therefore
-says the declared name, role and radio figures, then the script's `setup`,
-then what starts the radio (`radio_start`: `lora up` for a `reticulous`
-station, nothing for a kind whose radio needs no start).
+the community radius it hands to rnsd, whether SUPE is on — so a setting
+made after the radio is up waits for the next start. That is why starting
+it is an intent of its own (`radio_up`: `lora up` for a `reticulous`
+station, nothing for a kind whose radio needs no start), and why the
+startup script says it after each nodeset's own setup. A script's own
+first-boot lines come after the include, so what the radio reads belongs
+in a nodeset's setup or before the include.
 
 **A role the firmware forgets is said at every boot.** Setup runs once, on
-a station with no state; a `berlinmesh` station keeps `transport on|off` in
-RAM only, so a reset would bring it back a client while its node declares
+a station with no state; a `sergeyculum` station keeps `transport on|off` in
+RAM only, so a reset would bring it back a client while its node is tagged
 transport. A kind whose role does not survive a restart says so
-(`role_volatile`), and simd says the declared role again whenever such a
-station comes up with state.
+(`role_volatile`), and simd says the role intents of its first-boot rules
+again whenever such a station comes up with state.
 
-Lines are expanded per station: `{name}`, `{id}` and `{addr}`, and
-`{addr:<node>}` for another node's address. That is what lets one shared
+Lines are expanded per station: `{name}`, `{id}` and `{addr}`,
+`{addr:<node>}` for another node's address, and `{max_dbm}`, the node's
+maximum power. That is what lets one shared
 line say node-specific things, and it is why simd adds no settings of its
 own. An address is always a macro and never written down, because it follows
 from the id and from the network the front gave that simulation, which
@@ -682,7 +895,8 @@ differs between two simulations of one nodeset.
 
 The name is the node's identity in three places at once —
 the map label, the proxy hostname and the station's own name — and must not
-drift; the declared name is said in the kind's own line (`hostname {name}`),
+drift; simd says the name itself, before any rule, in the kind's own line
+(`hostname {name}`),
 so it cannot disagree per node.
 
 A macro the list does not define is left exactly as written. A CLI line is
@@ -762,18 +976,18 @@ the second one to start finds the port taken.
 `stopped` → `starting` → `setup` → `up`, with `restarting` for the gap after an
 exit nobody asked for. `up` is **the station booted and answering the door
 its kind talks through** — a `reticulous` station's framed RPC once its boot
-has written `s.sys.reset_reason`, a `berlinmesh` station's `rncfg detect` —
+has written `s.sys.reset_reason`, a `sergeyculum` station's `rncfg detect` —
 not the process existing: a firmware process that has forked but not
 finished booting is not a station you can do anything with, and the map
 should not claim otherwise.
 
 A station's **role** — `transport`, `router`, `repeater` or `client` — is not
-status. Its node declares one, which setup says to it and the page draws
-before anything runs; once it runs, simd asks each station every few seconds,
-through its kind, because the setting is live and a person can flip it on
-the station itself — the map should show what the station thinks, not what
-was declared at its first boot. A kind that cannot be asked leaves the
-declared one on show. Roles are a kind's words for what a station does, so
+status. Its node's role tag names one, which the startup script says to it
+and the page draws before anything runs; once it runs, simd asks each
+station every few seconds, through its kind, because the setting is live
+and a person can flip it on the station itself — the map should show what
+the station thinks, not what it was told at its first boot. A kind that
+cannot be asked leaves the tag's on show. Roles are a kind's words for what a station does, so
 the map draws a forwarding ring for any firmware without knowing its
 protocol.
 
@@ -784,6 +998,24 @@ Everything the testbed knows about one firmware lives in its kind
 methods. The station contract ([STATION.md](STATION.md)) is what every kind
 shares, and it is small on purpose: an identity, a directory, an address and
 the ether, in `SIMESH_*`, and a console on stdin/stdout.
+
+**One chip model for every kind, below the driver.** Every kind links the
+same `radio/`, whatever its language. A rewrite per language would drift on
+exactly the details the testbed exists to hold constant, and a seam above
+the driver, at a `LoRaRadio`-style level, would skip BUSY, CAD, the sync-word
+register write and a CAD cutting off a reception, which are what break on
+boards.
+
+**Protocol parts sit behind their protocol.** The ether, the record, the
+map, airtime per carrier and link geometry know no protocol; LXMF traffic,
+delivery analysis and SUPE frame classes live under `simesh.reticulum`, so a
+firmware of another protocol gets everything generic and nothing that
+misreads it.
+
+**A mixed SUPE run builds `sergeyculum` without `supe-band`.** That switch
+drops channel 9 on duty-cycle readings, while `reticulous` uses all nine
+channels with polite spectrum access; the two would derive different
+schedules, and the run would measure the mismatch instead of the protocol.
 
 **A kind supplies what its firmware reads.** A firmware that reads other
 names for the contract's values gets them from its kind's `env`, beside the
@@ -806,7 +1038,7 @@ and it never runs.
 
 **One conversation at a time on a station's door.** `rncfg` opens the
 station's KISS pty (KISS, "keep it simple, stupid", is the serial framing radio modems speak) per command; two at once interleave their frames and both
-read garbage, so the `berlinmesh` kind holds a lock per station around every
+read garbage, so the `sergeyculum` kind holds a lock per station around every
 invocation, the transport poll included. A `reticulous` station runs its
 framed-RPC frames one after another and answers each with the id it was sent;
 two queries in flight whose ids collided would each take the other's answer,
@@ -838,6 +1070,16 @@ be running, and the next frame would find the command line busy. So a slow
 line is followed by a question that confirms it landed, and a caller asks for
 one key at a time rather than a subtree whose tail could be cut.
 
+**A query is retried only after a whole timeout with no answer at all**, the
+five-second bound plus margin (eight seconds), and at most twice. A slow
+command that must not run twice, such as `lxmf create`, is then never run
+again by a retry.
+
+**A driver takes T from a `command_result`, not from `clock`.** `clock`
+comes once per wall second, so at a high pace it is tens of seconds of T
+stale, and a driver that scheduled from it would send every message that
+late.
+
 **Ids are unique across kinds.** The ether keys stations by id; two processes
 answering under one id are one station to the medium, and two sockets on one
 address. A nodeset refuses a file that repeats one, and its editor an id
@@ -849,15 +1091,18 @@ Pinia stores hold the page's state, split as the data is: `catalog` (what
 the store holds — devices, geodata, nodesets, scripts, snapshots — and the
 script runs with their output), `geodata` (which ground is on show, and for
 a pack its manifest and the sidecar's base path), `display` (how the map is
-shown, per tab), `nodes` (the Nodes tab's nodeset, its selection, its dirty
-state), `coverage` (the nodes' rasters) and `sim` (the running simulations
+shown, per tab), `nodes` (the Nodes tab's active layer, its selection, its
+dirty state, and the other layers, as their files stand), `coverage` (the nodes' rasters) and `sim` (the running simulations
 and the attached one's live state); one socket store owns the websocket
 they all speak through, and `lib/front` matches each editor verb's answer to
 its request. Every component reads the stores; every action is one store
 method that sends one message. A reconnect replays the `snapshot`, so the
 page holds no state simd cannot restate — which is the whole of what makes
-simd restartable under a page that is open. The nodeset being edited is the
-one exception, deliberately: it is the page's own until it is saved.
+simd restartable under a page that is open. The active layer is the one
+exception, deliberately: it is the page's own until it is saved. That is
+also why Save visible as sends the layers as they stand to the front to be
+merged there (`nodeset.merge`), rather than naming files: the active one's
+unsaved edits are part of what is saved.
 
 **A reply the sidecar cut short is never drawn as if it were whole.** The
 sidecar caps a footprint reply's vertices and fills it in the pack's order,
@@ -872,7 +1117,8 @@ key includes which raster each node was drawn from, so a raster arriving is
 a repaint.
 
 **One map, two places.** The map page (`NodesPage`) is one component in
-two modes. On the Nodes tab it edits the nodeset being built; opened from a
+two modes. On the Nodes tab it edits the active layer, with the other shown
+layers drawn beside it; opened from a
 running simulation's row it stands on the Simulations tab in place of the
 list and shows that run's stations live, and the same edits (move, set,
 tag, offset, remove) go to the run's own copy as messages to its simd. The
@@ -907,7 +1153,8 @@ rather than by two implementations staying in step.
 
 **Coverage is a margin, worked out on the page.** The layer is the best
 decoding margin at each point over the nodes shown: each node's transmit
-power and gain, less its path loss there, less its own threshold (its SF and
+power and its antenna's gain toward a receiver 2 m over the ground there,
+less its path loss there, less its own threshold (its SF and
 bandwidth over the noise floor). On a pack the loss is the node's raster
 from the front; on synthetic ground it is the log-distance formula. It is
 painted once per settled view into a surface of its own, a cell every few
@@ -1062,6 +1309,12 @@ and drops the host's callback, and opening the slot again powers it up fresh.
 A run keeps **real time** or **virtual time** (`simd --time real|max|<k>x`),
 for every station alike.
 
+A virtual-time run is nearly serial: T moves only when every station is idle,
+so more cores buy more runs side by side (other seeds, other scripts), not a
+faster run. A real-time run never shares a machine with a build, because the
+tick drift a loaded host adds makes it unreproducible for reasons that have
+nothing to do with the protocol.
+
 In real time `esp_timer` is `CLOCK_MONOTONIC` in microseconds from the first
 reading, and every timed event in the model — the instant a preamble ends, a
 header lands, a frame finishes — is a one-shot on the backend's timer. The
@@ -1149,10 +1402,22 @@ way to know it:
   wakes the run once in that second, not a hundred times; and because every
   station's clock is a whole number of seconds from every other's, the ticks
   of all of them fall on the same instants of T and share their barriers.
-- a `berlinmesh` station, whose threads are plain pthreads: the shim's thread
-  census (`SIMESH_IDLE=threads`). A thread counts as blocked while it is in
-  one of the shim's waits, an untimed `pthread_cond_wait`, or a read on a
-  blocking descriptor; when the last one blocks, the station is idle.
+- a `sergeyculum` or `microreticulum` station, whose threads are plain
+  pthreads: the shim's thread census (`SIMESH_IDLE=threads`). A thread counts
+  as blocked while it is in one of the shim's waits, an untimed
+  `pthread_cond_wait`, or a read on a blocking descriptor that is not a file;
+  when the last one blocks, the station is idle. A read on a regular file
+  does not count, however long it takes: nothing outside the process ends
+  it, and counting it let a station reading its stored tables at boot look
+  idle mid-work, with no wake held, and T run seconds ahead of it. A thread
+  counts as running again the moment it is woken, not when it next gets the
+  CPU: its wake firing, or a `pthread_cond_signal`/`pthread_cond_broadcast`
+  on the condition it waits on. Otherwise a thread that signals another and
+  then blocks itself would leave every thread counted blocked while the one
+  it woke has work to do. A timed wait's deadline is broadcast holding the
+  waiter's mutex, tried for 10 ms of wall time, since the waiter has joined
+  the census a moment before its wait gives the mutex up, and a broadcast in
+  between would be lost.
 
 Neither can be told apart from a thread that is waiting where nothing can
 see it, so the conductor also has a **busy watchdog**: a station that has not
@@ -1205,7 +1470,7 @@ same instants.
 
 What is still outside: a TCP connection from something that is not a station
 (the page's proxy to a station's web UI), a station's UDP to another, the
-files it shares with the testbed (`rncfg`'s KISS socket for a `berlinmesh`
+files it shares with the testbed (`rncfg`'s KISS socket for a `sergeyculum`
 station), and anything a person does, which lands at whatever T the run has
 reached; and a firmware that reads its console other than by `read` on
 descriptor 0 holds T a second each time it is typed at.
@@ -1282,3 +1547,155 @@ linked by the interface that drives it rather than by the board that wires it.
   host's. Code that assumes a 32-bit `long` or pointer fails here and not
   on the chip, which makes the host build a free audit of width assumptions,
   and a clean run here is not a clean run on a board.
+- Races between cores: the port runs one core. Scheduling faults look
+  different too, since preemption runs through signals, so starvation and
+  priority inversion are not the chip's.
+- The boot chain, partitions, OTA (over-the-air) updates, safe mode,
+  watchdogs, panics, core dumps and reset reasons (`esp_restart` is a process
+  exit); growing the state partition at runtime, a factory reset by
+  partition, and the updater.
+- WiFi, BLE (Bluetooth Low Energy) and ESP-NOW; sleep and power management,
+  GPIO wake included; and every I2C and SPI peripheral but the radio (GPS,
+  IMU, RTC, SD card, battery ADC).
+
+## What to model next, and what not
+
+A simulator that is subtly wrong is worse than one that leaves a thing out:
+it gives confidence rather than information. So every physical figure the
+ether uses is to be held against a measurement on real boards, kept as a
+regression check, and what gets modelled next goes in this order: capture,
+wrong sync word, deafness while retuning, occupancy, the noise sum, the CRC
+band. Fading, multipath, antenna patterns and clock drift come after all of
+those, if at all; past that point the cost grows and the answers do not
+change.
+
+## Still to build
+
+**The medium and the record**
+
+- **Mode changes take the datasheet's time, and the ether honours
+  `ready_at`.** The model charges each transition: from `STDBY_RC` to
+  XOSC, FS, RX or TX 150 µs or the TCXO (temperature-compensated crystal
+  oscillator) delay `SetDIO3AsTCXOCtrl` programmed; XOSC to FS 40 µs; FS to
+  RX 40 µs; FS to TX the power-amplifier ramp from `SetTxParams`; a wake from
+  SLEEP 150 µs plus 500 µs; `Calibrate` 3.5 ms. `ether_link.cpp` already
+  sends `ready_at`; the ether treats a frame whose `t0` falls before a
+  receiver's `ready_at` as energy with no lock. That makes a wrong retune or
+  turnaround constant a frame loss that reproduces.
+- **A loss cause for every frame at every station in range**, in the record:
+  `no_rx`, `tx`, `settling`, `off_channel`, `wrong_rate`, `wrong_sync`,
+  `below_threshold`, lost lock, `crc` from interference, `left_rx`, with a
+  summary per station and per pair. A protocol claim ("`settling` cannot
+  happen here") and a departure policy are judged by these.
+- **A referee over `record.tsv`**: it reads the channel plan and the `state`,
+  `tx`, `rx_begin` and `rx_end` lines and names the line that breaks a rule:
+  more than 100 s of transmission in any hour per 500 kHz channel, less than
+  100 ms off-time before returning to a frequency, radiated power over a
+  channel's cap, a `tx` without the sense window of RX or CAD before it on
+  that carrier, a `tx` from a slot that is inside a reception.
+- **The CRC band**: in the `crc_margin_db` (3 dB) above the demodulation
+  threshold, a locked frame ends as `crc` with a probability falling linearly
+  from 1 to 0, drawn from the run's seeded generator.
+- **`next_instant()` from a heap**: the pending `until`s kept in a heap keyed
+  by instant and station, updated on idle, retraction and leave, stale
+  entries dropped when popped, instead of a scan of every station per
+  barrier.
+- **Runs off the bind mount**: a run's directory on the container's own
+  filesystem or a tmpfs, with the page and the analysis tools reading it
+  there.
+- **Hardware checks**: RSSI (received signal strength) at two known
+  distances and the channel-switch success rate on real boards, kept as
+  regression checks on the ether and the loss model. Time on air is checked
+  against a board, not only against the formula.
+
+**Stations and kinds**
+
+- **The Python reference Reticulum as a station kind**, the oracle: under the
+  time shim with `SIMESH_IDLE=threads`, attached to a `reticulous` station's
+  radio through the RNode-over-TCP endpoint (`s.lora.rnode.tcp`) or through
+  `iface-tcp`. It answers what `rnsd` does when an interface stops taking
+  packets, and whether real Reticulum agrees with our neighbour and identity
+  inference.
+- **`sergeyculum` stations built with `--profile sim`** (opt-level 3), from
+  `target/sim/simesh`, in `devices/local/sergeyculum_local.yaml` and the
+  README's developer loop; release is opt-level `z` with LTO (link-time
+  optimisation), several times slower at signature checks.
+- **`libudev-dev` in SIMesh's image**: `rncfg` links `libudev` through
+  `serialport`, so Sergeyculum's Cargo workspace does not build in the image
+  without it.
+- **The mixed-kind walkthrough** in the README: announces crossing both ways,
+  a path through our transports, a two-frame split both ways, carrier sense
+  under contention, and the hidden terminal, each with its commands and what
+  `seq.py` shows.
+- **The chip model as a submodule** of `simesh-radio-sys`, as an alternative
+  to `SIMESH_RADIO_DIR` or the workspace layout.
+- **Tests of a station's own screen**: the `lcdmirror` framebuffer tap in
+  `lcd_lvgl.cpp`'s flush callback without its WebRTC half, `tinylcd`'s 1-bit
+  buffer read directly, and LVGL's `LV_USE_TEST` for time, injected input and
+  image comparison. No panel is emulated.
+- **An `hw-qemu` board**, outside SIMesh: a UART0 console, OpenCores Ethernet
+  for WiFi, no ADC user, no Bluetooth, to ask regularly whether the real
+  binary still boots. LittleFS does not yet format the state partition there.
+
+**Running and analysing**
+
+- **Freeze and step**: T held at the barrier while the map, the consoles and
+  every station's web UI stay live, and a step that moves T on by a given
+  amount and holds it again. Pause stops simd; this does not.
+- **Single stations off and on** with their state kept (drawn grey), as
+  `sel.stop()` and `sel.start()` in the library and on the node menu.
+- **The run analyses as tools** in `testbed/simesh/reticulum/` beside
+  `delivery.py`, reading a run's logs and record: `peer left` withdrawals and
+  the routes they dropped; directory entries, full blob pools and evictions;
+  neighbour-table rows and evictions (from `table … evicted, … gone
+  silent`); paths a reloaded snapshot kept; calling-channel power and rate
+  steps per target. `callkind` classes a short HEADER_2 frame correctly.
+- **Traffic scripts for SUPE's departure policy**, the one pure function
+  `should_channel switch(peer_state, queue_state, channel_state) -> no | now |
+  wait_until(t)`, each reporting losses by cause: an interactive exchange that
+  waits on every delivery proof (where a naive hold timer is strictly
+  harmful), a receiver-driven resource transfer, many stations on one
+  transport, a peer that is not there, and SUPE and plain-LoRa nodes sharing a
+  channel (whether SUPE is a good neighbour). The same runs settle SUPE's
+  stated timing constants: turnaround, retune gap, burst gap, guard, seed gap
+  and the schedule's spacings, jitters and lifetimes. No policy is committed
+  in code before these have measured it.
+- **Run options on the page**: a paced `<k>x`, a build override, and a new
+  simulation started from a snapshot.
+- **Which build a simulation runs** on its row (source and stamp), and on the
+  Firmware tab the scripts and simulations that use each build.
+- **An LR2021 model** beside the SX1262's, and a node that can be one.
+- **Meta commands carried by the firmware**: each device zip naming its own
+  implementations of a standard list of meta commands (`max_tx_pwr`,
+  `send_msg`, …), in place of the kinds' intents, so a new firmware brings
+  them with it. Until then the kinds say them, and a Meshtastic kind adds
+  its own lines.
+- **Firmware changed mid-run as an experiment**: `firmware()` in `main`
+  restarts the nodes it changes with their state kept; an upgrade test
+  across firmwares whose stores differ needs a rule for what becomes of it.
+- **An editable node id** in the editor, refusing one another node has and
+  saying that the station restarts.
+- **The snapshots in `testbed/snapshots/`**, still in the scenario format,
+  retaken from converted runs or removed.
+- **A live-reload mode** for working on the page: the Quasar dev server beside
+  the front, with `/ws` and `/api` proxied.
+- **Fewer costs per barrier in simd**: the UDP send per station and the JSON
+  encoding are its largest.
+
+**Ground and losses**
+
+- **433 and 915 MHz tables on a pack**: `link.json` takes a carrier, so a
+  pack gives all three bands.
+- **A batched pair request** in `planner-web`, parallel over pairs, instead
+  of one request per cell.
+- **A geodata editor** on the Geodata tab's map, and synthetic terrains other
+  than `flat`.
+- **Losses from a running network**: measured cells (the table's flag bit 4
+  and `samples`), a lower bound for a pair that does not hear, and the
+  residuals as calibration. Below the noise floor RSSI reads the noise, so
+  received power there is SNR (signal-to-noise ratio) plus the floor; the
+  median is taken per direction over time; a pair that does not hear gets a
+  bound from the sensitivity, not a value; the sender's power is needed per
+  frame, because SUPE varies it.
+- **x86_64 device packages** beside the aarch64 ones, from a builder of that
+  architecture.

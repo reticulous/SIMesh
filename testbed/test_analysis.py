@@ -1,5 +1,5 @@
-"""The analysis tools against a small run laid out here: the repository's
-smoke4 nodeset on plain-27, its loss table computed there, and a
+"""The analysis tools against a small run laid out here: the tests' four
+stations (testdata/four.yaml) on plain-27, its loss table computed there, and a
 hand-written record and station logs; and the traffic driver against a
 stand-in simulation."""
 
@@ -11,6 +11,7 @@ import io
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -19,7 +20,9 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "ether"))
 
 import airtime  # noqa: E402
+import antennas  # noqa: E402
 import compare  # noqa: E402
+import compliance  # noqa: E402
 import delivery  # noqa: E402
 import geodata  # noqa: E402
 import links  # noqa: E402
@@ -32,10 +35,13 @@ import slt  # noqa: E402
 import simesh  # noqa: E402
 from simesh import reticulum  # noqa: E402
 from simesh.reticulum import frames  # noqa: E402
-from simesh.reticulum import traffic as rtraffic  # noqa: E402
+from simesh import traffic as rtraffic  # noqa: E402
 from simesh.view import RunView  # noqa: E402
 
 CALLING = 869_525_000
+GLOBALS = "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n"
+FOUR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "four.yaml")
+PLAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "plain-27.yaml")
 TRAFFIC_CH = 869_100_000
 EPOCH = calendar.timegm((2026, 9, 25, 10, 0, 0))        # T = 0, wall clock
 DEST = bytes(range(16))
@@ -80,15 +86,19 @@ class Record:
 
 
 def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
-    gd, ns = geodata.load("plain-27"), nodeset.load("smoke4")
+    gd, ns = geodata.read(PLAIN, "plain-27"), nodeset.open_path(FOUR, "four")
     if bare:
-        for each in ns.nodes:
-            ns.set_node(each, role="", radio={})
+        for each, node in ns.nodes.items():
+            ns.set_node(each, tags=[t for t in node["tags"] if t != "transport"])
     table = tmp_path / "868.bin"
     if not table.exists():
         losses.synthetic_table(gd, ns, "868").write(str(table))
     run = runs.create_run(str(tmp_path / name), gd, ns, None, "max", {"868": str(table)},
-                          builds={"stable": {"kind_type": kind}})
+                          builds={"reticulous_dev_latest": {"kind_type": kind}})
+    # The tests' own radio, whatever the store's globals.py says today.
+    with open(os.path.join(run.dir, runs.GLOBALS_FILE), "w", encoding="utf-8") as handle:
+        handle.write(GLOBALS)
+    run.set(firmware={n: "reticulous_dev_latest" for n in ns.nodes})
 
     rec = Record()
     rec.add(0, "in", 1, {"type": "hello", "sid": 1, "slots": [0], "t": 0})
@@ -135,15 +145,19 @@ def test_a_run_view_takes_everything_from_the_run(run):
     assert view.calling_hz() == CALLING
     assert view.radio("n01") == {"freq_hz": CALLING, "sf": 8, "bw_hz": 125000, "power_dbm": 14.0}
     assert view.roles() == {1: "transport", 2: "transport", 3: "transport", 4: "transport"}
-    # Levels are the table's, less nothing: n01's frame at n02 is its power
-    # plus both gains less the loss the run's table holds.
+    # Levels are the table's with the antennas on it: n01's frame at n02 is
+    # its power plus each antenna's gain toward the other less the loss the
+    # run's table holds. On flat ground at one height that is each pattern
+    # on the horizon.
     table = slt.Table.read(run.table_path("868"))
     e = view.medium()
-    assert e.level(1, 2, CALLING, 14) == pytest.approx(14 - table.at("n01", "n02", CALLING))
+    horizon = sum(antennas.gain(view.nodes[n]["antenna"], 0.0, 0.0) for n in ("n01", "n02"))
+    assert e.level(1, 2, CALLING, 14) == pytest.approx(
+        14 + horizon - table.at("n01", "n02", CALLING), abs=0.01)
     need = e.noise(125000) + e.sensitivity(8)
     assert view.audible(1, 2) == (e.level(1, 2, CALLING, 14) >= need)
     n1, n2 = view.nodes["n01"], view.nodes["n02"]
-    assert view.distance(1, 2) == pytest.approx(geodata.load("plain-27").distance_m(
+    assert view.distance(1, 2) == pytest.approx(geodata.read(PLAIN, "plain-27").distance_m(
         (n1["lat"], n1["lon"]), (n2["lat"], n2["lon"])))
     assert view.protocols() == [reticulum] and view.kind_type("n01") == "reticulous"
 
@@ -158,12 +172,12 @@ def test_offsets_reach_the_medium_the_tools_read(tmp_path):
 
 
 def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
-    other = lay_out(tmp_path, kind="berlinmesh", bare=True, name="bm")
+    other = lay_out(tmp_path, kind="sergeyculum", bare=True, name="bm")
     view = RunView(other.dir)
     assert set(view.roles().values()) == {"client"} and view.forwarders() == set()
     assert view.protocols() == []
-    assert view.radio("n01")["sf"] == simesh.DEFAULT_SF
-    assert simesh.protocol_for("berlinmesh") is None
+    assert view.radio("n01")["sf"] == 8                  # the run's globals.py
+    assert simesh.protocol_for("sergeyculum") is None
     code, text = call(airtime.main, [other.dir, "--roles"])
     out = json.loads(text)
     assert out["roles"]["client"]["stations"] == 4
@@ -202,6 +216,47 @@ def test_links(run):
     assert model["links_one_way"] == expected and model["sf"] == 8 and model["power_dbm"] == 14
     assert out["power_traffic_channels"]["frames"] == 2
     assert out["power_traffic_channels"]["frames_with_peer"] == 2
+
+
+def test_compliance_within(run):
+    got = compliance.analyse(run.dir)
+    bands = {name: [r["band"] for r in node["rows"]] for name, node in got.items()}
+    assert bands["n01"] == ["868.7–869.2 MHz", "869.4–869.65 MHz"]
+    assert got["n01"]["rows"][1]["worst_hour_s"] == pytest.approx(0.2)
+    assert got["n01"]["rows"][1]["allowed_s"] == pytest.approx(360)
+    assert got["n01"]["rows"][1]["erp_dbm"] == pytest.approx(14 - 2.15)
+    text = compliance.section(run.dir)
+    assert text.startswith("## ETSI compliance")
+    assert "Every node stayed within its time and power budgets." in text
+
+
+def test_compliance_over(tmp_path):
+    run = lay_out(tmp_path)
+    rec = Record()
+    for k in range(925):                    # 0.5 s every 4 s: 450 s in an hour
+        rec.tx(4.0 * k, 1, data_packet(), {}, span=0.5)
+    for k in range(370):                    # 0.5 s every 10 s at 869.1: 180 s
+        rec.tx(10.0 * k + 1, 2, data_packet(), {}, freq=TRAFFIC_CH, span=0.5)
+    for k in range(93):                     # 0.5 s every 40 s at 869.1: 45 s
+        rec.tx(40.0 * k + 2, 3, data_packet(), {}, freq=TRAFFIC_CH, span=0.5)
+    rec.tx(3.0, 4, data_packet(), {}, freq=868_650_000, span=0.2)
+    rec.tx(5.0, 4, data_packet(), {}, freq=CALLING, power=30, span=0.2)
+    rec.tx(7.0, 4, data_packet(), {}, freq=915_000_000, span=0.2)
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    got = compliance.analyse(run.dir)
+    one = got["n01"]["rows"][0]
+    assert one["time"] == "over" and one["worst_hour_s"] == pytest.approx(450, abs=0.5)
+    two = got["n02"]["rows"][0]
+    assert two["time"] == "over" and two["psa"]["worst_hour_s"] == pytest.approx(180, abs=0.5)
+    three = got["n03"]["rows"][0]
+    assert three["time"] == "PSA" and three["psa"]["longest_frame_s"] == pytest.approx(0.5)
+    four = got["n04"]
+    assert four["no_entry"]["frames"] == 1 and four["outside"]["frames"] == 1
+    assert not four["rows"][0]["power_ok"]
+    text = compliance.section(run.dir)
+    assert "**Over budget:** n01 (time in 869.4–869.65 MHz); n02 (time in 868.7–869.2 MHz); " \
+           "n04 (power in 869.4–869.65 MHz, spectrum no entry allows)." in text
+    assert "n04 sent 1 frame (0.2 s)" in text and "within PSA" in text
 
 
 def test_seq(run):
@@ -268,16 +323,20 @@ class FakeSim:
         await ws.send_json({"type": "snapshot", "clock": {"t": 1_000_000},
                             "run": {"dir": "/runs/fake"},
                             "nodes": [{"name": n, "id": i + 1, "status": "up", "kind": "reticulous",
+                                       "firmware": "reticulous_dev_latest", "max_dbm": 22,
                                        "tags": ["even"] if i % 2 else []}
                                       for i, n in enumerate(self.names)]})
         async for msg in ws:
             m = json.loads(msg.data)
             self.got.append(m)
+            if m["type"] in ("firmware", "first_boot"):
+                await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
+                                    "t": 2_000_000})
             if m["type"] in ("command", "meta"):
                 who = [m["name"]] if m.get("name") else m.get("names") or self.names
                 line = m.get("line") or m.get("verb")
-                results = {n: ("* 0 %s %s" % (n, ("%02d" % i) * 16) if line == "lxmf"
-                               else "3 paths total") for i, n in enumerate(who)}
+                results = {n: (("%02d" % i) * 16 if line == "address" else "3 paths total")
+                           for i, n in enumerate(who)}
                 await ws.send_json({"type": "command_result", "id": m.get("id"),
                                     "name": m.get("name"), "t": 2_000_000, "results": results})
         return ws
@@ -333,15 +392,73 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
 def test_the_traffic_driver_runs_on_a_sim(tmp_path):
     fake = FakeSim(["n01", "n02"])
     out = tmp_path / "out.json"
-    opts = {"warm_rounds": 0, "traffic": 0, "drain": 0, "gather": ["rnpath -s"]}
+    opts = {"warm_rounds": 1, "warm_spread": 0, "settle_every": 1, "traffic": 0, "drain": 0,
+            "gather": {"reticulous": ["rnpath -s"]}}
     result = with_fake_sim(fake, lambda sim: rtraffic.run_on(sim, opts, str(out)))
-    commands = [m for m in fake.got if m["type"] == "command"]
-    assert commands and all(m["kind"] == "reticulous" for m in commands)
+    metas = [m["verb"] for m in fake.got if m["type"] == "meta"]
+    assert metas[:2] == ["address", "announce"]
     assert sorted(result["dests"]) == ["n01", "n02"]
-    assert result["gathered"]["rnpath -s"]["results"]["n01"] == "3 paths total"
+    assert result["warm"]["samples"][-1]["total"] == 6
+    assert result["gathered"]["reticulous: rnpath -s"]["results"]["n01"] == "3 paths total"
     assert json.loads(out.read_text())["phases"][-1][0] == "gathered"
     with pytest.raises(ValueError, match="no traffic option"):
         rtraffic.Options(colour="blue")
+
+
+def test_a_script_says_it_synchronously(monkeypatch):
+    """The library as a script uses it: plain calls, on a simulation held
+    on a loop of its own, its rules said once it is attached."""
+    from aiohttp import web
+
+    from simesh import library
+
+    fake = FakeSim(["n01", "n02", "n03"])
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+    port = []
+
+    async def serve():
+        app = web.Application()
+        app.router.add_get("/ws", fake.handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port.append(site._server.sockets[0].getsockname()[1])
+        started.set()
+
+    server = threading.Thread(target=lambda: (loop.run_until_complete(serve()),
+                                              loop.run_forever()), daemon=True)
+    server.start()
+    started.wait(10)
+    fresh = library.Runtime()
+    monkeypatch.setattr(library, "runtime", fresh)
+    fresh.configure(sim="fake", port=port[0])
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            library.firmware("all", "reticulous_dev_latest")
+            library.on_first_boot(library.nodes(tag="even"), "lxmf create {name}")
+            assert library.up("all") == ["n01", "n02", "n03"]
+            assert library.exec(library.nodes(tag="even"), "one\ntwo") == {
+                "n02": "3 paths total\n3 paths total"}
+            assert library.announce("all", spread=30) == {n: "3 paths total"
+                                                           for n in ("n01", "n02", "n03")}
+            later = library.send_msg("n01", "n03", "hi", after=5, wait=False)
+            assert later.result(10) == {"n01": "3 paths total"}
+            library.max_tx_pwr("n01")
+            assert library.station("n02")["max_dbm"] == 22
+            with pytest.raises(library.ScriptError, match="comes before"):
+                library.time("max")
+    finally:
+        fresh.close()
+        loop.call_soon_threadsafe(loop.stop)
+    kinds = [m["type"] for m in fake.got]
+    assert kinds[:2] == ["firmware", "first_boot"]
+    metas = [(m["verb"], m.get("args")) for m in fake.got if m["type"] == "meta"]
+    assert ("message", {"to": "n03", "text": "hi"}) in metas
+    assert ("tx_power", {"dbm": 22.0}) in metas
+    sent = [m for m in fake.got if m["type"] == "meta" and m["verb"] == "message"][0]
+    assert sent["after"] == 5 and sent["names"] == ["n01"]
 
 
 def test_the_schedule_is_the_seed_s():

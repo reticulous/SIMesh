@@ -13,6 +13,7 @@ the testbed; what differs between firmwares beyond it is a **kind**
 | `SIMESH_NODE_DIR` | the station's directory; its working directory; its state lives under `state/` |
 | `SIMESH_BIND_ADDR` | its own loopback address, fixed by its id in the testbed's network (`simd --net`, a /22 holding 1000 stations by default); every socket it opens binds here |
 | `SIMESH_ETHER` | `host:port` of the ether |
+| `SIMESH_BOARD` | the board its node is, as one flat JSON object: `chip` (`sx1262`), `max_dbm` (the node's maximum power at the antenna connector) and, when that is above 22 dBm and the node has a GC1109 front-end module, `fem_part`, `fem_tx_cal` (chip register → connector dBm, in the `LORAn_TX_CAL` form), `fem_gain_db` (its flat gain, when there is no curve) and `fem_rx_gain_db`, from `testbed/boards.py`. The chip model reads it too (below, The radio); a firmware that drives a front end takes its figures from here |
 | `SIMESH_TIME` | `virtual` in a virtual-time run, absent in a real-time one |
 | `SIMESH_EPOCH_US` | virtual time: the wall-clock microseconds T 0 stands for |
 | `SIMESH_SEED` | virtual time: the ether's seed, the one its `welcome` carries; the shim keys the station's `getentropy`/`getrandom` by it and `SIMESH_NODE_ID` |
@@ -48,12 +49,45 @@ nowhere else, so two stations on one host never collide.
 The station links `radio/` (`simradio.h`) and calls
 `simradio_station_open(SIMESH_NODE_ID, SIMESH_BIND_ADDR, SIMESH_ETHER)` once,
 then `simradio_open(slot, …)` per radio. Its driver talks to the chip model
-frame by frame, exactly as to an SX1262 on a bus.
+frame by frame, exactly as to an SX1262 on a bus. A firmware built on
+Portduino links [`radio/portduino/`](radio/portduino/README.md) instead,
+which does that for it and binds the chip's lines at the pin numbers it is
+given in `SIMRADIO_PIN_NSS`, `SIMRADIO_PIN_RESET`, `SIMRADIO_PIN_BUSY` and
+`SIMRADIO_PIN_DIO1` (1 to 4 when unset); a kind of such a firmware sets them
+to the pins it configures the firmware with.
+
+**One whole frame per NSS cycle.** A bus adapter hands the model everything
+the driver put on the bus between NSS (the chip-select line) going low and
+going high as one frame: writes inside a frame are appended, never passed on
+one by one; a frame that contains a read is complete at the read, and nothing
+is sent again at NSS high; the adapter never adds a NOP of its own, because
+the driver sends it. A reassembly one byte off makes `GetIrqStatus` read the
+status byte as the IRQ word's high byte, so every flag looks set and every
+transmission "succeeds" in no time.
+
+**A station never learns where it stands.** Its position is the ether's and
+the loss table's alone; nothing in the environment or in setup tells it, so a
+firmware that reads a position behaves here as it would with none.
+
+**The model applies the board's front end** from `SIMESH_BOARD`: what the
+chip radiates goes through `fem_tx_cal`'s curve for `fem_part` (or the flat
+`fem_gain_db`) before the ether is told its power, and every level the chip
+reads, instant or per packet, is `fem_rx_gain_db` above the connector's. A
+firmware that drives a front end converts with the same figures, so it
+radiates what it asked for; one that does not sends at the curve's reading
+of whatever it set.
 
 The medium matches receivers on carrier, bandwidth, spreading factor and sync
 word, and **does not model preamble length**: two radios whose preambles
 differ hear each other here and may not on a bench. Set them equal in a
 nodeset that means to say anything about hardware.
+
+**Sync words differ by default between kinds**: `reticulous` uses 0x42,
+`sergeyculum` and `microreticulum` (as RNode) 0x12, and theirs cannot be
+changed. The startup script sets every radio to `globals.py`'s `SYNC`,
+0x12, RNode's, so a `reticulous` station hears them; when nothing crosses
+between kinds, the `state` lines in `record.tsv` (sync, carrier, bandwidth,
+spreading factor) are the first thing to read.
 
 ## Time
 
@@ -70,7 +104,11 @@ four promises:
 - **It opens its link early**, before anything in it waits on time:
   `simradio_station_open` is where the station's clock starts and the shim
   attaches, and until the ether's welcome the monotonic clocks read 0 and the
-  wall clocks the run's epoch.
+  wall clocks the run's epoch. A monotonic clock that jumped backwards at
+  attach would saturate Rust's `Instant` and hold a station's uptime at 0 for
+  the whole run. The mode itself comes in the environment (`SIMESH_TIME`)
+  as well as in the welcome, because a FreeRTOS station calls `setitimer`
+  before it can reach the ether; the two disagreeing is an error.
 - **It says when it is idle, and until when.** Idle is every thread
   blocked; the `until` it reports is the earliest wake anything in it holds
   (`simradio_wake_at`), which is the instant it next needs to run, and
@@ -84,7 +122,12 @@ four promises:
   time after every message once none of its threads is on the CPU, which
   runs but crawls. A host whose own clock is
   counted from node time, as a kernel tick is, learns of every move of it
-  from `simradio_on_advance()`.
+  from `simradio_on_advance()`. The link is UDP, and a datagram lost either
+  way would leave the ether and the station each waiting on the other, so
+  `radio/` applies the ether's messages strictly in their numbers' order,
+  never twice, and says its idle again every 250 ms of wall time until it
+  hears back; the ether answers an idle said twice for an older number by
+  sending what came after it again.
 - **It reads its console and talks TCP (Transmission Control Protocol) to
   other stations through the C
   library**: `read` on descriptor 0, and `read`/`recv`/`send`/`write` and
@@ -96,6 +139,11 @@ four promises:
 
 A kind waits between two questions to a station with `pause()`, which is on
 T in a virtual run, so a poll costs the station the same time in either mode.
+
+**A kind whose door is a pty holds a slave descriptor open for the station's
+whole life.** Reading a pty master returns `EIO` once every slave descriptor
+is closed, and a tool that opens and closes the slave per command (`rncfg`)
+would otherwise close the door between commands.
 
 ## A kind
 
@@ -111,9 +159,7 @@ a kind is a class in `testbed/kinds/` that says, for one firmware:
 | `setup_line` | one setup line, and whatever waiting it takes for it to land |
 | `setup` | a station's setup lines, on its first boot, then a flush |
 | `flush` | how to make what it was told durable, before a stop or a snapshot |
-| `lines` | an intent (`name`, `role`, `radio`, `announce`, `message`, `path`, `peer_tcp`) in its own lines, or refused |
-| `declared` | a node's declared name, role and radio figures in its own lines |
-| `radio_start` | the lines that start its radio, said last in setup |
+| `lines` | an intent (`name`, `role`, `radio`, `radio_up`, `tx_power`, `announce`, `message`, `path`, `peer_tcp`) in its own lines, or refused |
 | `address` | its LXMF delivery address |
 | `role` | what it does for the mesh, read live: `transport`, `router`, `repeater` or `client`, or unknown |
 | `web_port` | the port of its web UI, or none |

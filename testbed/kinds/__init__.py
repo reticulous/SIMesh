@@ -7,21 +7,22 @@ Everything beyond that differs by firmware — how to tell it is up, how to
 type a line at it, what role it plays in the mesh, whether it has a web UI,
 how an intent is said in its language — and that is a kind.
 
-A node's device (devices.py) says which kind runs it: `node.yaml`'s `kind`
-names the class here by its `type_name`. One `Kind` object stands for one
-resolved device, its executable, `/fixed` tree, tools and environment; nodes
-on the same device share it. `resolve_builds` settles every device a nodeset
-uses before any station starts, and a simulation may be started with a build
-of its own, which then replaces the device of every node whose device is of
-that build's kind.
+A node's firmware, a device (devices.py) a script names with `firmware()`,
+says which kind runs it: `node.yaml`'s `kind` names the class here by its
+`type_name`. One `Kind` object stands for one resolved device, its
+executable, `/fixed` tree, tools and environment; nodes on the same firmware
+share it. `ensure_builds` settles every firmware a run uses before a station
+of it starts, and a simulation may be started with a build of its own, which
+then replaces every firmware of that build's kind.
 
 **Lines and intents.** A line is text typed at a station, in its kind's own
-language: the Reticulous CLI, `rncfg` arguments for `berlinmesh`. The same
+language: the Reticulous CLI, `rncfg` arguments for `sergeyculum`. The same
 text typed at another firmware means something else or nothing, so a line
 goes only to stations of one kind. An **intent** (`Kind.lines(verb, …)`) is
-what a script or the declared settings mean, which each kind turns into its
-own lines: `name`, `role`, `radio`, `announce`, `message`, `path`,
-`peer_tcp`. A kind that has no way to say one raises CommandError naming
+what a script means, which each kind turns into its own lines: `name`,
+`role`, `radio` (its settings), `radio_up` (the radio started, nothing for
+a kind whose radio needs no start), `tx_power`, `announce`, `message`,
+`path`, `peer_tcp`. A kind that has no way to say one raises CommandError naming
 itself and the verb.
 
 Lines keep `{name}`, `{id}`, `{addr}` and `{addr:<node>}` macros until a
@@ -38,12 +39,12 @@ import stations as stations_module
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The time shim every station of a virtual-time run is started with.
 SHIM = os.path.normpath(os.path.join(HERE, "..", "..", "radio", "build", "libsimclock.so"))
-DEFAULT_DEVICE = "stable"           # what a node naming no device runs
 
 # What a station does for the mesh, as its kind reports it: forwards for
 # others (transport, router, repeater) or only for itself (client).
 ROLES = ("transport", "router", "repeater", "client")
-INTENTS = ("name", "role", "radio", "announce", "message", "path", "peer_tcp")
+INTENTS = ("name", "role", "radio", "radio_up", "tx_power", "announce", "message", "path",
+           "peer_tcp")
 MACRO_RE = re.compile(r"\{([a-z_]+)(?::([A-Za-z0-9_.-]+))?\}")
 
 
@@ -54,9 +55,10 @@ class CommandError(Exception):
 
 # ---- macros --------------------------------------------------------------
 
-def expand(line, name, node_id, ids=None):
+def expand(line, name, node_id, ids=None, extra=None):
     """Fill `{name}`, `{id}` and `{addr}` in one line for one station, and
-    `{addr:<node>}` with another node's address.
+    `{addr:<node>}` with another node's address; `extra` is more of them by
+    name (`{max_dbm}`, the node's maximum power).
 
     `ids` maps the nodeset's node names to their station ids; the address a
     station binds comes from the simulation's network, which the front picks
@@ -69,6 +71,7 @@ def expand(line, name, node_id, ids=None):
     macro is worse than passing it through for the station to complain about.
     """
     values = {"name": name, "id": str(node_id), "addr": stations_module.bind_addr(node_id)}
+    values.update({k: str(v) for k, v in (extra or {}).items()})
 
     def fill(m):
         key, node = m.group(1), m.group(2)
@@ -80,11 +83,11 @@ def expand(line, name, node_id, ids=None):
     return MACRO_RE.sub(fill, line)
 
 
-def expand_all(lines, name, node_id, ids=None):
+def expand_all(lines, name, node_id, ids=None, extra=None):
     """The lines a station is actually given: expanded, minus blanks and comments."""
     out = []
     for line in lines:
-        line = expand(str(line), name, node_id, ids).strip()
+        line = expand(str(line), name, node_id, ids, extra).strip()
         if line and not line.startswith("#"):
             out.append(line)
     return out
@@ -107,10 +110,10 @@ class Kind:
 
     @property
     def label(self):
-        """What the page calls the device: its name, and what it stands for."""
+        """What the page calls the device: its name, and the hardware it plays."""
         name = self.device.get("name") or self.device.get("ref") or self.name
-        stands = self.device.get("stands_for")
-        return "%s (virtual %s)" % (name, stands) if stands else name
+        hardware = self.device.get("virtual_hardware")
+        return "%s (virtual %s)" % (name, hardware) if hardware else name
 
     # ---- the contract ----------------------------------------------------
 
@@ -125,6 +128,8 @@ class Kind:
                        SIMESH_EPOCH_US=str(station.clock.epoch),
                        SIMESH_SEED=str(station.clock.seed),
                        LD_PRELOAD=SHIM)
+        if getattr(station, "board", None):
+            env["SIMESH_BOARD"] = station.board
         env.update(self.extra_env)
         return env
 
@@ -201,27 +206,9 @@ class Kind:
             raise CommandError("no such intent %r (there are %s)" % (verb, ", ".join(INTENTS)))
         raise CommandError("a %s station has no way to %s" % (self.name, verb.replace("_", " ")))
 
-    def declared(self, node):
-        """The lines a node's declared settings come to on this kind, in
-        order: its name, its role, then its radio's figures. What starts the
-        radio is not among them (`radio_start`)."""
-        out = self.lines("name")
-        if node.get("role"):
-            out += self.lines("role", role=node["role"])
-        if node.get("radio"):
-            start = self.radio_start()
-            out += [line for line in self.lines("radio", **node["radio"]) if line not in start]
-        return out
-
     # True for a kind whose station forgets its role when it restarts: the
-    # declared role is then said at every boot, not only at setup.
+    # role intents of its first-boot rules are then said at every boot.
     role_volatile = False
-
-    def radio_start(self):
-        """The lines of the radio intent that start the radio, which setup
-        says last, after a script's `setup`: what a radio reads when it
-        starts is then in place. None for a kind whose radio needs no start."""
-        return []
 
     def describe(self):
         return "%s: %s (%s) %s" % (self.device.get("ref"), self.label, self.type_name,
@@ -230,47 +217,54 @@ class Kind:
 
 def kind_types():
     """Every kind class by its type name."""
-    from . import berlinmesh, reticulous
-    return {cls.type_name: cls for cls in (reticulous.Reticulous, berlinmesh.Berlinmesh)}
+    from . import microreticulum, reticulous, sergeyculum
+    return {cls.type_name: cls for cls in (reticulous.Reticulous, sergeyculum.Sergeyculum,
+                                           microreticulum.Microreticulum)}
 
 
-def device_of(node):
-    return str((node or {}).get("device") or DEFAULT_DEVICE)
+BUILD_KEYS = ("ref", "elf", "fixed", "tools", "env", "kind_type", "stamp", "arch", "name",
+              "virtual_hardware", "virtual_radio", "source", "project", "catalogue", "asked")
 
 
-def resolve_builds(nodes, override=None):
-    """Where each device a nodeset's nodes name runs from: {device ref:
-    resolved}, which a run keeps in run.yaml as its `builds`.
+async def ensure_builds(refs, override=None, say=None):
+    """Where each firmware a run names runs from: {firmware: resolved},
+    which a run keeps in run.yaml as its `builds`. A `_latest` one is looked
+    for afresh and fetched when it is not here (devices.ensure).
 
-    `override` is a simulation's own build (a catalogue, package, stamp,
-    local device or path), used in place of every device whose kind is the
-    one that build is of. A device that cannot be resolved raises
-    CommandError naming it and what would supply it.
+    `override` is a simulation's own build (a device name or a path), used in
+    place of every firmware whose kind is the one that build is of. A
+    firmware that cannot be resolved raises CommandError naming it and what
+    would supply it.
     """
+    say = say or (lambda line: None)
     forced = None
-    if override not in (None, ""):
-        try:
-            forced = devices_module.resolve(override)
-        except devices_module.DeviceError as err:
-            raise CommandError(str(err)) from err
-    out = {}
-    for ref in sorted({device_of(node) for node in (nodes or {}).values()}):
-        try:
-            got = devices_module.resolve(ref)
-        except devices_module.DeviceError as err:
-            if forced is None:
-                raise CommandError(str(err)) from err
-            got = None
-        if forced is not None and (got is None or got["kind_type"] == forced["kind_type"]):
-            got = dict(forced, asked=str(override))
-        out[ref] = {k: got.get(k) for k in ("ref", "elf", "fixed", "tools", "env", "kind_type",
-                                            "stamp", "arch", "name", "stands_for", "source",
-                                            "catalogue", "asked")}
+    try:
+        if override not in (None, ""):
+            forced = await devices_module.ensure(str(override), say=say)
+        out = {}
+        for ref in sorted(set(refs)):
+            try:
+                got = await devices_module.ensure(ref, say=say)
+            except devices_module.DeviceError:
+                if forced is None:
+                    raise
+                got = None
+            if forced is not None and (got is None or got["kind_type"] == forced["kind_type"]):
+                got = dict(forced, asked=str(override))
+            out[ref] = {k: got.get(k) for k in BUILD_KEYS}
+    except devices_module.DeviceError as err:
+        raise CommandError(str(err)) from err
     return out
 
 
+def build_present(build):
+    """Whether a kept build still has its executable: a `_latest` one is
+    removed once a newer one is seen."""
+    return bool(build) and bool(build.get("elf")) and os.path.isfile(build["elf"])
+
+
 def make_kinds(builds):
-    """A `Kind` per device ref, from what `resolve_builds` said (a run's `builds`)."""
+    """A `Kind` per firmware, from what `ensure_builds` said (a run's `builds`)."""
     types = kind_types()
     kinds = {}
     for ref, device in (builds or {}).items():

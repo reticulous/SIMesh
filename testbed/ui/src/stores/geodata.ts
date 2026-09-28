@@ -21,6 +21,9 @@ export const useGeodata = defineStore('geodata', {
     pack: null as PackInfo | null,
     /** Why a pack has no ground on show, when it has none. */
     problem: null as string | null,
+    /** The last view of each map that shares one, by its key (per geodata):
+     *  metres at the centre and metres per pixel. */
+    views: {} as Record<string, { cx: number; cy: number; mpp: number }>,
   }),
 
   getters: {

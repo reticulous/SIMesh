@@ -1,0 +1,11 @@
+{
+  "name": "simradio-portduino",
+  "version": "0.1.0",
+  "description": "SIMesh's simulated SX1262 and the station's idle wait, for a Portduino firmware",
+  "frameworks": "arduino",
+  "platforms": "native",
+  "build": {
+    "libArchive": false,
+    "extraScript": "link.py"
+  }
+}

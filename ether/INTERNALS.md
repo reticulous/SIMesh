@@ -234,7 +234,7 @@ medium learns to care about coding rate, header type or preamble length.
 The carrier is matched within a tolerance, not exactly, because the
 synthesizer steps in 32 MHz / 2^25: two drivers asked for 869.525 MHz round it
 to register values tens of hertz apart (RadioLib lands on 869 524 963 Hz, the
-berlinmesh driver on 869 524 999), and an exact match makes two stations on
+Sergeyculum driver on 869 524 999), and an exact match makes two stations on
 one channel deaf to each other. A quarter of the bandwidth is what a LoRa
 demodulator tolerates.
 

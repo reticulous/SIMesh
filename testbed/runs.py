@@ -3,12 +3,15 @@
 A **run** is a directory, `testbed/runs/<name>/`:
 
     run.yaml            the geodata, nodeset and script names, time mode,
-                        each device's build by stamp, when it started, and the
-                        snapshot it started from, if any
+                        the firmware rules its scripts declared, each node's
+                        firmware and where each firmware's build was, when
+                        it started, and the snapshot it started from, if any
     geodata.yaml        the geodata file as it was, its pack path re-based
     nodeset.yaml        the run's own copy of the nodeset: edits during the run
                         go here, never to `nodesets/`
     script.py           the script it was started with, as it was, when one was
+    globals.py          scripts/globals.py as it was: the radio the run's
+                        coverage, tables and analysis take its stations to have
     losses/<band>.bin   the loss tables the ether reads, the run's own copies
     nodes/<name>/state/ each station's store, as it writes it
     nodes/<name>/...    each station's log, and whatever else it keeps
@@ -25,10 +28,12 @@ snapshot is loaded, and the old run's `run.yaml` says `resumed: <new run>`.
 
 A **snapshot** is a directory, `testbed/snapshots/<name>/`:
 
-    snapshot.yaml       taken at which T, from which run, which builds
+    snapshot.yaml       taken at which T, from which run, each node's firmware
+                        and its rules, which builds
     geodata.yaml        the geodata reference, as it was
     nodeset.yaml        the nodeset, as the run had it
     script.py           the run's script, when it had one
+    globals.py          the run's globals.py
     losses/<band>.bin   the run's table copies
     nodes/<node>/state/
 
@@ -56,6 +61,7 @@ SNAPSHOT_FILE = "snapshot.yaml"
 GEODATA_FILE = "geodata.yaml"
 NODESET_FILE = "nodeset.yaml"
 SCRIPT_FILE = "script.py"
+GLOBALS_FILE = "globals.py"
 LOSSES_DIR = "losses"
 NODES_DIR = "nodes"
 EDITS_FILE = "nodeset-edits.jsonl"
@@ -166,9 +172,10 @@ def _copy_tables(src_root, dst_root):
 
 
 def _copy_script(src_root, dst_root):
-    src = os.path.join(src_root, SCRIPT_FILE)
-    if os.path.isfile(src):
-        shutil.copyfile(src, os.path.join(dst_root, SCRIPT_FILE))
+    for name in (SCRIPT_FILE, GLOBALS_FILE):
+        src = os.path.join(src_root, name)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(dst_root, name))
 
 
 # ---- a run ---------------------------------------------------------------
@@ -210,6 +217,16 @@ class Run:
     def nodeset(self):
         """The run's own nodeset, which edits during the run change and save."""
         return nodeset_module.open_path(self.nodeset_path, self.meta.get("nodeset"))
+
+    def radio(self):
+        """The radio the run's globals.py sets its stations to (script.shared_radio)."""
+        import script as script_module
+        return script_module.shared_radio(script_module.globals_path(self.dir))
+
+    def node_count(self):
+        """How many stations the run has, from its nodeset file's node list
+        alone: a listing reads any run's, whatever else that file says."""
+        return len((_read_yaml(self.nodeset_path).get("nodes") or {}))
 
     def table_path(self, band):
         return os.path.join(self.dir, LOSSES_DIR, "%s.bin" % band)
@@ -326,10 +343,11 @@ def create_run(directory, gd, ns, script_name, time_mode, tables, builds=None, s
     wipe_state(directory)
     geodata_module.write_copy(gd, os.path.join(directory, GEODATA_FILE))
     nodeset_module.write(os.path.join(directory, NODESET_FILE), ns.data)
+    import script as script_module
     if script_name:
-        import script as script_module
         shutil.copyfile(script_module.script_path(script_name),
                         os.path.join(directory, SCRIPT_FILE))
+    shutil.copyfile(script_module.globals_path(), os.path.join(directory, GLOBALS_FILE))
     for band, path in (tables or {}).items():
         shutil.copyfile(path, os.path.join(directory, LOSSES_DIR, "%s.bin" % band))
     meta = {"geodata": gd.name, "nodeset": ns.name, "script": script_name, "time": time_mode,
@@ -367,6 +385,9 @@ def save_snapshot(run, name, t, builds=None, snapshots_dir=None):
             "t": t, "run": run.name, "geodata": run.geodata_name,
             "nodeset": run.meta.get("nodeset"), "script": run.meta.get("script"),
             "builds": dict(builds if builds is not None else run.meta.get("builds") or {}),
+            "firmware": dict(run.meta.get("firmware") or {}),
+            "firmware_rules": list(run.meta.get("firmware_rules") or []),
+            "first_boot_rules": list(run.meta.get("first_boot_rules") or []),
             "taken": now_iso()})
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
@@ -397,7 +418,9 @@ def load_snapshot(name, directory, time_mode, snapshots_dir=None):
     _write_yaml(os.path.join(directory, RUN_FILE), {
         "geodata": snap.get("geodata"), "nodeset": snap.get("nodeset"),
         "script": snap.get("script"), "time": time_mode,
-        "builds": dict(snap.get("builds") or {}), "started": now_iso(),
+        "builds": dict(snap.get("builds") or {}), "firmware": dict(snap.get("firmware") or {}),
+        "firmware_rules": list(snap.get("firmware_rules") or []),
+        "first_boot_rules": list(snap.get("first_boot_rules") or []), "started": now_iso(),
         "snapshot": name, "snapshot_t": snap.get("t")})
     return Run(directory)
 

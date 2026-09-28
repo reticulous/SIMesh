@@ -45,7 +45,6 @@
         <template v-if="view === 'nodes'">
           <q-separator />
           <q-item-label header>Layers</q-item-label>
-          <toggle label="Links from the selected node" field="links" />
           <toggle label="Offsets" field="offsets" />
           <q-separator />
           <q-item-label header>Nodes</q-item-label>

@@ -3,7 +3,6 @@ import { answered } from '../lib/front'
 import { useCatalog } from './catalog'
 import { useCoverage } from './coverage'
 import { useGeodata } from './geodata'
-import { useNodes } from './nodes'
 import { useSim } from './sim'
 
 /* The page's one websocket, to the front (or to a simd on its own), and the
@@ -45,6 +44,15 @@ export const useSocket = defineStore('socket', {
 
     receive(msg: Record<string, unknown>) {
       if (msg.type === 'hello') {
+        // A page older (or newer) than the build the front serves reloads
+        // itself, once per build, so a cache handing back the old one cannot loop.
+        const mine = document.querySelector('script[type="module"][src*="/assets/"]')?.getAttribute('src')
+        const page = typeof msg.page === 'string' ? msg.page : null
+        if (mine && page && mine !== page) {
+          let tried = false
+          try { tried = sessionStorage.getItem('simesh.reloaded') === page; sessionStorage.setItem('simesh.reloaded', page) } catch { /* private window */ }
+          if (!tried) { location.reload(); return }
+        }
         // Only the front has the editors: a simd on its own answers none of them.
         this.front = true
         this.port = String(msg.port ?? this.port)
@@ -53,7 +61,6 @@ export const useSocket = defineStore('socket', {
       }
       if (answered(msg)) return
       useCatalog().receive(msg)
-      useNodes().receive(msg)
       useCoverage().receive(msg)
       useSim().receive(msg)
     },

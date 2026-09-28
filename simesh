@@ -2,7 +2,7 @@
 # simesh — SIMesh, from a shell.
 #
 #     simesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page
-#     simesh new [NAME] (--geodata G --nodeset N [--script S] | --snapshot S)
+#     simesh new [NAME] (--geodata G --nodeset N | --snapshot S)
 #                [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
 #                                    start a simulation (and the front, when none runs);
 #                                    prints its name, sockets and run directory as JSON
@@ -12,19 +12,23 @@
 #     simesh list [--json]           the simulations, with their clocks and plans
 #     simesh plan NAME PHASE=UNTIL…  tell a simulation its phases (UNTIL in seconds
 #                                    of T; +N is N after now)
-#     simesh run SCRIPT (--sim NAME [--pause] | --geodata G --nodeset N [--time T] [--name S])
-#                                    a script's main on a simulation, then its report;
-#                                    a simulation it started is paused when main ends.
-#                                    SCRIPT is a path or one of testbed/scripts/ by name
+#     simesh run SCRIPT (--sim NAME | --geodata G --nodeset N [--nodeset N2…] [--name S])
+#                                    a script, top to end, on a simulation of its own
+#                                    (several nodesets merged) or a running one, then
+#                                    its report. SCRIPT is a path or one of
+#                                    testbed/scripts/ by name
 #     simesh run SCRIPT --report RUN_DIR
 #                                    only the script's report of an ended run
-#     simesh devices refresh [SOURCE…]  fetch the newest device packages (default: stable
-#                                    and dev from the web, then every catalogue in
-#                                    builds/ beside SIMesh); a SOURCE is a catalogue
-#                                    name, URL or local directory
-#     simesh devices list            the devices under devices/
-#     simesh devices import ZIP      a device zip into devices/imported/
-#     simesh devices resolve DEVICE  what a node's `device:` value runs, as JSON
+#     simesh devices refresh [SOURCE…]  survey the catalogues for their newest builds,
+#                                    fetching nothing (default: the web's, then every
+#                                    catalogue in builds/ beside SIMesh); a SOURCE is
+#                                    a catalogue name, URL or local directory
+#     simesh devices list            the latest and the saved builds
+#     simesh devices fetch DEVICE    download a <project>_<catalogue>_latest build now
+#     simesh devices save DEVICE     keep a <project>_<catalogue>_latest build as it is
+#     simesh devices delete DEVICE   remove a saved build
+#     simesh devices import ZIP      a device zip into the saved builds
+#     simesh devices resolve DEVICE  what a device name runs, as JSON
 #     simesh build [page|radio|planner]…
 #                                    build the page, the chip library and the planner
 #                                    (all three when none is named)
@@ -37,7 +41,7 @@
 # or with SIMESH_DOCKER=1, the same command runs inside SIMesh's own image
 # (Dockerfile beside this script), built on first use and again whenever the
 # Dockerfile changes, with the directory holding SIMesh mounted at its own path
-# so a workspace beside it is where a local device expects it, and port 8800
+# so a workspace beside it is where a workspace build expects it, and port 8800
 # published for TCP and UDP. That container is called simesh-front, and the
 # simulation verbs run inside it, so they need the front started first.
 #
@@ -114,6 +118,14 @@ in_container() {
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
     [ -z "${SIMESH_CATALOGUES:-}" ] || args+=(-e "SIMESH_CATALOGUES=$SIMESH_CATALOGUES")
     if [ "$publish" = 1 ]; then
+        # One front at a time: a running one is said so, and one left behind
+        # stopped (--rm did not get to it) is cleared out of the name's way.
+        if [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            die "a front is already running ($FRONT_CONTAINER): to restart it, docker stop $FRONT_CONTAINER first"
+        fi
+        if [ -n "$(docker ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            docker rm -f "$FRONT_CONTAINER" >/dev/null
+        fi
         args+=(--name "$FRONT_CONTAINER" -p "$PORT:$PORT/tcp" -p "$PORT:$PORT/udp")
         say "the page: $URL"
         open_when_up "$URL"
@@ -191,8 +203,8 @@ build_planner() {
     else
         say "the planner: no wasm-pack, so planner-web embeds the planner-wasm output already in $static"
     fi
-    say "the planner: planner-web (cargo build --release)"
-    (cd "$PLANNER" && cargo build --release -p planner-web)
+    say "the planner: planner-web and planner-job (cargo build --release)"
+    (cd "$PLANNER" && cargo build --release -p planner-web -p planner-job)
 }
 
 cmd_build() {
@@ -281,7 +293,7 @@ fi
 
 case "$verb" in
     build) shift; cmd_build "$@" ;;
-    devices) shift; [ $# -gt 0 ] || die "devices: refresh, list, import or resolve"; cmd_devices "$@" ;;
+    devices) shift; [ $# -gt 0 ] || die "devices: refresh, list, fetch, save, delete, import or resolve"; cmd_devices "$@" ;;
     new|stop|pause|resume|list|plan) cmd_sims "$@" ;;
     run) shift; cmd_run "$@" ;;
     front) shift; cmd_front "$@" ;;

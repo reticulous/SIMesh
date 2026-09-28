@@ -2,22 +2,14 @@
   <q-page class="sims-page">
     <div class="sims-body">
       <div class="sims-head">
-        <div class="sims-heading">Simulations</div>
-        <q-space />
-        <q-btn unelevated dense no-caps color="primary" label="Run from current world"
-               :disable="!currentReady" @click="runCurrent">
-          <q-tooltip>{{ currentReason }}</q-tooltip>
-        </q-btn>
-        <q-select v-model="currentScript" :options="setupScripts" dense outlined options-dense clearable
-                  class="sims-script" label="setup script (optional)" />
+        <div class="sims-heading">Simulation runs</div>
       </div>
 
       <div v-if="!sim.sims.length" class="sims-none">
-        No simulations yet. Run from current world starts the Nodes tab's nodeset on its
-        geodata in real time, for working with the stations by hand; a script's Run
-        starts one too, and so does
-        <code>simesh new --geodata &lt;g&gt; --nodeset &lt;n&gt; [--script &lt;s&gt;]</code>
-        from a shell.
+        No simulation runs yet. A script's Run on the Scripts tab starts one, on
+        the Nodes tab's geodata and nodeset, running what the script's
+        <code>firmware()</code> says; so does <code>simesh run &lt;script&gt;
+        --geodata &lt;g&gt; --nodeset &lt;n&gt;</code> from a shell.
       </div>
 
       <table v-else class="sims-table">
@@ -94,7 +86,7 @@
                 <span v-else class="sims-sub">{{ s.plan && !s.done ? 'pace not known yet' : '—' }}</span>
               </td>
               <td class="num mono">
-                <template v-if="s.state === 'paused' || s.state === 'ended'">{{ s.stations }}</template>
+                <template v-if="s.state === 'paused' || s.state === 'ended'">{{ s.stations ?? '—' }}</template>
                 <template v-else>
                   <span :class="{ 'sims-all-up': s.stations && up(s) === s.stations }">
                     {{ up(s) }}/{{ s.stations }}
@@ -194,7 +186,6 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useQuasar } from 'quasar'
 import { useSim, type SimSummary } from '../stores/sim'
 import { useCatalog } from '../stores/catalog'
-import { saveIfEditing, useNodes } from '../stores/nodes'
 import { useSocket } from '../stores/socket'
 import { clockTime, etaText, phaseText, realText, simText, speedText } from '../components/runtime'
 import ReportDialog from '../components/ReportDialog.vue'
@@ -202,10 +193,8 @@ import { matDeleteOutline } from '@quasar/extras/material-icons'
 
 const sim = useSim()
 const catalog = useCatalog()
-const nodes = useNodes()
 const socket = useSocket()
 const quasar = useQuasar()
-const currentScript = ref<string | null>(null)
 /** The run whose report is on show. */
 const reportOf = ref<string | null>(null)
 /** The simulation a snapshot is being chosen for, while the dialog is open. */
@@ -214,26 +203,6 @@ const restoringOpen = computed<boolean>({
   get: () => restoring.value !== null,
   set: (v) => { if (!v) restoring.value = null },
 })
-
-const setupScripts = computed(() => catalog.scripts.filter(s => s.setup !== false && !s.error).map(s => s.name))
-
-/* Run from current world: the Nodes tab's nodeset on its geodata, its
- * changes saved first, since a simulation runs the file. */
-const currentReason = computed(() => {
-  if (!nodes.nodeset) return 'Open a nodeset in the Nodes tab first'
-  if (!nodes.nodeset.name) return 'Save the Nodes tab\'s nodeset first: it has no name yet'
-  if (!nodes.geodata) return 'Choose the geodata on the Geodata tab first'
-  return `${nodes.nodeset.name}${nodes.nodeset.dirty ? ' (saved first)' : ''} on ${nodes.geodata}, in real time`
-})
-const currentReady = computed(() => !!(nodes.nodeset?.name && nodes.geodata))
-
-async function runCurrent() {
-  if (!currentReady.value) return
-  const error = await saveIfEditing(nodes.nodeset!.name)
-  if (error) { quasar.notify({ type: 'negative', message: error, timeout: 6000 }); return }
-  sim.newSim({ geodata: nodes.geodata!, nodeset: nodes.nodeset!.name!, time: 'real',
-               ...(currentScript.value ? { script: currentScript.value } : {}) })
-}
 
 onMounted(() => { void catalog.refresh() })
 
@@ -309,7 +278,6 @@ function askStop(simName: string, state: string) {
 .sims-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .sims-heading { font-size: 14px; font-weight: 500; color: #d1d5db; margin-bottom: 10px; }
 .sims-head .sims-heading { margin-bottom: 0; }
-.sims-script { min-width: 200px; }
 .sims-none { color: #6b7280; font-size: 13px; line-height: 1.5; max-width: 760px; }
 .sims-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .sims-table th {

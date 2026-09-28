@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn berlin_ground_truths() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.cache/worldcover/ESA_WorldCover_10m_2021_v200_N51E012_Map.tif");
+            .join("../../../packs/.cache/worldcover/ESA_WorldCover_10m_2021_v200_N51E012_Map.tif");
         if !path.exists() {
             eprintln!("SKIP: WorldCover tile not downloaded ({})", path.display());
             return;

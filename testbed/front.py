@@ -10,7 +10,17 @@ browser ── http localhost:8800/planner/<geodata>/… ─► front ── htt
 browser ── http localhost:8800/api/table?path=… ────► front          a loss table file (links layer)
 browser ── http localhost:8800/api/coverage?… ──────► front          a node's coverage raster
 browser ── POST localhost:8800/api/devices/import ──► front          a device zip, expanded
-browser ── POST localhost:8800/api/geodata/import ──► front          a pack zip, expanded
+browser ── POST localhost:8800/api/geodata/import ──► front          a geodata pack zip, expanded
+browser ── GET  localhost:8800/api/geodata/export ──► front          a geodata pack zip, made as it goes
+browser ── GET  localhost:8800/osm/<z>/<x>/<y>.png ► front ── (cache miss) ─► tile.openstreetmap.org
+browser ── GET  localhost:8800/api/nominatim?q= ───► front ─────────────────► nominatim.openstreetmap.org
+front ── GET /api/v1/nodes (weekly) ───────────────► map.meshcore.io  for nodeset_import
+front ── planner-job nodes-import, JSON on stdin ──► planner-job      the nodes inside the geodata
+browser ── GET  localhost:8800/api/geodata/sources ► front          what a rectangle's build takes
+browser ── POST localhost:8800/api/geodata/build ──► front          a build started (DELETE cancels)
+front ── fetch into packs/.cache/<source>/ ────────► source hosts     (sources.py)
+front ── planner-job pack-build, JSON on stdin ────► planner-job      (packbuild.py)
+front ── geodata_progress {build} ─► every page     as it fetches and compiles
 driver  ── ws   localhost:8800/ws?sim=lora  {type: "plan", ...} ─────► child
 
 page ── sim_new {geodata, nodeset, script?, time} ──► front
@@ -21,9 +31,13 @@ front: runs.create_run → runs/<sim>/ (geodata, nodeset, script, losses/<band>.
 front ── simd.py --run runs/<sim> --sidecar URL ───► child
 front ── sim_new {ok, name, control, run, …} ─► asker
 
-page ── script_run {name, sim} ──► front ── python -m simesh.runner <script> --sim <sim> ──► runner
-runner ── ws localhost:8800/ws?sim=<sim> ─► front ─► child     the script's main(sim)
-runner ── sim_pause {name} ─► front                            main ended, on a sim started for it
+page ── script_run {name, geodata, nodesets} ──► front: a name for its simulation, <sim>
+front ── python -m simesh.runner <script> --geodata G --nodeset N… --name <sim> ──► runner
+front ── script_run {run, simulation: <sim>} ──► page          which goes over to <sim>
+runner: the script from its top; time(), firmware(), on_first_boot() collected
+runner ── sim_new {name: <sim>, …, time, firmware_rules, first_boot_rules} ──► front
+runner ── ws localhost:8800/ws?sim=<sim> ─► front ─► child     what the script does
+runner ── sim_pause {name} ─► front                            when the script says pause()
 front: stop the child, runs.pause_run → runs/<sim>/paused/    the registry keeps it, paused
 runner: report(run_dir) → runs/<sim>/report.md                when the script has a report
 front ── script_output {run, line} … script_exit {run, code} ─► every page
@@ -39,12 +53,12 @@ simulation ends that one; the registry keeps it, exited, with the last lines
 it wrote, until it is stopped.
 
 **Before a child starts** its run is made whole here: the geodata and the
-nodeset are loaded and checked, every node's device is resolved (so a missing
-package is said at once, not after a table), the loss table of every band the
-nodes' carriers use is taken from the cache or computed into it by
-`losses.py` as a subprocess, whose progress goes to every page, and the run
-directory is laid out by `runs.create_run` (or `runs.load_snapshot`). The
-child is then started on that directory and loads it itself.
+nodeset are loaded and checked, the loss table of every band the nodes'
+carriers use is taken from the cache or computed into it by `losses.py` as a
+subprocess, whose progress goes to every page, and the run directory is laid
+out by `runs.create_run` (or `runs.load_snapshot`). The child is then
+started on that directory and loads it itself, settling each node's firmware
+from its script's `firmware()` declarations and fetching what they name.
 
 **The planner sidecar.** One `planner-web` per pack in use, on
 `127.0.0.1:<free>`: started when the first simulation or page socket opens
@@ -55,16 +69,17 @@ NO_PLANNER and synthetic ground works. The page reaches it as `/planner/<geodata
 the prefix stripped; a child is given its URL directly, for recomputing a
 moved node's row.
 
-**Script runs.** A script's `main` runs as a process of its own
-(`simesh.runner`), attached to a running simulation over this same port, its
-output kept (the last `SCRIPT_LINES` lines) and sent to every page as it
-comes. A run that asks for a new simulation has the front start it first,
-with the script as its setup, and the runner pauses it when main ends: its
-stations stop with their state kept in its run, and it stays in the
-registry as paused until it is resumed (in a new run directory, from that
-state) or removed. A script's `report(run_dir)` then writes the run's
-`report.md`, which `/api/report` serves. A run on a simulation already running leaves
-it running.
+**Script runs.** A script runs as a process of its own (`simesh.runner`),
+its output kept (the last `SCRIPT_LINES` lines) and sent to every page as it
+comes. On a new simulation it starts that itself, through `sim_new` on this
+same port, with its time and its firmware and first-boot rules, under the
+name the front chose when it was asked to run it, so the page can go to it
+at once; or it runs on a simulation already running. Either way the
+simulation runs on when the script ends, unless the script paused or
+stopped it; a paused one stays in the registry until it is resumed (in a
+new run directory, from its state) or removed. A script's
+`report(run_dir)` then writes the run's `report.md`, which `/api/report`
+serves.
 
 The front's control websocket speaks the child's messages (simd.py lists
 them) and these of its own, each answered to the asking socket as
@@ -72,7 +87,8 @@ them) and these of its own, each answered to the asking socket as
 
 ```
 sims                                                      the registry, now
-sim_new {name?, geodata, nodeset, script?, time?, stagger?, build?, pairwise?}
+sim_new {name?, geodata, nodeset | nodesets, script?, time?, stagger?, build?, pairwise?,
+         firmware_rules?, first_boot_rules?}
 sim_new {name?, snapshot, time?, stagger?, build?, pairwise?}
       → {ok, name, control, ether, net, run, time, geodata, nodeset, script, snapshot}
 sim_stop {name}                                           → {ok, name}
@@ -81,9 +97,14 @@ sim_resume {name}                 a paused one, from that state      → as sim_
 run_delete {run}                  an ended or paused run's directory, gone  → {ok, run}
 select {sim}                                              which simulation the socket is on
 
-device_list                       → {devices: [row…], arch}      builds/ refreshed, then devices.listing
-device_refresh {sources?}         → {results, said}              devices.refresh
-geodata_list                      → {geodata: [{name, kind, bbox, …} | {name, error}]}
+device_list                       → {latest: [row…], saved: [row…], arch}   builds/ surveyed, then
+                                    devices.listing
+device_refresh {sources?}         → {said}                       devices.survey, the web's too
+device_save {ref}                 → {ref, said}                  a _latest build kept, fetched first
+device_delete {ref}               → {ref}                        a saved build removed
+antenna_list                      → {antennas: [antenna…]}       antennas.catalogue
+geodata_list                      → {geodata: [{name, kind, bbox, licences, …} | {name, error}],
+                                     build: the running or failed build's row, or null}
 geodata_open {name}               → {geodata, planner}   holds the sidecar for this socket
 geodata_close                                            lets it go
 geodata_new {name, pack | synthetic: {terrain, exponent, extent_m}}   → {geodata}
@@ -93,17 +114,34 @@ nodeset_list {geodata?}           → {nodesets: [{name, nodes, bbox, tags, insi
 nodeset_open {name}               → {nodeset}
 nodeset_new {name}                → {nodeset}
 nodeset_save {name, data} · nodeset_save_as {name, data}              → {nodeset}
-nodeset_import {name, format: sites|nodes, text | path, height_m?, device?}  → {nodeset}
-script_list                       → {scripts: [{name, doc, setup, main} …]}
+nodeset_import {name, source: sites|nodes, text | path, height_m?}  → {nodeset}
+nodeset_import {name, source: meshcore|potatomesh, geodata, url?, companions?, max_age_days?,
+                height_m?}   → {nodeset, report}   a public node map inside the
+                                    geodata's extent, through planner-job nodes-import
+nodeset_merge {name, layers: [{name, data}]}  → {nodeset}   the shown layers, top first, as
+                                    they stand, merged into a new nodeset (nodeset.merge)
+nodeset_setup_open {name}         → {name, text, exists}   its own setup, nodesets/<name>.py;
+                                    one it has not got yet reads as a fresh one's text
+nodeset_setup_save {name, text}   → {name, text, exists}   checked to parse, then written
+script_list                      → {scripts: [{name, doc, report, references, included_by} …]}
+                                    included_by: the scripts that include or import it;
+                                    one some script includes is not run on its own
+module_open {path}                → {path, text}   a file a script imports (the library's,
+                                    or another script), by its path under testbed/
 script_open {name}                → {script, text}
 script_new {name, text?} · script_save {name, text} · script_save_as {name, text}
                                   → {script, text}
-script_run {name, sim | geodata, nodeset, setup?, time?, build?}  → {run, simulation}
-                                  setup: the new simulation's setup script, else this one's own
+script_run {name, sim | geodata, nodeset | nodesets, build?}  → {run, simulation}
+                                  a new simulation is the script's own, started by
+                                  it; several nodesets are merged as nodeset_merge
+                                  merges them
 script_stop {run}                 → {}
 script_log {run}                  → {run, lines}
 snapshot_list                     → {snapshots: [{name, t, run, geodata, nodeset, script, …}]}
 losses_compute {geodata, nodeset, bands?}  → {tables: {band: {path, cached}}}
+links {geodata, node, nodes: {name: record}, band?}  → {node, band, f0_hz, cells: {other:
+                                    {to, from, flags}}}   one node's row and column from the
+                                    nodes as the page has them, saved or not; null never heard
 coverage {geodata, nodes: [{name, lat, lon, height_m}]}  → {tiles: [{node, key, cached}]}
 ```
 
@@ -112,15 +150,21 @@ and these unasked:
 ```
 front → socket        hello {front: true, port}                    on connect
 front → all sockets   sims {port, sims: [...], script_runs: [...], geodata_names,
-                            nodesets, scripts, snapshots}          on change and once a second
+                            nodesets, scripts, snapshots, globals, globals_error}
+                                                                   on change and once a second
+                      `globals`: scripts/globals.py's shared settings (script.SHARED),
+                      null with `globals_error` saying why when it cannot be read
                       a sim's state: starting, running, stopping, exited, paused, or
                       ended (a run on disk that is neither; named by its run directory);
                       `report` on a sim or a script run: its run has a report.md;
                       `started`, `ended`: wall seconds (`ended` null while it runs),
                       `t`: its T now, or where it stopped, in microseconds
 front → all sockets   losses_progress {sim | nodeset, band, done, total}
+front → all sockets   geodata_progress {build: {name, state, step, done, total, fetched, of,
+                                                error, spec} | null}
 front → all sockets   script_output {run, line} · script_exit {run, code}
-front → all sockets   devices_changed {}                           the start's refresh fetched some
+front → all sockets   devices_changed {}                           a survey saw something new, or
+                                                                   a build was saved or deleted
 front → asker         coverage_tile {geodata, node, key} · coverage_error {geodata, node, error}
 anything else         → the child named by `sim`, or the selected one
 child → socket        the child's own message, with `sim` added
@@ -159,6 +203,7 @@ import fcntl
 import ipaddress
 import itertools
 import json
+import math
 import os
 import re
 import signal
@@ -166,6 +211,7 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.parse
 
 import aiohttp
 from aiohttp import WSMsgType, web
@@ -173,23 +219,37 @@ from aiohttp import WSMsgType, web
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SIM_DIR)
 
-import coverage as coverage_module  # noqa: E402 - the path is set just above
+import antennas as antennas_module  # noqa: E402 - the path is set just above
+import coverage as coverage_module  # noqa: E402
 import devices as devices_module    # noqa: E402
 import geodata as geodata_module    # noqa: E402
 import kinds as kinds_module        # noqa: E402
 import losses as losses_module      # noqa: E402
 import nodeset as nodeset_module    # noqa: E402
+import packbuild as packbuild_module   # noqa: E402
 import proxy                        # noqa: E402
 import runs as runs_module          # noqa: E402
 import script as script_module      # noqa: E402
 import simd as simd_module          # noqa: E402
+import sources as sources_module    # noqa: E402
 import store                        # noqa: E402
 import webrtc as webrtc_module      # noqa: E402
 
 SIGNAL_PATH = simd_module.SIGNAL_PATH
 LOSSES_PY = os.path.join(SIM_DIR, "losses.py")
 PLANNER_WEB = os.path.join("target", "release", "planner-web")
+PLANNER_JOB = os.path.join("target", "release", "planner-job")
 NO_PLANNER = ("geodata %s is a pack, and planner-web is not built: simesh build planner")
+OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_TILES_DIR = os.path.join(SIM_DIR, "osmtiles")
+OSM_TILE_MAX_AGE_S = 7 * 86400      # the tile usage policy's floor for keeping one
+OSM_MAX_ZOOM = 19
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_GAP_S = 1.0               # its usage policy: one request a second at most
+MESHCORE_NODES = "https://map.meshcore.io/api/v1/nodes"
+MESHCORE_META = "meshcore-nodes.json"
+MESHCORE_MAX_AGE_DAYS = 365         # an advert older than this is a clock never set, or a node gone
+POTATOMESH_NODES = "/api/nodes?limit=1000"
 
 CONTROL_PORTS = range(9100, 9200)   # a child's page, proxy and relay (TCP and UDP)
 ETHER_PORTS = range(7100, 7200)     # a child's ether
@@ -202,25 +262,30 @@ SIDECAR_POLL_S = 0.2
 REPORT_S = 1.0                      # how often every socket hears the registry
 PACE_WINDOW_S = 120.0               # the wall the estimate's pace is taken over
 TAIL_LINES = 40                     # a child's last lines, kept for the page
+LINK_CELLS_KEPT = 200_000           # pairs the links verb keeps, oldest dropped first
 SCRIPT_LINES = 2000                 # a script run's last lines, kept for the page
 ERRORS_KEPT = 5
 MAX_UPLOAD = 4 << 30                # a pack zip is hundreds of megabytes
+EXPORT_CHUNK = 1 << 20              # an export's zip goes out a megabyte at a time,
+EXPORT_QUEUE = 8                    # at most this many ahead of the reader
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 
 SIM_VERBS = ("sim_new", "sim_stop", "sim_pause", "sim_resume", "run_delete")
 EDITOR_VERBS = (
-    "device_list", "device_refresh",
+    "device_list", "device_refresh", "device_save", "device_delete", "antenna_list",
+    "module_open",
     "geodata_list", "geodata_open", "geodata_close", "geodata_new", "geodata_save",
-    "geodata_save_as",
+    "geodata_save_as", "geodata_rename", "geodata_delete",
     "nodeset_list", "nodeset_open", "nodeset_new", "nodeset_save", "nodeset_save_as",
-    "nodeset_import",
+    "nodeset_delete",
+    "nodeset_import", "nodeset_merge", "nodeset_setup_open", "nodeset_setup_save",
     "script_list", "script_open", "script_new", "script_save", "script_save_as",
     "script_run", "script_stop", "script_log",
-    "snapshot_list", "losses_compute", "coverage")
-QUIET_VERBS = ("device_list", "geodata_list", "nodeset_list", "script_list", "snapshot_list",
-               "geodata_open", "nodeset_open", "script_open", "geodata_close", "script_log",
-               "coverage")
+    "snapshot_list", "losses_compute", "links", "coverage")
+QUIET_VERBS = ("device_list", "antenna_list", "module_open", "geodata_list",
+               "nodeset_list", "script_list", "snapshot_list", "geodata_open", "nodeset_open",
+               "nodeset_setup_open", "script_open", "geodata_close", "script_log", "links", "coverage")
 
 PR_SET_PDEATHSIG = 1
 
@@ -316,6 +381,12 @@ def any_free_port():
 def planner_web():
     """The planner-web executable, or None when there is no planner."""
     path = os.path.join(geodata_module.planner_repo(), PLANNER_WEB)
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def planner_job():
+    """The planner-job executable, which compiles a pack, or None."""
+    path = os.path.join(geodata_module.planner_repo(), PLANNER_JOB)
     return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
 
 
@@ -707,19 +778,17 @@ class Child:
 # ---------------------------------------------------------------------------
 
 class ScriptRun:
-    """A script's `main`, running as `simesh.runner` on one simulation (and
-    then its `report`, when it has one, on that simulation's run)."""
+    """A script, running as `simesh.runner` (and then its `report`, when it
+    has one, on its simulation's run). It starts its own simulation, under
+    the name the front chose for it, on `world` (geodata, nodesets, build),
+    or runs on the one named, `world` then None."""
 
-    def __init__(self, front, ident, name, sim, run_dir, owns_sim=False):
+    def __init__(self, front, ident, name, sim, world=None):
         self.front = front
         self.id = ident
         self.name = name
         self.sim = sim
-        self.run_dir = run_dir
-        # A simulation started for this run is this run's: it is paused when
-        # main ends, its state kept to be resumed. One the run attached to is
-        # left running.
-        self.owns_sim = owns_sim
+        self.world = world
         self.process = None
         self.state = "running"              # running, stopping, exited
         self.code = None
@@ -727,14 +796,27 @@ class ScriptRun:
         self.lines = collections.deque(maxlen=SCRIPT_LINES)
         self.reader = None
 
+    @property
+    def run_dir(self):
+        """Its simulation's run directory, once there is one."""
+        child = self.front.children.get(self.sim)
+        return child.run_dir if child is not None else None
+
     async def start(self, port):
         argv = [sys.executable, "-u", "-m", "simesh.runner", script_module.script_path(self.name),
-                "--sim", self.sim, "--port", str(port)]
-        if self.owns_sim:
-            argv.append("--pause")
-        env = dict(os.environ, SIMESH_PORT=str(port), SIMESH_SIM=self.sim,
+                "--port", str(port)]
+        if self.world is None:
+            argv += ["--sim", self.sim]
+        else:
+            argv += ["--geodata", self.world["geodata"], "--name", self.sim]
+            for layer in self.world["nodesets"]:
+                argv += ["--nodeset", layer]
+            if self.world.get("build"):
+                argv += ["--build", self.world["build"]]
+        env = dict(os.environ, SIMESH_PORT=str(port),
                    PYTHONPATH=os.pathsep.join(p for p in (SIM_DIR, os.environ.get("PYTHONPATH"))
                                               if p))
+        env.pop("SIMESH_SIM", None)
         self.process = await asyncio.create_subprocess_exec(
             *argv, cwd=SIM_DIR, env=env, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -754,11 +836,7 @@ class ScriptRun:
             self.said(raw.decode("utf-8", "replace").rstrip("\n"))
         self.code = await self.process.wait()
         log("script %s (%s) exited with %s" % (self.name, self.id, self.code))
-        # The runner pauses what it was told to; one that died first leaves
-        # it running, and it is paused here instead.
-        if self.owns_sim and self.sim in self.front.children:
-            with contextlib.suppress(ValueError, store.StoreError, OSError):
-                await self.front.sim_pause({"name": self.sim})
+        # Its simulation runs on: a script that wants it paused says pause().
         self.state = "exited"
         self.front.broadcast({"type": "script_exit", "run": self.id, "code": self.code})
         self.front.changed = True
@@ -777,10 +855,12 @@ class ScriptRun:
             await self.reader
 
     def summary(self):
+        run_dir = self.run_dir
         return {"run": self.id, "name": self.name, "sim": self.sim, "state": self.state,
                 "code": self.code, "started": self.started,
-                "run_dir": os.path.relpath(self.run_dir, SIM_DIR),
-                "report": os.path.isfile(os.path.join(self.run_dir, runs_module.REPORT_FILE))}
+                "run_dir": os.path.relpath(run_dir, SIM_DIR) if run_dir else None,
+                "report": bool(run_dir) and os.path.isfile(
+                    os.path.join(run_dir, runs_module.REPORT_FILE))}
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +917,7 @@ class Front:
         self.proxy_session = None
         self.sidecars = None
         self.sweeps = None
+        self.cells = collections.OrderedDict()   # a pair's (to, from, flags), by where both stand
         self.runner = None
         self.control_port = None
         self.listener = None
@@ -844,6 +925,11 @@ class Front:
         self.reporter = None
         self.fetcher = None
         self.changed = False
+        self.cache = None                   # sources.Cache: packs/.cache and its fetches
+        self.build = None                   # packbuild.Build: the one running, or the last failed
+        self.tiles = {}                     # OSM tile path -> the fetch of it under way
+        self.nominatim_lock = asyncio.Lock()
+        self.nominatim_at = 0.0
 
     @property
     def bind_port(self):
@@ -896,7 +982,8 @@ class Front:
 
     def free_name(self, base):
         base = re.sub(r"[^a-z0-9-]", "-", (base or "sim").lower()).strip("-")[:28] or "sim"
-        taken = set(self.children) | self.preparing | set(self.paused)
+        taken = set(self.children) | self.preparing | set(self.paused) | {
+            r.sim for r in self.script_runs.values() if r.world and r.state != "exited"}
         if base not in taken:
             return base
         n = 2
@@ -969,8 +1056,10 @@ class Front:
         """Lay out a simulation's run directory: (run, sidecar URL or None).
 
         Everything that can be refused is checked before the loss tables,
-        which may take minutes: the names, the script, the devices. The
-        sidecar is held for the simulation from here on.
+        which may take minutes: the names and the script. The firmware is
+        the child's to settle, from the script's declarations, and `build`
+        goes to it in the run. The sidecar is held for the simulation from
+        here on.
         """
         snapshot = msg.get("snapshot")
         time_mode = str(msg.get("time") or "real")
@@ -984,8 +1073,7 @@ class Front:
                 run = await asyncio.to_thread(runs_module.resume_run, msg["resume"],
                                               simd_module.free_run_dir(base), time_mode)
             gd = read_geodata(run.geodata_path, run.geodata_name)
-            builds = kinds_module.resolve_builds(run.nodeset().nodes, msg.get("build"))
-            run.set(snapshot_builds=run.meta.get("builds") or {}, builds=builds)
+            run.set(build=msg.get("build") or None)
             sidecar = None
             if gd.is_pack:
                 try:
@@ -995,17 +1083,36 @@ class Front:
                         % (name, err))
             return run, sidecar
         gd = load_geodata(msg["geodata"])
-        ns = nodeset_module.load(msg["nodeset"])
         script_name = msg.get("script") or None
         if script_name:
             script_module.read(script_name)
-        builds = kinds_module.resolve_builds(ns.nodes, msg.get("build"))
-        sidecar = await self.sidecars.hold(holder, gd)
-        tables = await self.compute_losses(gd.name, ns.name, losses_module.bands_of(ns, gd),
-                                           sidecar, {"sim": name})
-        run = await asyncio.to_thread(
-            runs_module.create_run, simd_module.free_run_dir(base), gd, ns, script_name,
-            time_mode, {band: path for band, (path, _) in tables.items()}, builds)
+        layers = msg.get("nodesets") or [msg["nodeset"]]
+        merged = None
+        if len(layers) > 1:
+            # Several layers are run as one, merged as Save visible as merges
+            # them; losses.py reads the merge from a file of its own.
+            data = nodeset_module.merge([(n, nodeset_module.load(n).data) for n in layers])
+            merged = os.path.join(store.RUNS_DIR, ".merge-%s.yaml" % name)
+            os.makedirs(store.RUNS_DIR, exist_ok=True)
+            nodeset_module.write(merged, data)
+            ns = nodeset_module.open_path(merged, "+".join(layers))
+        else:
+            ns = nodeset_module.load(layers[0])
+        try:
+            sidecar = await self.sidecars.hold(holder, gd)
+            tables = await self.compute_losses(gd.path or gd.name, merged or ns.path,
+                                               losses_module.bands_of(ns, gd), sidecar,
+                                               {"sim": name})
+            run = await asyncio.to_thread(
+                runs_module.create_run, simd_module.free_run_dir(base), gd, ns, script_name,
+                time_mode, {band: path for band, (path, _) in tables.items()})
+        finally:
+            if merged:
+                with contextlib.suppress(OSError):
+                    os.unlink(merged)
+        run.set(build=msg.get("build") or None,
+                firmware_rules=list(msg.get("firmware_rules") or []),
+                first_boot_rules=list(msg.get("first_boot_rules") or []))
         return run, sidecar
 
     async def sim_new(self, msg):
@@ -1017,6 +1124,9 @@ class Front:
         resume = msg.get("resume")
         if resume is not None and not isinstance(resume, runs_module.Run):
             raise ValueError("a simulation is resumed with sim_resume")
+        if msg.get("nodesets"):
+            layers = [str(n) for n in msg["nodesets"]]
+            msg = dict(msg, nodeset=layers[0], nodesets=layers if len(layers) > 1 else None)
         if not snapshot and not resume and not all(msg.get(k) for k in ("geodata", "nodeset")):
             raise ValueError("a simulation needs geodata and a nodeset, or a snapshot")
         name = store.check_name(
@@ -1129,9 +1239,9 @@ class Front:
         return {"type": "run_delete", "ok": True, "run": name}
 
     def ended_rows(self):
-        """Every run that is neither running nor paused, newest first: what
-        it ran, when, and whether it has a report. Each is read again only
-        when its run.yaml or report changes."""
+        """Every run that is neither running nor paused: what it ran, when,
+        and whether it has a report. Each is read again only when its
+        run.yaml or report changes."""
         busy = {os.path.realpath(c.run_dir) for c in self.children.values()}
         busy |= {os.path.realpath(r.dir) for r in self.paused.values()}
         rows = []
@@ -1149,15 +1259,14 @@ class Front:
                 cached = (stamp, self.ended_summary(runs_module.open_run(path)))
                 self.ended_cache[name] = cached
             rows.append(cached[1])
-        rows.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
         return rows
 
     def ended_summary(self, run):
         """An ended run's registry row."""
         try:
-            stations = len(run.nodeset().nodes)
+            stations = run.node_count()
         except store.StoreError:
-            stations = 0
+            stations = None             # a run older than nodesets: not known
         return {"name": run.name, "state": "ended", "code": None,
                 "run": os.path.relpath(run.dir, SIM_DIR), "time": run.meta.get("time"),
                 "started": run.started_at(), "ended": run.ended_at(),
@@ -1173,9 +1282,9 @@ class Front:
         """A paused simulation's registry row: what it ran, and where it ended."""
         paused = run.paused or {}
         try:
-            stations = len(run.nodeset().nodes)
+            stations = run.node_count()
         except store.StoreError:
-            stations = 0
+            stations = None
         return {"name": name, "state": "paused", "code": None, "run": os.path.relpath(run.dir, SIM_DIR),
                 "time": run.meta.get("time"), "started": run.started_at(),
                 "ended": run.ended_at(), "paused_at": paused.get("at"),
@@ -1285,24 +1394,60 @@ class Front:
         name = msg.get("name")
         if verb == "device_list":
             # The workspace's own catalogues change as it builds; the web's
-            # are refreshed at start and on the tab's Refresh.
-            local = devices_module.builds_sources()
-            if local:
-                await devices_module.refresh(local, say=lambda line: None)
-            rows = await asyncio.to_thread(devices_module.listing)
-            return {"devices": rows, "arch": devices_module.machine_arch()}
+            # are surveyed at start and on the tab's Refresh.
+            said = []
+            _, changed = await devices_module.survey(web=False, say=said.append)
+            if changed:
+                self.broadcast({"type": "devices_changed"})
+            shown = await asyncio.to_thread(devices_module.listing)
+            return {**shown, "arch": devices_module.machine_arch()}
         if verb == "device_refresh":
             said = []
-            results = await devices_module.refresh(msg.get("sources") or None, say=said.append)
-            return {"results": results, "said": said}
+            _, changed = await devices_module.survey(msg.get("sources") or None, say=said.append)
+            if changed:
+                self.broadcast({"type": "devices_changed"})
+            return {"said": said}
+        if verb == "device_save":
+            said = []
+            got = await devices_module.save(str(msg["ref"]), say=said.append)
+            self.broadcast({"type": "devices_changed"})
+            return {"ref": got["ref"], "said": said}
+        if verb == "device_delete":
+            await asyncio.to_thread(devices_module.delete_saved, str(msg["ref"]))
+            self.broadcast({"type": "devices_changed"})
+            return {"ref": msg["ref"]}
+        if verb == "antenna_list":
+            return {"antennas": await asyncio.to_thread(antennas_module.listing)}
         if verb == "geodata_list":
+            # Each geodata with how many nodesets have a node on it.
+            sets = []
+            for each in nodeset_module.names():
+                with contextlib.suppress(store.StoreError):
+                    sets.append(nodeset_module.load(each))
             rows = []
             for each in geodata_module.names():
                 try:
-                    rows.append(load_geodata(each).as_dict())
+                    gd = load_geodata(each)
+                    rows.append({**gd.as_dict(),
+                                 "nodesets": sum(1 for ns in sets if ns.inside(gd.bbox))})
                 except store.StoreError as err:
                     rows.append({"name": each, "error": str(err)})
-            return {"geodata": rows}
+            return {"geodata": rows, "build": self.build.row if self.build else None}
+        if verb in ("geodata_rename", "geodata_delete"):
+            live = [c.name for c in self.children.values()
+                    if c.state != "exited" and c.loaded.get("geodata") == name]
+            if live:
+                raise store.StoreError("%s is the ground of %s, which is running"
+                                       % (name, ", ".join(live)))
+            pack = geodata_module.pack_of(geodata_module.geodata_path(name))
+            car = self.sidecars.by_pack.pop(pack, None) if pack else None
+            if car is not None:
+                await self.sidecars.stop(car)
+            if verb == "geodata_rename":
+                to = store.check_name(msg.get("to"), "geodata")
+                geodata_module.rename(name, to)
+                return {"name": to}
+            return {"name": name, "kept_by": geodata_module.delete(name)}
         if verb == "geodata_open":
             return await self.open_geodata(conn, load_geodata(name))
         if verb == "geodata_close":
@@ -1330,18 +1475,41 @@ class Front:
             return {"nodesets": rows}
         if verb == "nodeset_open":
             return {"nodeset": nodeset_module.load(name).as_dict()}
+        if verb == "nodeset_delete":
+            nodeset_module.delete(store.check_name(name, "nodeset"))
+            return {"name": name}
         if verb == "nodeset_new":
             return {"nodeset": nodeset_module.create(store.check_name(name, "nodeset")).as_dict()}
         if verb in ("nodeset_save", "nodeset_save_as"):
             return self.write_nodeset(store.check_name(name, "nodeset"), msg["data"],
                                       new=verb == "nodeset_save_as")
         if verb == "nodeset_import":
-            return self.import_nodeset(msg)
+            if (msg.get("source") or msg.get("format") or "sites") in ("sites", "nodes"):
+                return self.import_nodeset(msg)
+            return await self.import_node_map(msg)
+        if verb == "nodeset_merge":
+            name = store.check_name(name, "nodeset")
+            path = self.new_path(nodeset_module.nodeset_path(name), "nodeset", name)
+            layers = [(store.check_name(str(layer.get("name")), "layer"), layer.get("data") or {})
+                      for layer in msg.get("layers") or ()]
+            if not layers:
+                raise store.StoreError("nothing is shown to save")
+            nodeset_module.write(path, nodeset_module.merge(layers),
+                                 "from %s" % ", ".join(layer for layer, _ in layers))
+            return {"nodeset": nodeset_module.load(name).as_dict()}
+        if verb == "nodeset_setup_open":
+            text, exists = script_module.read_nodeset_setup(store.check_name(name, "nodeset"))
+            return {"name": name, "text": text, "exists": exists}
+        if verb == "nodeset_setup_save":
+            script_module.write_nodeset_setup(store.check_name(name, "nodeset"), msg["text"])
+            return {"name": name, "text": msg["text"], "exists": True}
         if verb == "script_list":
-            return {"scripts": [script_module.describe(script_module.script_path(each), each)
-                                for each in script_module.names()]}
+            return {"scripts": await asyncio.to_thread(script_module.listing)}
         if verb == "script_open":
             return self.script_reply(name)
+        if verb == "module_open":
+            return {"path": msg["path"],
+                    "text": await asyncio.to_thread(script_module.read_reference, msg["path"])}
         if verb == "script_new":
             script_module.write(store.check_name(name, "script"),
                                 msg.get("text") or script_module.DEFAULT_TEXT, new=True)
@@ -1382,16 +1550,79 @@ class Front:
             return {"geodata": gd.name, "nodeset": ns.name,
                     "tables": {band: {"path": path, "cached": hit}
                                for band, (path, hit) in tables.items()}}
+        if verb == "links":
+            return await self.links_row(conn, msg)
         if verb == "coverage":
             return await self.coverage(conn, msg)
         raise ValueError("unknown verb %s" % verb)
 
+    async def import_node_map(self, msg):
+        """A public node map's nodes inside the geodata's extent, as a new
+        nodeset: the MeshCore map's list (fetched at most weekly into the
+        cache), or a PotatoMesh instance's /api/nodes (fetched for this
+        import), read by `planner-job nodes-import`."""
+        source = msg.get("source")
+        name = store.check_name(msg.get("name"), "nodeset")
+        path = self.new_path(nodeset_module.nodeset_path(name), "nodeset", name)
+        gd = geodata_module.load(msg.get("geodata") or "")
+        if planner_job() is None:
+            raise store.StoreError("planner-job is not built: simesh build planner")
+        if source == "meshcore":
+            fetched = await self.cache.meta_file(MESHCORE_META, MESHCORE_NODES)
+        elif source == "potatomesh":
+            base = str(msg.get("url") or "").strip().rstrip("/")
+            if not re.match(r"^https?://[^/\s]+", base):
+                raise store.StoreError("a PotatoMesh instance is its address, https://…")
+            fetched = await self.cache.meta_file(
+                "potatomesh-%s.json" % store.slug(urllib.parse.urlsplit(base).netloc, "instance"),
+                base + POTATOMESH_NODES, max_age_s=0)
+        else:
+            raise ValueError("an import's source is meshcore, potatomesh, sites or nodes")
+        job = {"source": source, "file": fetched, "bbox": gd.bbox,
+               "companions": bool(msg.get("companions")),
+               "max_age_days": int(msg.get("max_age_days") or MESHCORE_MAX_AGE_DAYS),
+               "now_unix": int(time.time())}
+        got = await self.run_job("nodes-import", job)
+        rows = got.get("nodes") or []
+        if not rows:
+            raise store.StoreError("%s has no node inside %s's extent (%s)"
+                                   % (source, gd.name, json.dumps(got.get("report") or {})))
+        data = nodeset_module.from_imported(rows, source, float(msg.get("height_m") or 15.0))
+        nodeset_module.write(path, data, "imported from %s inside %s: %s" % (
+            source, gd.name, json.dumps(got.get("report") or {})))
+        log("imported %d nodes from %s into nodeset %s" % (len(data["nodes"]), source, name))
+        return {"nodeset": nodeset_module.load(name).as_dict(), "report": got.get("report")}
+
+    async def run_job(self, verb, job):
+        """One `planner-job <verb>` run: the JSON object on its standard input,
+        its last JSON line back; its standard error goes to the front's log."""
+        process = await asyncio.create_subprocess_exec(
+            planner_job(), verb, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, start_new_session=True, preexec_fn=die_with_parent)
+        out, err = await process.communicate(json.dumps(job).encode("utf-8"))
+        for line in err.decode("utf-8", "replace").splitlines()[-TAIL_LINES:]:
+            log("planner-job %s: %s" % (verb, line))
+        last = {}
+        for line in out.decode("utf-8", "replace").splitlines():
+            with contextlib.suppress(ValueError):
+                last = json.loads(line)
+        if process.returncode != 0 or "error" in last:
+            raise store.StoreError(last.get("error") or "planner-job %s ended with %d"
+                                   % (verb, process.returncode))
+        return last
+
+    async def api_nodes_sources(self, request):
+        """GET: what the import sources hold here: when the MeshCore map's
+        list was fetched (Unix seconds), or null."""
+        return web.json_response({"meshcore": {"fetched": self.cache.meta_age(MESHCORE_META)}})
+
     def import_nodeset(self, msg):
-        """A planner CSV as a new nodeset, its transmit powers in the nodes' radios."""
+        """A planner CSV as a new nodeset, its transmit powers in the nodes'
+        radios; with `geodata`, only its nodes inside that geodata's extent."""
         name = store.check_name(msg["name"], "nodeset")
         path = nodeset_module.nodeset_path(name)
         self.new_path(path, "nodeset", name)
-        fmt = msg.get("format") or "sites"
+        fmt = msg.get("source") or msg.get("format") or "sites"
         if fmt not in ("sites", "nodes"):
             raise ValueError("an import is format sites (planner optimize) or nodes "
                              "(planner nodes import)")
@@ -1404,8 +1635,6 @@ class Front:
         extra = {}
         if msg.get("height_m"):
             extra["height_m"] = float(msg["height_m"])
-        if msg.get("device"):
-            extra["device"] = str(msg["device"])
         try:
             if fmt == "sites":
                 data = nodeset_module.import_sites_csv(source, **extra)
@@ -1414,43 +1643,89 @@ class Front:
         finally:
             if tmp:
                 os.unlink(tmp)
+        if msg.get("geodata"):
+            gd = geodata_module.load(msg["geodata"])
+            data["nodes"] = {n: node for n, node in data["nodes"].items()
+                             if gd.holds(node["lat"], node["lon"])}
+            if not data["nodes"]:
+                raise store.StoreError("the CSV has no node inside %s's extent" % gd.name)
         nodeset_module.write(path, data, "imported from %s (%s)" % (
             os.path.basename(msg.get("path") or "an upload"), fmt))
         log("imported %d nodes into nodeset %s" % (len(data["nodes"]), name))
         return {"nodeset": nodeset_module.load(name).as_dict()}
 
     async def script_run(self, msg):
-        """A script's `main` on a simulation: the one named, or a new one
-        started first from geodata and a nodeset, with the script as setup,
-        which stops again when main ends (its run directory stays)."""
+        """A script, run: on a new simulation of its own from geodata and
+        nodesets, which it starts itself with its time, firmware and
+        first-boot declarations, under the name chosen here so the page can
+        go to it; or on the running one named."""
         name = msg.get("name")
         info = script_module.describe(
             self.old_path(script_module.script_path(name), "script", name), name)
         if info.get("error"):
             raise store.StoreError(info["error"])
-        if not info[script_module.MAIN]:
-            raise store.StoreError("script %s has no main(sim) to run" % name)
-        sim = msg.get("sim")
-        if not sim:
-            spec = {"geodata": msg.get("geodata"), "nodeset": msg.get("nodeset"),
-                    "time": msg.get("time") or "real", "build": msg.get("build"),
-                    "name": msg.get("sim_name")}
-            # The new simulation's setup: the one asked for, else the script's own.
-            if msg.get("setup"):
-                spec["script"] = msg["setup"]
-            elif info[script_module.SETUP]:
-                spec["script"] = name
-            sim = (await self.sim_new({k: v for k, v in spec.items() if v}))["name"]
-        child = self.children.get(sim)
-        if child is None or child.state != "running":
-            raise ValueError("simulation %s is not running" % sim)
-        run = ScriptRun(self, "r%d" % next(self.run_ids), name, sim, child.run_dir,
-                        owns_sim=not msg.get("sim"))
+        including = next((row["included_by"] for row in script_module.listing()
+                          if row["name"] == name), [])
+        if including:
+            raise store.StoreError("%s is part of %s, which include it: run one of those"
+                                   % (name, ", ".join(including)))
+        sim, world = msg.get("sim"), None
+        if sim:
+            child = self.children.get(sim)
+            if child is None or child.state != "running":
+                raise ValueError("simulation %s is not running" % sim)
+        else:
+            layers = [str(n) for n in (msg.get("nodesets") or [msg.get("nodeset")]) if n]
+            if not msg.get("geodata") or not layers:
+                raise ValueError("a script's simulation needs geodata and a nodeset")
+            world = {"geodata": str(msg["geodata"]), "nodesets": layers,
+                     "build": msg.get("build")}
+            sim = store.check_name(msg.get("sim_name") or self.free_name(layers[0]),
+                                   "simulation")
+        run = ScriptRun(self, "r%d" % next(self.run_ids), name, sim, world)
         self.script_runs[run.id] = run
         await run.start(self.bind_port)
         self.changed = True
         # Not `sim`: a message carrying `sim` is that simulation's own to a page.
         return {"run": run.id, "simulation": sim}
+
+    async def links_row(self, conn, msg):
+        """One node's losses to and from every other, from the nodes as the
+        page has them, saved or not: what its links are drawn from before
+        there is a table. Each pair is kept by where both ends stand, so
+        selecting the next node asks only for the pairs that are new."""
+        gd = load_geodata(msg["geodata"])
+        ns = nodeset_module.Nodeset(None, nodeset_module.parse(
+            {"nodes": msg["nodes"], "offsets": []}, "links"))
+        name = str(msg["node"])
+        me = ns.node(name)
+        band = str(msg.get("band") or (losses_module.bands_of(ns, gd) or ["868"])[0])
+
+        def where(node):
+            return (round(node["lat"], 7), round(node["lon"], 7), round(node["height_m"], 2))
+
+        def key(other, back=False):
+            ends = (where(me), where(ns.nodes[other]))
+            return (gd.content_hash, band) + (ends[::-1] if back else ends)
+        missing = [o for o in ns.nodes if o != name and key(o) not in self.cells]
+        if missing:
+            sidecar = await self.sidecars.hold(conn.holder, gd) if gd.is_pack else None
+            got = await losses_module.row(gd, ns, name, band, sidecar, missing, self.session)
+            # Kept both ways, so the other end's row finds the pair.
+            for other, (to, back, flags) in got.items():
+                self.cells[key(other)] = (to, back, flags)
+                self.cells[key(other, back=True)] = (back, to, flags)
+            while len(self.cells) > LINK_CELLS_KEPT:
+                self.cells.popitem(last=False)
+        out = {}
+        for other in ns.nodes:
+            if other == name:
+                continue
+            to, back, flags = self.cells[key(other)]
+            out[other] = {"to": to if math.isfinite(to) else None,
+                          "from": back if math.isfinite(back) else None, "flags": flags}
+        f0 = losses_module.LINK_F0_HZ if gd.is_pack else losses_module.slt.f0_of(band)
+        return {"node": name, "band": band, "f0_hz": f0, "cells": out}
 
     async def coverage(self, conn, msg):
         """Each node's coverage raster: those in the cache said at once, the
@@ -1488,22 +1763,26 @@ class Front:
     # ---- the registry, to everyone ---------------------------------------
 
     def sims_message(self):
+        """The registry: every simulation, running, paused or ended, newest
+        started first."""
+        rows = ([c.summary() for c in self.children.values()]
+                + [self.paused_summary(n, r) for n, r in self.paused.items()]
+                + self.ended_rows())
+        rows.sort(key=lambda r: r.get("started") or 0, reverse=True)
         return {"type": "sims", "port": self.args.public_port,
-                "sims": [c.summary() for c in self.children.values()]
-                        + [self.paused_summary(n, r) for n, r in self.paused.items()]
-                        + self.ended_rows(),
+                "sims": rows,
                 "script_runs": [r.summary() for r in self.script_runs.values()],
                 **simd_module.store_lists()}
 
     async def refresh_devices(self):
-        """Every catalogue's newest devices, once at start, in the background;
-        a page on the Devices tab lists again when it is told."""
+        """Every catalogue's newest devices surveyed, once at start, in the
+        background; a page on the Devices tab lists again when it is told."""
         try:
-            results = await devices_module.refresh(say=lambda line: log("devices: " + line))
+            _, changed = await devices_module.survey(say=lambda line: log("devices: " + line))
         except Exception as err:            # noqa: BLE001 - a start that goes on without them
-            log("devices: refresh failed: %s" % err)
+            log("devices: survey failed: %s" % err)
             return
-        if any(r["state"] == "fetched" for r in results):
+        if changed:
             self.broadcast({"type": "devices_changed"})
 
     async def report(self):
@@ -1524,7 +1803,8 @@ class Front:
         conn = Conn(ws, request.query.get("sim") or None,
                     request.query.get("quiet", "") not in ("", "0"))
         self.conns.add(conn)
-        await conn.send({"type": "hello", "front": True, "port": self.args.public_port})
+        await conn.send({"type": "hello", "front": True, "port": self.args.public_port,
+                         "page": simd_module.page_build()})
         await conn.send(self.sims_message())
         if conn.selected and await self.open_upstream(conn, conn.selected) is None:
             await conn.send({"type": "error", "text": "simulation %s is not running"
@@ -1564,7 +1844,9 @@ class Front:
         else:
             name = msg.pop("sim", None) or conn.selected
             if name is None:
-                await conn.send({"type": "error", "text": "no simulation selected"})
+                await conn.send({"type": "error",
+                                 "text": "the page asked for %s, which this SIMesh does not "
+                                         "know" % kind})
                 return
             if kind in ("sim_load", "snapshot_load") and not msg.get("run"):
                 asyncio.ensure_future(self.forward_load(conn, name, msg))
@@ -1828,7 +2110,8 @@ class Front:
         return tmp
 
     async def api_device_import(self, request):
-        """POST a device zip, `?name=` the name it was given: into `imported`."""
+        """POST a device zip, `?name=` the name it was given: saved, in the
+        catalogue `imported`."""
         tmp = await self.upload(request)
         try:
             got = await asyncio.to_thread(devices_module.import_zip, tmp,
@@ -1841,19 +2124,218 @@ class Front:
         return web.json_response({"ok": True, "ref": got["ref"], "name": got["name"]})
 
     async def api_geodata_import(self, request):
-        """POST a pack zip, `?name=` the geodata it becomes: into the planner's
-        packs, and a geodata file naming it."""
+        """POST a SIMesh geodata pack or a bare planner pack, `?name=` the
+        geodata it becomes (empty: the one the zip gives): a pack into
+        `packs/`, and a geodata file."""
         tmp = await self.upload(request)
         try:
-            gd = await asyncio.to_thread(geodata_module.import_pack, tmp,
-                                         request.query.get("name", ""))
+            gd = await asyncio.to_thread(geodata_module.import_zip, tmp,
+                                         request.query.get("name") or None)
         except store.StoreError as err:
             return web.json_response({"ok": False, "error": str(err)})
         finally:
             os.unlink(tmp)
         self.changed = True
-        log("imported pack %s as geodata %s" % (gd.pack_dir, gd.name))
+        log("imported geodata %s%s" % (gd.name, " (pack %s)" % gd.pack_dir if gd.is_pack else ""))
         return web.json_response({"ok": True, "geodata": gd.as_dict()})
+
+    async def api_geodata_export(self, request):
+        """GET `?name=`: that geodata as a SIMesh geodata pack, a zip made
+        while it is sent, never whole on disk or in memory: it is written on a
+        worker thread into a short queue this handler drains into the
+        response, and a reader that goes away stops the writer at its next
+        chunk."""
+        try:
+            gd = geodata_module.load(request.query.get("name", ""))
+        except store.StoreError as err:
+            raise web.HTTPNotFound(text=str(err)) from err
+        loop = asyncio.get_running_loop()
+        chunks = asyncio.Queue(EXPORT_QUEUE)
+        gone = False
+
+        class Sink:
+            """A write-only stream: each full buffer onto the queue, waited for."""
+            def __init__(self):
+                self.buf = bytearray()
+
+            def write(self, data):
+                if gone:
+                    raise OSError("the reader went away")
+                self.buf += data
+                if len(self.buf) >= EXPORT_CHUNK:
+                    self.flush()
+                return len(data)
+
+            def flush(self):
+                if self.buf:
+                    data, self.buf = bytes(self.buf), bytearray()
+                    asyncio.run_coroutine_threadsafe(chunks.put(data), loop).result()
+
+        def make():
+            sink = Sink()
+            try:
+                geodata_module.export_zip(gd, sink)
+                sink.flush()
+            finally:
+                asyncio.run_coroutine_threadsafe(chunks.put(None), loop).result()
+
+        response = web.StreamResponse(headers={
+            "Content-Type": "application/zip", "Cache-Control": "no-store",
+            "Content-Disposition": 'attachment; filename="%s.zip"' % gd.name})
+        await response.prepare(request)
+        maker = asyncio.ensure_future(asyncio.to_thread(make))
+        try:
+            while (chunk := await chunks.get()) is not None:
+                await response.write(chunk)
+        except (ConnectionError, asyncio.CancelledError):
+            gone = True
+
+            async def drain():
+                while await chunks.get() is not None:
+                    pass
+            asyncio.ensure_future(drain())
+            raise
+        await maker
+        await response.write_eof()
+        log("exported geodata %s" % gd.name)
+        return response
+
+    # ---- building a pack from its sources --------------------------------
+
+    @staticmethod
+    def build_spec(query):
+        """A build's name, rectangle and resolution from a query or a JSON body."""
+        bbox = query.get("bbox")
+        if isinstance(bbox, str):
+            bbox = [float(v) for v in bbox.split(",")]
+        return {"name": query.get("name"), "bbox": bbox, "res_m": float(query.get("res_m") or 30)}
+
+    async def api_geodata_sources(self, request):
+        """GET `?bbox=w,s,e,n&res_m=`: what a build of that rectangle takes,
+        for the side panel: the grid, the sources chosen and what each is
+        used for, their files and what is still to fetch; or why it is
+        refused."""
+        try:
+            got = await sources_module.plan(self.cache, self.build_spec(request.query))
+        except (store.StoreError, ValueError, TypeError) as err:
+            return web.json_response({"ok": False, "error": str(err)})
+        got.pop("files")
+        return web.json_response({"ok": True, **got})
+
+    async def api_geodata_areas(self, request):
+        """GET: the outlines of the sources that do not cover the world."""
+        try:
+            return web.json_response({"ok": True, **await sources_module.areas(self.cache)})
+        except store.StoreError as err:
+            return web.json_response({"ok": False, "error": str(err)})
+
+    async def api_geodata_build(self, request):
+        """POST {name, bbox, res_m}: a build of the sources sources.plan
+        chooses, started; its progress goes to every page as `geodata_progress`. One
+        runs at a time."""
+        try:
+            spec = self.build_spec(await request.json())
+            if planner_job() is None:
+                raise store.StoreError("planner-job is not built: simesh build planner")
+            if self.build is not None and self.build.running:
+                raise store.StoreError("%s is being built: one build at a time" % self.build.name)
+            packbuild_module.refuse(spec)
+        except (store.StoreError, ValueError, TypeError) as err:
+            return web.json_response({"ok": False, "error": str(err)})
+        self.build = packbuild_module.Build(self.cache, spec, planner_job(), self.build_said,
+                                            preexec_fn=die_with_parent)
+        self.build.start()
+        log("building geodata %s from sources (%s)" % (spec["name"], json.dumps(self.build.spec)))
+        return web.json_response({"ok": True, "build": self.build.row})
+
+    async def api_geodata_build_cancel(self, request):
+        """DELETE: the running build cancelled, or the ended one's row gone."""
+        if self.build is not None and self.build.running:
+            self.build.cancel()
+        else:
+            self.build = None
+            self.broadcast({"type": "geodata_progress", "build": None})
+        return web.json_response({"ok": True})
+
+    def build_said(self, row):
+        if row["state"] in ("done", "cancelled"):
+            self.build = None
+        if row["state"] == "done":
+            self.changed = True
+        if row["state"] in ("done", "failed", "cancelled"):
+            log("geodata %s: build %s%s" % (row["name"], row["state"],
+                                             ": " + row["error"] if row.get("error") else ""))
+        self.broadcast({"type": "geodata_progress", "build": row})
+
+    async def osm_tile(self, request):
+        """GET /osm/<z>/<x>/<y>.png: an OpenStreetMap tile for the build
+        view's map, from `osmtiles/` or fetched into it. A tile is kept a week
+        (the tile usage policy's floor), fetched once however many ask at
+        once, and a stale one is served when the fetch fails."""
+        try:
+            z, x, y = (int(request.match_info[k]) for k in ("z", "x", "y"))
+        except ValueError as err:
+            raise web.HTTPNotFound() from err
+        if not (0 <= z <= OSM_MAX_ZOOM and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+            raise web.HTTPNotFound()
+        path = os.path.join(OSM_TILES_DIR, str(z), str(x), "%d.png" % y)
+        fresh = os.path.isfile(path) and time.time() - os.path.getmtime(path) < OSM_TILE_MAX_AGE_S
+        if not fresh:
+            pending = self.tiles.get(path)
+            if pending is None:
+                pending = asyncio.ensure_future(self.fetch_tile(z, x, y, path))
+                self.tiles[path] = pending
+                pending.add_done_callback(lambda _f: self.tiles.pop(path, None))
+            with contextlib.suppress(store.StoreError, OSError):
+                await asyncio.shield(pending)
+        if not os.path.isfile(path):
+            raise web.HTTPNotFound(text="no such tile")
+        return web.FileResponse(path, headers={"Content-Type": "image/png",
+                                               "Cache-Control": "max-age=86400"})
+
+    async def fetch_tile(self, z, x, y, path):
+        resp = await self.cache.request("GET", OSM_TILES.format(z=z, x=x, y=y))
+        try:
+            if resp.status != 200:
+                raise store.StoreError("tile %d/%d/%d: %d" % (z, x, y, resp.status))
+            body = await resp.read()
+        finally:
+            resp.release()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".part", "wb") as out:
+            out.write(body)
+        os.replace(path + ".part", path)
+
+    async def api_nominatim(self, request):
+        """GET `?q=`: places by that name from Nominatim, OpenStreetMap's
+        geocoder, as [{name, lat, lon, bbox}]: one request per search, and
+        never two within a second."""
+        q = request.query.get("q", "").strip()
+        if not q:
+            return web.json_response({"ok": True, "places": []})
+        async with self.nominatim_lock:
+            wait = self.nominatim_at + NOMINATIM_GAP_S - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.nominatim_at = time.monotonic()
+            try:
+                resp = await self.cache.request("GET", "%s?%s" % (NOMINATIM, urllib.parse.urlencode(
+                    {"q": q, "format": "jsonv2", "limit": 8})))
+                try:
+                    found = await resp.json(content_type=None) if resp.status == 200 else None
+                finally:
+                    resp.release()
+            except (store.StoreError, ValueError) as err:
+                return web.json_response({"ok": False, "error": str(err)})
+        if not isinstance(found, list):
+            return web.json_response({"ok": False, "error": "Nominatim did not answer"})
+        places = []
+        for each in found:
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                s, n, w, e = (float(v) for v in each["boundingbox"])
+                places.append({"name": each.get("display_name") or q, "lat": float(each["lat"]),
+                               "lon": float(each["lon"]), "bbox": [w, s, e, n]})
+        return web.json_response({"ok": True, "places": places})
 
     def app(self):
         app = web.Application(client_max_size=64 << 20)
@@ -1867,6 +2349,14 @@ class Front:
         app.router.add_get("/api/report", self.api_report)
         app.router.add_post("/api/devices/import", self.api_device_import)
         app.router.add_post("/api/geodata/import", self.api_geodata_import)
+        app.router.add_get("/api/geodata/export", self.api_geodata_export)
+        app.router.add_get("/api/geodata/sources", self.api_geodata_sources)
+        app.router.add_get("/api/geodata/areas", self.api_geodata_areas)
+        app.router.add_post("/api/geodata/build", self.api_geodata_build)
+        app.router.add_delete("/api/geodata/build", self.api_geodata_build_cancel)
+        app.router.add_get("/api/nominatim", self.api_nominatim)
+        app.router.add_get("/api/nodes/sources", self.api_nodes_sources)
+        app.router.add_get("/osm/{z}/{x}/{y}.png", self.osm_tile)
         app.router.add_route("*", "/planner/{geodata}/{tail:.*}", self.planner_proxy)
         app.router.add_get("/{tail:.*}", simd_module.serve_page)
         return app
@@ -1901,6 +2391,7 @@ class Front:
             auto_decompress=False, timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
         self.sidecars = Sidecars(self.session)
         self.sweeps = coverage_module.Sweeps(self.session)
+        self.cache = sources_module.Cache(self.session)
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -1926,6 +2417,10 @@ class Front:
             self.reporter.cancel()
         if self.fetcher is not None:
             self.fetcher.cancel()
+        if self.build is not None and self.build.running:
+            self.build.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.build.task
         await asyncio.gather(*(r.stop() for r in self.script_runs.values()),
                              return_exceptions=True)
         await asyncio.gather(*(c.stop() for c in self.children.values()),

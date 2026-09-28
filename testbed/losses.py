@@ -13,9 +13,13 @@ in the SLT1 format (`ether/slt.py`). A run works on its own copy; a node
 moved during a run has its row and column recomputed into that copy, never
 into the cache.
 
-A nodeset's **offsets** are not in the table: they are a layer over it,
-added when the medium is given the tables (`with_offsets`), so the cached
-table is the model's own and an offset never forces a recompute.
+A nodeset's **antennas** and **offsets** are not in the table: they are
+layers over it, put on when the medium is given the tables
+(`medium_tables`), so the cached table is the model's own and neither a new
+antenna nor an offset forces a recompute. The antenna layer takes each
+pair's gains off its loss, each end's pattern toward the other in three
+dimensions, which needs the ground under each node (`grounds`: 0 on
+synthetic ground, the pack's terrain through the sidecar).
 
 Synthetic ground is computed here:
 
@@ -31,7 +35,7 @@ apart on a 300 m Mitte path with antennas at 38 m and 30 m), so each
 direction's cell is what `link.json` says of that direction. Each
 request gives both ends' antenna heights from the nodeset, in the pack's own
 CRS, and takes `lb_db`, the loss with the terminal clutter at both ends.
-Gains are not sent: they are the ether's to add. What the sidecar cannot
+Gains are not sent: they are the antenna layer's to add. What the sidecar cannot
 answer is decided here, without asking:
 
 - an end outside the pack's extent: never heard, FLAG_OFF_PACK (the sidecar
@@ -87,6 +91,7 @@ import shutil
 import sys
 from array import array
 
+import antennas as antennas_module
 import geodata as geodata_module
 import nodeset as nodeset_module
 import store
@@ -181,6 +186,94 @@ def _pairs_to_do(table, names, only=None):
 
 
 # ---- offsets -------------------------------------------------------------
+
+def with_antennas(tables, gd, ns, grounds=None):
+    """Copies of `tables` (band -> slt.Table) with each pair's antenna gains
+    taken off its loss, both ways: each end's gain toward the other, in
+    three dimensions (antennas.pair_gain), from the nodes' positions and
+    antenna heights over the ground under them. `grounds` is {node: metres
+    above sea level of the ground}; a node it lacks stands at 0, which is
+    synthetic ground's own. A pair either table does not hold is left out."""
+    grounds = grounds or {}
+    xy = _xy(gd, ns)
+    ends = {name: {"xy": xy[name], "antenna": node["antenna"],
+                   "top": float(grounds.get(name) or 0.0) + float(node["height_m"])}
+            for name, node in ns.nodes.items()}
+    gains = {}
+    out = {}
+    for band, table in tables.items():
+        new = slt.Table(table.header, array("f", table.loss), array("B", table.flags),
+                        array("H", table.samples))
+        names = [n for n in table.names if n in ends]
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if (a, b) not in gains:
+                    gains[(a, b)] = antennas_module.pair_gain(ends[a], ends[b])
+                g = gains[(a, b)]
+                new.loss[new.cell(a, b)] -= g
+                new.loss[new.cell(b, a)] -= g
+        out[band] = new
+    return out
+
+
+def medium_tables(tables, gd, ns, grounds=None):
+    """What the medium is given: the model's tables with the antennas and
+    the offsets on them."""
+    return with_offsets(with_antennas(tables, gd, ns, grounds), ns)
+
+
+async def grounds(gd, ns, sidecar, names=None, session=None):
+    """{node: metres above sea level of the ground under it}: 0 on synthetic
+    ground, from the pack's terrain through the sidecar's `tile.bin` on a
+    pack, a node off the pack or with no terrain left out."""
+    names = list(ns.nodes if names is None else names)
+    if not gd.is_pack:
+        return {name: 0.0 for name in names}
+    if not sidecar:
+        return {}
+    import aiohttp
+
+    own = session is None
+    if own:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    out = {}
+    try:
+        for name in names:
+            node = ns.nodes.get(name)
+            if node is None:
+                continue
+            x, y = gd.to_xy(node["lat"], node["lon"])
+            params = {"minx": "%.3f" % (x - 2), "miny": "%.3f" % (y - 2),
+                      "maxx": "%.3f" % (x + 2), "maxy": "%.3f" % (y + 2), "w": "1", "h": "1",
+                      "terrain_only": "1"}
+            for _ in range(6):
+                async with session.get(sidecar + "/tile.bin", params=params) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(0.2)
+                        continue
+                    if resp.status == 200:
+                        value = terrain_of_tile(await resp.read())
+                        if value is not None:
+                            out[name] = value
+                    break
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    finally:
+        if own:
+            await session.close()
+    return out
+
+
+def terrain_of_tile(data):
+    """The first cell's terrain, in metres, of a sidecar `tile.bin` ("PTL2",
+    u32 w, u32 h, six f64, u8 flags, then i16 decimetres per cell), or None."""
+    import struct
+
+    if len(data) < 47 or data[:4] != b"PTL2":
+        return None
+    raw = struct.unpack_from("<h", data, 45)[0]
+    return None if raw == -32768 else raw / 10.0
+
 
 def with_offsets(tables, ns):
     """Copies of `tables` (band -> slt.Table) with the nodeset's offsets
@@ -437,19 +530,16 @@ async def pack_table(gd, ns, band, base_url, progress=None, radius_m=DEFAULT_RAD
 
 # ---- either --------------------------------------------------------------
 
-def bands_of(ns, gd=None):
-    """The loss-table bands a nodeset's declared carriers fall in, sorted;
-    868 when no node declares one, because that is where a station starts.
-    On a pack, 868 only: the planner judges nothing else."""
+def bands_of(ns, gd=None, radio=None):
+    """The loss-table bands a simulation needs: the one globals.py's carrier
+    (`radio`, script.shared_radio's, else the store's) falls in, 868 when
+    it falls in none. On a pack, 868 only: the planner judges nothing else.
+    `ns` is the nodeset the tables are for."""
     if gd is not None and gd.is_pack:
         return list(PACK_BANDS)
-    bands = set()
-    for node in ns.nodes.values():
-        mhz = nodeset_module.carrier_mhz(node)
-        band = slt.band_for(mhz * 1e6) if mhz else None
-        if band is not None:
-            bands.add(band)
-    return sorted(bands) or ["868"]
+    import script as script_module
+    radio = radio or script_module.shared_radio()
+    return [slt.band_for(radio["freq_mhz"] * 1e6) or "868"]
 
 
 async def build(gd, ns, band, base_url=None, progress=None, radius_m=DEFAULT_RADIUS_M,
@@ -477,17 +567,73 @@ def cached(gd, ns, band):
     return path
 
 
+# What a cached table's losses depend on beyond its nodes: another table
+# agreeing on all of these gives the same loss for the same two ends.
+SAME_MODEL = ("geodata_hash", "pack_manifest_hash", "f0_hz", "model", "exponent",
+              "p_time_pct", "p_loc_pct", "radius_m")
+
+
+def _spot(node):
+    """Where a node stands, as the geometry hash rounds it."""
+    return (round(node["lat"], 7), round(node["lon"], 7), round(node["height_m"], 3))
+
+
+def nearest_cached(gd, ns, band, radius_m=DEFAULT_RADIUS_M, planner_version=None):
+    """The cached table of this geodata and band that shares the most
+    unchanged nodes with `ns` (same name, position and height, under the
+    same model), and the names of `ns`'s nodes it has no pairs for: (table,
+    names), or (None, None) when no cached table shares two."""
+    want = header_for(gd, ns, band, radius_m, planner_version)
+    root = os.path.join(store.LOSSES_DIR, store.check_name(gd.name, "geodata"))
+    here = {name: _spot(node) for name, node in ns.nodes.items()}
+    best, best_same = None, set()
+    for entry in sorted(os.listdir(root)) if os.path.isdir(root) else ():
+        path = os.path.join(root, entry, "%s.bin" % band)
+        if entry == ns.geometry_hash() or not os.path.isfile(path):
+            continue
+        try:
+            table = slt.Table.read(path)
+        except (OSError, ValueError):
+            continue
+        head = table.header
+        if any(head.get(key) != want.get(key) for key in SAME_MODEL):
+            continue
+        if planner_version is not None and head.get("planner_version") != planner_version:
+            continue
+        same = {n["name"] for n in head.get("nodes") or ()
+                if here.get(n["name"]) == _spot(n)}
+        if len(same) > len(best_same):
+            best, best_same = table, same
+    if best is None or len(best_same) < 2:
+        return None, None
+    return best, set(ns.nodes) - best_same
+
+
 async def compute(gd, ns, band, base_url=None, progress=None, radius_m=DEFAULT_RADIUS_M,
                   concurrency=None, use_cache=True, planner_version=None, notice=None):
     """The table for this geodata, nodeset and band, from the cache or
     computed into it. Returns (path of the cached file, whether it was
-    already there)."""
+    already there).
+
+    A nodeset the cache has no table for is usually one it has a table for
+    with a few nodes moved, added or taken away: the nearest cached table
+    (`nearest_cached`) gives every pair whose two ends it has unchanged, and
+    only the pairs touching the rest are computed (`update_nodes`)."""
     band = _check_band(band)
     path = cached(gd, ns, band) if use_cache else None
     if path:
         return path, True
-    table = await build(gd, ns, band, base_url, progress, radius_m, concurrency,
-                        planner_version=planner_version, notice=notice)
+    donor, changed = nearest_cached(gd, ns, band, radius_m, planner_version) \
+        if use_cache else (None, None)
+    if donor is not None:
+        if notice:
+            notice("%d of %d nodes' pairs are from a cached table; computing those of the "
+                   "other %d" % (len(ns.nodes) - len(changed), len(ns.nodes), len(changed)))
+        table = await update_nodes(donor, gd, ns, changed, base_url, progress, radius_m,
+                                   concurrency, notice=notice)
+    else:
+        table = await build(gd, ns, band, base_url, progress, radius_m, concurrency,
+                            planner_version=planner_version, notice=notice)
     path = cache_path(gd.name, ns.geometry_hash(), band)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_table(table, path)
@@ -500,6 +646,24 @@ def write_table(table, path):
     tmp = path + ".tmp"
     table.write(tmp)
     os.replace(tmp, path)
+
+
+async def row(gd, ns, name, band, base_url=None, others=None, session=None, notice=None):
+    """One node's row and column against `others` (every other node by
+    default), computed now and cached nowhere: {other: (loss to it, loss from
+    it, flags)}, a pair never heard as +inf. The links a node's editor draws
+    before there is a table, from the nodes as they stand."""
+    band = _check_band(band)
+    table = slt.Table(header_for(gd, ns, band))
+    pairs = [(name, o) for o in (others if others is not None else ns.nodes)
+             if o != name and o in ns.nodes]
+    if gd.is_pack:
+        _check_pack(gd, band, base_url)
+        await _fill_pack(table, gd, ns, pairs, base_url, session=session, notice=notice)
+    else:
+        _fill_synthetic(table, gd, ns, pairs)
+    return {o: (table.loss[table.cell(name, o)], table.loss[table.cell(o, name)],
+                table.flags[table.cell(name, o)]) for _, o in pairs}
 
 
 async def update_nodes(table, gd, ns, names, base_url=None, progress=None,
@@ -561,6 +725,12 @@ def _progress_printer():
     return show
 
 
+def _load_geodata(text):
+    if text.endswith(".yaml") or os.sep in text:
+        return geodata_module.read(text, os.path.splitext(os.path.basename(text))[0])
+    return geodata_module.load(text)
+
+
 def _load_nodeset(text):
     if text.endswith(".yaml") or os.sep in text:
         return nodeset_module.open_path(text)
@@ -568,7 +738,7 @@ def _load_nodeset(text):
 
 
 async def _main(args):
-    gd = geodata_module.load(args.geodata)
+    gd = _load_geodata(args.geodata)
     ns = _load_nodeset(args.nodeset)
     radius_m = args.radius_km * 1000.0
     show = _progress_printer()
@@ -595,7 +765,7 @@ async def _main(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Compute a loss table for a nodeset on geodata; progress as JSON lines.")
-    parser.add_argument("--geodata", required=True, help="a geodata name")
+    parser.add_argument("--geodata", required=True, help="a geodata name, or a geodata file")
     parser.add_argument("--nodeset", required=True, help="a nodeset name, or a nodeset file")
     parser.add_argument("--band", default="868", choices=sorted(slt.BANDS))
     parser.add_argument("--sidecar", help="the planner-web base URL, for a pack")

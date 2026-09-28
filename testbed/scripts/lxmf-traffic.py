@@ -1,15 +1,16 @@
 """LXMF traffic: warm-up announces, an hour of messages, a drain; the record in the run.
 
-Run on a new simulation, its own setup gives every station a device password
-and an LXMF identity; on a running one, or with another setup script
-(town100 with town100-lora, say), that one must. `OPTIONS` below are the phases' settings,
-over simesh.reticulum.traffic's defaults; the result, every send with its
-route and reply, lands in the run directory as `traffic.json`, and its
-report is the delivery `delivery.py traffic.json <run>` counts.
+Every station runs Reticulous's dev build, is set up by the startup script
+(its role, its radio, its nodeset's own setup), and gets an LXMF identity at
+its first boot; its messages go out as the `send_msg`
+meta command (simesh.traffic), so the driver runs on any firmware that has
+one. `OPTIONS` below are the phases' settings, over simesh.traffic's
+defaults; the result, every send with its route and reply, lands in the run
+directory as `traffic.json`, the simulation is paused, and the report is the
+delivery `delivery.py traffic.json <run>` counts.
 """
-import os
-
-from simesh.reticulum import traffic
+from simesh import *
+from simesh import traffic
 
 OPTIONS = {
     "warm_rounds": 3,
@@ -19,18 +20,18 @@ OPTIONS = {
     "drain": 600.0,
 }
 
+time("max")
+firmware("all", "reticulous_dev_latest")
+include("scripts/startup.py")
+# What a station needs to take part: a sender and a recipient each need an
+# identity.
+on_first_boot("all", """
+    lxmf create {name}
+""")
 
-async def setup(node):
-    # What a station needs to take part: Reticulum runs only once a device
-    # password is set, and a sender and a recipient each need an identity.
-    # Run with another setup script, that one's setup is used instead.
-    await node.run("auth passwd admin admin")
-    await node.run("lxmf create {name}")
-
-
-async def main(sim):
-    await traffic.run_on(sim, OPTIONS, os.path.join(sim.run_dir, "traffic.json"))
+traffic.run(OPTIONS)
+pause()
 
 
 def report(run_dir):
-    return traffic.report(run_dir, os.path.join(run_dir, "traffic.json"))
+    return traffic.report(run_dir)

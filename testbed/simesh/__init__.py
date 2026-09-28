@@ -1,21 +1,28 @@
 """The library scripts and the analysis tools share.
 
-    simesh.sim          a driver's hold on a running simulation: its stations,
-                        its clock, selections of stations and what to do with
-                        them (lines, intents, resets), snapshots, moves
-    simesh.setup        one station as a script's `setup(node)` sees it
-    simesh.runner       a script's `main` run on a simulation
+    simesh.library      what a script says, top to end, synchronously: time(),
+                        firmware(), on_first_boot(), exec(), the meta commands
+                        (announce, max_tx_pwr, send_msg), the run's clock,
+                        snapshots, moves, pause and stop
+    simesh.select       which nodes: nodes(field=value…), combined with & | - ~
+    simesh.traffic      the LXMF traffic driver, on any firmware with the
+                        meta commands, and its report
+    simesh.sim          the hold on a running simulation the library runs on:
+                        its stations, its clock, what is asked of them (async)
+    simesh.runner       a script, run: its simulation started, then its report
     simesh.view         a run directory as the analysis tools see it: nodes by id
                         and name, positions in the geodata's metres, each node's
-                        declared radio and role, and the medium's levels from the
-                        run's own loss tables
+                        radio (the run's globals.py) and role (its tag), and the
+                        medium's levels from the run's own loss tables
     simesh.record       the ether's record, line by line
     simesh.reticulum    Reticulum's parts: what a frame on the air is (the
-                        Reticulum packet, SUPE's frames), the LXMF traffic
-                        driver and its delivery analysis
+                        Reticulum packet, SUPE's frames), and a traffic run's
+                        delivery, from Reticulous's logs
 
-`start`, `attach`, `Sim` and `Selection` are here at the top, so a script
-needs only `import simesh`.
+A script needs only `from simesh import *`: the library's names
+(`simesh.library.__all__`). `start`, `attach`, `Sim` and `Selection` are
+here at the top too, for the analysis tools and tests that hold a
+simulation themselves.
 
 What is generic stays out of a protocol: the record, per-carrier airtime,
 link geometry, the loss table and the levels it gives. What a frame means is
@@ -28,17 +35,13 @@ only speaks for itself.
 """
 
 from simesh import reticulum
-from simesh.sim import Selection, Sim, SimError, attach, start  # noqa: F401 - the library's face
+from simesh.library import *  # noqa: F401,F403 - the library's face
+from simesh.library import __all__  # noqa: F401
+from simesh.select import Nodes  # noqa: F401
+from simesh.sim import Selection, Sim, SimError, attach, start  # noqa: F401
 
 ROLES = ("transport", "router", "repeater", "client")
 FORWARDING = ("transport", "router", "repeater")
-
-# The radio a station is taken to have when its node declares none: the
-# calling channel of the EU 868 plan at SF8, 125 kHz, 14 dBm.
-DEFAULT_FREQ_HZ = 869_525_000
-DEFAULT_SF = 8
-DEFAULT_BW_HZ = 125_000
-DEFAULT_POWER_DBM = 14.0
 
 PROTOCOLS = (reticulum,)
 

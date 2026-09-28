@@ -83,14 +83,12 @@ def test_offsets_are_a_layer_added_both_ways(stores):
     assert losses.with_offsets({"868": table}, ns)["868"] is table
 
 
-def test_the_bands_are_the_nodes_declared_carriers(stores):
+def test_the_band_is_the_one_globals_carrier_falls_in(stores):
     ns = nodeset.load("three")
-    assert losses.bands_of(ns) == ["868"]
-    ns.set_node("a", radio={"freq_mhz": 433.92})
-    ns.set_node("b", radio={"freq_mhz": 915.0})
-    assert losses.bands_of(ns) == ["433", "915"]
-    ns.set_node("c", radio={"freq_mhz": 869.525})
-    assert losses.bands_of(ns) == ["433", "868", "915"]
+    assert losses.bands_of(ns) == ["868"]                # the store's globals.py
+    radio = {"freq_mhz": 433.92, "sf": 8, "bw_khz": 125.0, "cr": 5}
+    assert losses.bands_of(ns, radio=radio) == ["433"]
+    assert losses.bands_of(ns, radio=dict(radio, freq_mhz=915.0)) == ["915"]
 
 
 def test_a_table_round_trips_through_slt1(stores, tmp_path):
@@ -114,13 +112,33 @@ def test_the_cache_is_keyed_by_geodata_and_geometry(stores):
     assert not hit
     assert path == os.path.join(store.LOSSES_DIR, "flat", ns.geometry_hash(), "868.bin")
     assert asyncio.run(losses.compute(gd, ns, "868")) == (path, True)
-    ns.set_node("a", tags=["x"], gain_dbi=9, role="transport")   # not geometry: still a hit
+    ns.set_node("a", tags=["x"], antenna={"type": "yagi_directional"},
+                max_dbm=27)                                      # not geometry: still a hit
     ns.set_offset("a", "b", 12)
     assert asyncio.run(losses.compute(gd, ns, "868"))[1]
     geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.2}})
     gd = geodata.load("flat")
     assert losses.cached(gd, ns, "868") is None            # the ground changed
     assert slt.Table.read(asyncio.run(losses.compute(gd, ns, "868"))[0]).header["exponent"] == 3.2
+
+
+def test_a_changed_nodeset_computes_only_the_pairs_the_cache_has_not(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    asyncio.run(losses.compute(gd, ns, "868"))
+    ns.move_node("c", 0.001, 0.02)
+    ns.add_node("e", 0.003, 0.003)
+    said, totals = [], []
+    path, hit = asyncio.run(losses.compute(gd, ns, "868", progress=lambda d, t: totals.append(t),
+                                           notice=said.append))
+    assert not hit and path == losses.cache_path("flat", ns.geometry_hash(), "868")
+    # a, b and d are unchanged: of the ten pairs only the seven touching c or e are asked.
+    assert set(totals) == {7}
+    assert said == ["3 of 5 nodes' pairs are from a cached table; computing those of the other 2"]
+    got, full = slt.Table.read(path), losses.synthetic_table(gd, ns, "868")
+    assert got.names == full.names and list(got.loss) == pytest.approx(list(full.loss))
+    # Another geodata, or another ground under this one, gives nothing to reuse.
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.3}})
+    assert losses.nearest_cached(geodata.load("flat"), ns, "868") == (None, None)
 
 
 def test_one_nodes_row_and_column_are_recomputed_into_a_copy(stores):

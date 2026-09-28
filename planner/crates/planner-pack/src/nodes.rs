@@ -1,12 +1,9 @@
 //! The deployed network: where the repeaters actually are.
 //!
-//! Planning against bare terrain answers the wrong question. At activation
-//! time the operator does not ask "does this hill have coverage", they ask
-//! "what does a node HERE add to the network that already exists" — and that
-//! needs the deployed nodes on disk, next to the terrain, with the network
-//! down. Positions are collected at pack-BUILD time (the public MeshCore
-//! advert map is scraped there, same rule as the DEM tiles and the Overpass
-//! exports) plus whatever the community has corrected by hand.
+//! The `Nodes` layer format. The pack compiler never writes one — nodes
+//! belong to nodesets, which stand on any ground that holds them — and
+//! planner-web reads one when a pack still carries it. The CSV side reads and
+//! writes the deployed-network CSV the importer and the community exchange.
 //!
 //! Two caveats live in the data model rather than in a README:
 //!   * Advert positions are self-reported and unverified. Some are rounded to
@@ -142,7 +139,7 @@ impl DeployedNode {
     /// Same, from geographic coordinates, projecting with the caller's
     /// closure. Every source of node positions is WGS84 lat/lon, so this is
     /// the constructor an importer actually reaches for; `to_xy` takes
-    /// `(lat, lon)` like `roads::parse_overpass` does.
+    /// `(lat, lon)` like every projection closure in the compiler.
     pub fn from_wgs84(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -423,7 +420,7 @@ fn field<'a>(row: &'a [String], idx: Option<usize>) -> &'a str {
 }
 
 /// Parse a community node CSV, projecting with `to_xy` — which takes
-/// `(lat, lon)`, like `roads::parse_overpass`.
+/// `(lat, lon)`, like every projection closure in the compiler.
 ///
 /// Columns `id,name,kind,lat,lon,height_agl_m,tx_power_dbm[,last_seen_unix]`
 /// in any order; unknown columns are ignored, `#` comments and blank lines are
@@ -1009,8 +1006,10 @@ mod tests {
         // actual scraped population rather than against a remembered figure.
         // Skipped rather than failed when the cache is absent, the same rule
         // the importer's real-data tests already use.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.cache/meshcore/nodes.json");
+        let path = std::env::var_os("SIMESH_MESHCORE_SNAPSHOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../packs/.cache/meshcore/nodes.json")
+        });
         if !path.exists() {
             eprintln!("SKIP: MeshCore advert map not downloaded ({})", path.display());
             return;

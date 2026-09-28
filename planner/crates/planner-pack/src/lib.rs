@@ -1,16 +1,18 @@
-//! Pack manifest — the contract between the pack compiler (build server,
-//! online, may shell out to GDAL) and the fully-offline device side.
+//! Pack manifest — the contract between the pack compiler (`build`, which
+//! reads files already on disk and never the network) and the fully-offline
+//! readers.
 //!
-//! Layer list mirrors review §4: terrain and clutter are separate layers by
-//! schema rule; ΔN/N0 are baked as region scalars because the ITU maps are
-//! not redistributable; every third-party source carries its license notice
-//! verbatim so the app can display attributions offline.
+//! Terrain and clutter are separate layers by schema rule; ΔN/N0 are baked as
+//! region scalars because the ITU maps are not redistributable; every
+//! third-party source carries its license notice verbatim so the app can
+//! display attributions offline.
 
 pub mod berlin1m;
 pub mod build;
 pub mod itu_maps;
 pub mod lod2;
 pub mod nodes;
+pub mod osm;
 pub mod places;
 pub mod roads;
 pub mod worldcover;
@@ -46,7 +48,9 @@ pub enum LayerKind {
     ClutterHeight,
     /// Clutter class raster (small enum), for per-class calibration offsets.
     ClutterClass,
-    /// Per-building records (FlatGeobuf), solver-native attributes.
+    /// Per-building records (`buildings.jsonl`, one `lod2::Lod2Building` per
+    /// line) from LoD2 or OpenStreetMap, each saying where its height came
+    /// from.
     Buildings,
     /// Population grid (Zensus 100 m / WorldPop) for household weighting.
     Population,
@@ -66,14 +70,12 @@ pub enum LayerKind {
     /// region, and without this layer a synthesized 30 m clutter estimate is
     /// indistinguishable on screen from lidar at 1 m.
     DataQuality,
-    /// The deployed network: repeaters and other nodes already on the air,
-    /// projected to the pack CRS. Display AND a planning input — "what does a
-    /// site here add to the existing network" is unanswerable without it.
-    /// Positions are third-party advert data of unknown accuracy: they are
-    /// self-reported by node operators, unverified, and often stale, so a node
-    /// in this layer is a hypothesis about the network, not a survey point.
+    /// Deployed nodes projected to the pack CRS (`nodes.rs`). The compiler
+    /// never writes this layer: nodes belong to nodesets, not to ground. A
+    /// reader still accepts one found in a pack.
     Nodes,
-    /// Fraction of each cell covered by a LoD2 building footprint, 0..1.
+    /// Fraction of each cell covered by a building footprint (LoD2 or
+    /// OpenStreetMap), 0..1.
     ///
     /// The street/building boundary, at the resolution the footprints were
     /// rasterized (1 m), reduced to one number per pack cell. It exists
@@ -161,8 +163,10 @@ impl LayerKind {
 
 /// Where a pack cell's terrain/clutter split actually came from.
 ///
-/// Stored as raster pixel values in the `DataQuality` layer. Ordered worst to
-/// best so a later, better source can simply overwrite a lower code.
+/// Stored as raster pixel values in the `DataQuality` layer. The codes are
+/// stable wire values, not a ranking: [`DataQuality::rank`] orders them worst
+/// to best, and a source only overwrites a cell whose current code ranks
+/// lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum DataQuality {
@@ -176,6 +180,14 @@ pub enum DataQuality {
     /// Real lidar terrain AND surface at 1 m (e.g. Berlin DGM1 + bDOM),
     /// averaged into pack cells. The only tier where both halves are measured.
     Lidar1m = 2,
+    /// Clutter heights merged from OpenStreetMap footprints, most of the
+    /// cell's built area carrying a class-default height (no `height` or
+    /// `building:levels` tag). The footprints are mapped; the heights are
+    /// guesses by building type.
+    OsmDefaultHeights = 3,
+    /// Clutter heights merged from OpenStreetMap footprints, most of the
+    /// cell's built area carrying a tagged `height` or `building:levels`.
+    OsmTaggedHeights = 4,
 }
 
 impl DataQuality {
@@ -184,6 +196,8 @@ impl DataQuality {
             0 => DataQuality::Glo30Pseudo,
             1 => DataQuality::Lod2Buildings,
             2 => DataQuality::Lidar1m,
+            3 => DataQuality::OsmDefaultHeights,
+            4 => DataQuality::OsmTaggedHeights,
             _ => return None,
         })
     }
@@ -192,8 +206,28 @@ impl DataQuality {
             DataQuality::Glo30Pseudo => "GLO-30 synthesized",
             DataQuality::Lod2Buildings => "LoD2 buildings",
             DataQuality::Lidar1m => "lidar 1 m",
+            DataQuality::OsmDefaultHeights => "OSM buildings, default heights",
+            DataQuality::OsmTaggedHeights => "OSM buildings, tagged heights",
         }
     }
+    /// Worst to best: GLO-30 < OSM default heights < OSM tagged heights <
+    /// LoD2 < lidar.
+    pub fn rank(self) -> u8 {
+        match self {
+            DataQuality::Glo30Pseudo => 0,
+            DataQuality::OsmDefaultHeights => 1,
+            DataQuality::OsmTaggedHeights => 2,
+            DataQuality::Lod2Buildings => 3,
+            DataQuality::Lidar1m => 4,
+        }
+    }
+    pub const ALL: &'static [DataQuality] = &[
+        DataQuality::Glo30Pseudo,
+        DataQuality::OsmDefaultHeights,
+        DataQuality::OsmTaggedHeights,
+        DataQuality::Lod2Buildings,
+        DataQuality::Lidar1m,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

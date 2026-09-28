@@ -1,16 +1,20 @@
 # SIMesh's planner: the ground, propagation and coverage code behind a pack.
 #
 #   planner-web       the sidecar the front runs per pack in use
+#   planner-job       the front's batch jobs: pack-build, nodes-import
 #   planner-wasm      the page's base-map compositor (testbed/ui/vendor/planner-wasm)
 #   planner-coverage  the point-to-area sweep
 #   planner-propag    P.1812 and the near-field model
 #   planner-terrain   rasters and profiles
-#   planner-pack      a pack's manifest and layers
+#   planner-pack      a pack's manifest and layers, and the pack compiler
+#   planner-buildings building heights and where they came from
+#   planner-import    the MeshCore map and PotatoMesh node lists, measurements
 #   planner-render    base-map rendering
 #   planner-core      shared types and link parameters
 #   planner-opt       what the coverage code draws on for siting
 #
-# The crates keep the names they had in Sergey's planner, where they came from.
+# The crates other than planner-job keep the names they had in Sergey's
+# planner, where they came from.
 [workspace]
 resolver = "2"
 members = [
@@ -20,8 +24,11 @@ members = [
     "crates/planner-opt",
     "crates/planner-coverage",
     "crates/planner-pack",
+    "crates/planner-buildings",
+    "crates/planner-import",
     "crates/planner-render",
     "crates/planner-web",
+    "crates/planner-job",
     "crates/planner-wasm",
 ]
 
@@ -40,8 +47,11 @@ tiff = "0.11"
 proj4rs = "0.1"
 quick-xml = "0.37"
 rayon = "1"
+osmpbf = "0.3"
 
 planner-core = { path = "crates/planner-core" }
+planner-buildings = { path = "crates/planner-buildings" }
+planner-import = { path = "crates/planner-import" }
 planner-terrain = { path = "crates/planner-terrain" }
 planner-propag = { path = "crates/planner-propag" }
 planner-opt = { path = "crates/planner-opt" }

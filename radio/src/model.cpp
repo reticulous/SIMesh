@@ -11,14 +11,17 @@
 
 #include "conductor.h"
 #include "ether_link.h"
+#include "json.h"
 #include "model.h"
 #include "services.h"
 #include "toa.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
 
 /* ---- The SX126x command and register surface the drivers use ---- */
 
@@ -157,6 +160,97 @@ static int radiatedDbm(uint8_t dutyCycle, uint8_t hpMax, int8_t paVal)
     else if (dutyCycle == 2 && hpMax == 2) offset = -8;
     int dbm = paVal + offset;
     return dbm < -9 ? -9 : dbm > 22 ? 22 : dbm;
+}
+
+/* The front end between the chip and the connector, from SIMESH_BOARD
+ * (STATION.md): what the medium hears is the connector's power, and what the
+ * chip reads is the connector's level plus the LNA's gain. The transmit side is
+ * the board's curve (fem_tx_cal, the LORAn_TX_CAL form: `<part> <grade>
+ * <reg>:<ant>,…`, entries separated by `;`, the one named fem_part taken),
+ * straight lines between its points and flat outside them, rounded — the same
+ * arithmetic the firmware's rfCalAntenna does, so a firmware that converts
+ * with that curve radiates what it asked for. With no curve it is the flat
+ * fem_gain_db, and with no front end at all, identity. One front end serves
+ * every slot of the station: a board with two radios behind two front ends is
+ * not described by SIMESH_BOARD. */
+struct FrontEnd {
+    int n = 0;
+    int chip[16] = {}, ant[16] = {};
+    int gainDb = 0;
+    int rxGainDb = 0;
+};
+
+static FrontEnd loadFrontEnd()
+{
+    FrontEnd fe;
+    const char* env = getenv("SIMESH_BOARD");
+    simradio_json::Object board;
+    if (!env || !board.parse(env, strlen(env))) return fe;
+    fe.gainDb = (int)board.num("fem_gain_db", 0);
+    fe.rxGainDb = (int)board.num("fem_rx_gain_db", 0);
+    const std::string part = board.str("fem_part", "");
+    const std::string spec = board.str("fem_tx_cal", "");
+    if (part.empty()) return fe;
+
+    size_t at = 0;
+    while (at < spec.size()) {
+        size_t end = spec.find(';', at);
+        if (end == std::string::npos) end = spec.size();
+        char name[32] = "", grade[32] = "";
+        int used = 0;
+        std::string entry = spec.substr(at, end - at);
+        at = end + 1;
+        if (sscanf(entry.c_str(), " %31s %31s %n", name, grade, &used) < 2) continue;
+        if (part != name) continue;
+        FrontEnd curve = fe;
+        const char* p = entry.c_str() + used;
+        int reg, dbm, adv;
+        while (curve.n < 16 && sscanf(p, " %d : %d %n", &reg, &dbm, &adv) == 2) {
+            if (curve.n && reg <= curve.chip[curve.n - 1]) { curve.n = 0; break; }
+            curve.chip[curve.n] = reg;
+            curve.ant[curve.n] = dbm;
+            curve.n++;
+            p += adv;
+            if (*p != ',') break;
+            p++;
+        }
+        if (curve.n >= 2) return curve;
+        fprintf(stderr, "simradio: SIMESH_BOARD fem_tx_cal entry %s is not a curve; "
+                        "flat %d dB taken\n", name, fe.gainDb);
+        return fe;
+    }
+    return fe;
+}
+
+static const FrontEnd& frontEnd()
+{
+    static const FrontEnd fe = loadFrontEnd();
+    return fe;
+}
+
+static int connectorDbm(int chipDbm)
+{
+    const FrontEnd& fe = frontEnd();
+    if (fe.n < 2) return chipDbm + fe.gainDb;
+    if (chipDbm <= fe.chip[0]) return fe.ant[0];
+    if (chipDbm >= fe.chip[fe.n - 1]) return fe.ant[fe.n - 1];
+    for (int i = 1; i < fe.n; i++) {
+        if (chipDbm > fe.chip[i]) continue;
+        const int x0 = fe.chip[i - 1], x1 = fe.chip[i];
+        const int y0 = fe.ant[i - 1], y1 = fe.ant[i];
+        const int num = (y1 - y0) * (chipDbm - x0);
+        const int den = x1 - x0;
+        return y0 + (num >= 0 ? (num + den / 2) / den : -((-num + den / 2) / den));
+    }
+    return fe.ant[fe.n - 1];
+}
+
+/* A connector level as the chip reads it, in its -x/2 byte's range. The LNA
+ * raises signal and noise alike, so SNR is left as the ether gave it. */
+static int chipLevelDbm(int connectorLevel)
+{
+    const int dbm = connectorLevel + frontEnd().rxGainDb;
+    return dbm < -127 ? -127 : dbm > 0 ? 0 : dbm;
 }
 
 /* The chip's state: everything a power cycle puts back. */
@@ -489,7 +583,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
         frame.tPre = now + (int64_t)((d.preamble + 4.25) * tSym * 1e6);
         frame.tHdr = frame.tPre + (int64_t)(8.0 * tSym * 1e6);
         frame.tEnd = now + (int64_t)(toa * 1e6);
-        frame.powerDbm = radiatedDbm(d.paDutyCycle, d.paHpMax, (int8_t)d.paVal);
+        frame.powerDbm = connectorDbm(radiatedDbm(d.paDutyCycle, d.paHpMax, (int8_t)d.paVal));
         for (int i = 0; i < d.payloadLen; i++) txPayload[i] = d.buf[(uint8_t)(d.txBase + i)];
         frame.payload = txPayload;
         frame.len = d.payloadLen;
@@ -607,7 +701,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
     case CMD_GET_RSSI_INST:
         if (len >= 3) {
             /* The chip's -x/2 encoding, and nothing at all outside RX. */
-            int dbm = S()->now_us() < d.airEndUs ? d.airLevel : kNoiseFloorDbm;
+            int dbm = chipLevelDbm(S()->now_us() < d.airEndUs ? d.airLevel : kNoiseFloorDbm);
             in[2] = strcmp(d.mode, "RX") == 0 ? (uint8_t)(-2 * dbm) : 0xFF;
         }
         break;
@@ -744,7 +838,7 @@ void rxEndCb(void* arg)
             d.buf[(uint8_t)(d.rxBase + i)] = d.pendingPayload[i];
         d.rxLen = (uint8_t)d.pendingLen;
         d.rxPtr = d.rxBase;
-        d.rssiPkt    = (uint8_t)(-2 * d.pendingEnd.rssiDbm);
+        d.rssiPkt    = (uint8_t)(-2 * chipLevelDbm(d.pendingEnd.rssiDbm));
         d.sigRssiPkt = d.rssiPkt;
         d.snrPkt     = (uint8_t)(int8_t)(d.pendingEnd.snrDb * 4);
         bits = IRQ_RX_DONE;

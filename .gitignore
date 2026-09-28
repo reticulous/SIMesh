@@ -3,6 +3,9 @@ testbed/runs/
 testbed/losses/
 testbed/coverage/
 testbed/snapshots/
+testbed/osmtiles/
+testbed/nodesets/
+testbed/geodata/
 testbed/ui/dist/
 testbed/ui/node_modules/
 testbed/ui/.quasar/

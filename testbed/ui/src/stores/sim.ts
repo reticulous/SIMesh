@@ -2,7 +2,8 @@ import { defineStore } from 'pinia'
 import { useSocket } from './socket'
 import { useCatalog, type GeodataInfo } from './catalog'
 import { readTable, type LossTable } from '../lib/slt'
-import type { HeightFrom, NodesetData, Radio } from './nodes'
+import type { HeightFrom, NodesetData } from './nodes'
+import type { Antenna, AntennaSpec } from '../lib/antennas'
 
 /** The run a simulation is, as simd's snapshot describes it (runs.Run.as_dict). */
 export interface RunInfo {
@@ -31,10 +32,11 @@ export type Status = 'stopped' | 'starting' | 'setup' | 'up' | 'restarting'
 export interface Node {
   name: string
   id: number
-  /** Its kind's type: reticulous, berlinmesh, … */
+  /** Its kind's type: reticulous, sergeyculum, … */
   kind: string | null
-  /** The device reference its node names, and what the device is called. */
-  device: string
+  /** The firmware a script's rules give it (a device name), or null while
+   *  none does, and what that build is called. */
+  firmware: string | null
   device_name: string | null
   /** Whether it has a web UI the proxy can reach. */
   web: boolean
@@ -42,10 +44,10 @@ export interface Node {
   lon: number
   height_m: number
   height_from: HeightFrom
-  gain_dbi: number
+  /** Its maximum power at the antenna connector: its own, else 22 dBm. */
+  max_dbm: number
+  antenna: Antenna
   tags: string[]
-  declared_role: string | null
-  declared_radio: Radio | null
   /** What it does for the mesh, as its kind reads it live: transport,
    *  router, repeater, client, or null when the kind cannot say. */
   role: string | null
@@ -160,7 +162,7 @@ export interface SimSpec {
   build?: string
 }
 
-export type Tab = 'devices' | 'geodata' | 'nodes' | 'scripts' | 'sims'
+export type Tab = 'devices' | 'antennas' | 'geodata' | 'nodes' | 'scripts' | 'sims'
 
 const FLASH_MS = 400
 const MAX_PULSES = 400       // a busy network, bounded
@@ -194,6 +196,10 @@ export const useSim = defineStore('sim', {
     view: 'nodes' as Tab,
     /** The front's answer to this page's last `sim_new`. */
     lastNew: null as { ok: boolean; name?: string; error?: string } | null,
+    /** The live map should frame the nodes once they arrive (a script's Run). */
+    fitWanted: false,
+    /** A simulation a script is starting, attached to before it exists. */
+    awaiting: null as string | null,
     /** Loss tables being computed for a simulation, by its name: before its
      *  child starts, and for a load or a move once it runs. */
     progress: {} as Record<string, LossProgress>,
@@ -248,8 +254,13 @@ export const useSim = defineStore('sim', {
               if (row && !this.progress[name]!.running) delete this.progress[name]
             }
             // An ended run may share the name; only a live simulation keeps the tab on it.
-            if (this.selected && !this.sims.some(s => s.name === this.selected
-                                                  && s.state !== 'ended' && s.state !== 'paused')) this.detach()
+            // One a script is about to start is waited for, while its script runs.
+            const live = this.selected && this.sims.some(s => s.name === this.selected
+                                                         && s.state !== 'ended' && s.state !== 'paused')
+            if (live) this.awaiting = null
+            const scripted = this.awaiting === this.selected && Object.values(
+              useCatalog().runs).some(r => r.sim === this.selected && r.state === 'running')
+            if (this.selected && !live && !scripted) { this.awaiting = null; this.detach() }
             return
           }
           case 'sim_new':
@@ -293,6 +304,7 @@ export const useSim = defineStore('sim', {
             this.selected = this.selected ?? ''
             this.view = 'nodes'
             useCatalog().names(msg)
+            if (Array.isArray(msg.antennas)) useCatalog().antennas = msg.antennas as AntennaSpec[]
           }
           if (msg.clock) this.clock = msg.clock as Clock
           this.nodes = {}
@@ -421,7 +433,8 @@ export const useSim = defineStore('sim', {
     /* ── simulations, through the front ── */
     /** Open a running simulation's live map: on the Simulations tab, as its
      *  row's detail (a simd on its own has only the one tab). */
-    attach(name: string) {
+    attach(name: string, starting = false) {
+      if (starting) this.awaiting = name
       if (name !== this.selected) {
         this.clear()
         this.selected = name

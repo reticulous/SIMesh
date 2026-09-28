@@ -35,12 +35,19 @@ in n (Karney 2011), good to well under a millimetre inside a zone, so what
 SIMesh sends the planner is the point the planner itself would compute. No
 projection library is needed.
 
-**Importing a pack** takes a zip of a pack directory (its `manifest.json` at
-the zip's root, or inside one top-level directory), expands it into
-`packs/<name>/`, whole or not at all, and writes the geodata file that
-names it.
+**A SIMesh geodata pack** is how geodata moves between machines: a zip
+holding `geodata.yaml` at the top and, for a pack, the pack under `pack/`,
+which the yaml's `pack:` names. Importing takes that, or a bare planner pack
+(its `manifest.json` at the zip's root, or inside one top-level directory),
+expands a pack into `packs/<name>/`, whole or not at all, and writes the
+geodata file that names it.
+
+**Nodes are never part of the ground.** A planner pack may carry a `Nodes`
+layer, a deployed network baked in; it is left out of what the page is told,
+of an export, and of an import. Nodes belong to nodesets.
 """
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -64,6 +71,11 @@ PLANNER_DIR = os.path.join(SIMESH_ROOT, "planner")
 PACKS_DIR = os.path.join(SIMESH_ROOT, "packs")
 PART_PREFIX = ".part-"
 CHUNK = 1 << 16
+GEODATA_MEMBER = "geodata.yaml"     # at the top of a SIMesh geodata pack
+PACK_MEMBER = "pack"                # where an exported pack goes inside it
+EXPORT_LEVEL = 1                    # deflate's fastest: berlin-city, 450 MB, is 124 MB in 2 s
+NODES_LAYER = "Nodes"
+NODES_NOTICE = "Deployed mesh nodes"   # how the Nodes layer's notice names its source
 
 
 def planner_repo():
@@ -293,11 +305,13 @@ class Geodata:
         out = {"name": self.name, "kind": self.kind, "origin": list(self.origin),
                "bbox": self.bbox}
         if self.is_pack:
-            layers = self.manifest.get("layers") or ()
+            manifest, _ = without_nodes(self.manifest)
             out.update(pack=self.pack_dir, crs_epsg=self.crs_epsg,
                        pack_manifest_hash=self.pack_manifest_hash,
-                       layers=[layer.get("kind") if isinstance(layer, dict) else str(layer)
-                               for layer in layers])
+                       layers=[layer_kind(layer) for layer in manifest["layers"]],
+                       licences=[{"source": str(n.get("source", "")),
+                                  "notice": str(n.get("notice", ""))}
+                                 for n in manifest.get("licenses") or () if isinstance(n, dict)])
         else:
             out.update(exponent=self.exponent, terrain=self.terrain, extent_m=self.extent_m)
         return out
@@ -370,6 +384,82 @@ def write(path, data, comment=None):
     store.write_text(path, head + dump(parse(data, path)))
 
 
+# ---- renaming and deleting ------------------------------------------------
+
+def pack_of(path):
+    """The pack directory a geodata file names, read without loading the
+    pack; None for synthetic ground or a file that cannot be read."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict) or not data.get(PACK):
+        return None
+    base = os.path.dirname(os.path.abspath(path))
+    return os.path.normpath(os.path.join(base, os.path.expanduser(str(data[PACK]))))
+
+
+def pack_users(pack_dir, but=None):
+    """Everything else naming a pack directory: other geodata by name, runs
+    and snapshots as `run <name>` and `snapshot <name>`. `but` is the
+    geodata left out."""
+    out = [other for other in names()
+           if other != but and pack_of(geodata_path(other)) == pack_dir]
+    for what, base in (("run", store.RUNS_DIR), ("snapshot", store.SNAPSHOTS_DIR)):
+        if os.path.isdir(base):
+            out += ["%s %s" % (what, entry) for entry in sorted(os.listdir(base))
+                    if pack_of(os.path.join(base, entry, "geodata.yaml")) == pack_dir]
+    return out
+
+
+def _own_pack(name, pack):
+    """Whether a pack is this geodata's alone to move or remove: a directory
+    of `packs/` nothing else names."""
+    return (pack is not None and os.path.isdir(pack)
+            and os.path.dirname(pack) == os.path.normpath(packs_dir())
+            and not pack_users(pack, but=name))
+
+
+def rename(name, to):
+    """Geodata by another name, its comment kept. Its pack directory is
+    renamed with it when it is `packs/<name>` and nothing else names it."""
+    src = geodata_path(name)
+    if not os.path.isfile(src):
+        raise store.StoreError("no geodata called %r" % name)
+    dst = geodata_path(to)
+    if os.path.exists(dst):
+        raise store.StoreError("there is already a geodata called %r" % to)
+    with open(src, encoding="utf-8") as handle:
+        text = handle.read()
+    comment = "\n".join(line[1:].strip() for line in text.splitlines() if line.startswith("#"))
+    data = parse(yaml.safe_load(text) or {}, src)
+    pack = pack_of(src)
+    target = os.path.join(os.path.normpath(packs_dir()), to)
+    if os.path.basename(pack or "") == name and _own_pack(name, pack) \
+            and not os.path.exists(target):
+        os.rename(pack, target)
+        data = {PACK: os.path.relpath(target, os.path.dirname(os.path.abspath(dst)))}
+    write(dst, data, comment)
+    os.remove(src)
+
+
+def delete(name):
+    """Geodata gone, and its pack directory with it when that is in `packs/`
+    and nothing else names it. What still names the pack, which keeps it;
+    [] when it went or there was none."""
+    src = geodata_path(name)
+    if not os.path.isfile(src):
+        raise store.StoreError("no geodata called %r" % name)
+    pack = pack_of(src)
+    users = pack_users(pack, but=name) if pack else []
+    own = _own_pack(name, pack)
+    os.remove(src)
+    if own:
+        shutil.rmtree(pack)
+    return users
+
+
 def write_copy(gd, path):
     """Write loaded geodata to another place (a run's or a snapshot's
     `geodata.yaml`), its pack path re-based so it still names the same pack."""
@@ -390,7 +480,57 @@ def rebase_text(text, src_dir, dst_dir):
     return dump(parse(data, "geodata"))
 
 
-# ---- importing a pack ----------------------------------------------------
+# ---- nodes are never ground ----------------------------------------------
+
+def layer_kind(layer):
+    return layer.get("kind") if isinstance(layer, dict) else str(layer)
+
+
+def without_nodes(manifest):
+    """A manifest with no `Nodes` layer and no notice for one, and the pack
+    paths of the files those layers were. Nodes belong to nodesets, so a
+    pack SIMesh keeps, draws or exports never carries a planner's baked-in
+    deployed network."""
+    out = copy.deepcopy(manifest)
+    layers = out.get("layers") or []
+    dropped = [layer.get("path") for layer in layers
+               if layer_kind(layer) == NODES_LAYER and isinstance(layer, dict)]
+    out["layers"] = [layer for layer in layers if layer_kind(layer) != NODES_LAYER]
+    if isinstance(out.get("licenses"), list):
+        out["licenses"] = [notice for notice in out["licenses"]
+                           if not str((notice or {}).get("source", "")).startswith(NODES_NOTICE)]
+    return out, [os.path.normpath(p) for p in dropped if p]
+
+
+# ---- a SIMesh geodata pack -----------------------------------------------
+
+def export_zip(gd, out):
+    """Geodata as a SIMesh geodata pack, written to `out`, a binary stream
+    that need not seek (a response being sent).
+
+    The zip holds `geodata.yaml` at the top, its first line `# geodata
+    <name>`; for a pack, the pack itself under `pack/`, which the yaml's
+    `pack:` names. The pack goes without its `Nodes` layer, whose file and
+    manifest entry and notice are left out, and without dot files.
+    """
+    head = "# geodata %s\n" % gd.name
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=EXPORT_LEVEL) as zf:
+        if not gd.is_pack:
+            zf.writestr(GEODATA_MEMBER, head + dump(gd.data))
+            return
+        zf.writestr(GEODATA_MEMBER, head + dump({PACK: PACK_MEMBER}))
+        manifest, dropped = without_nodes(gd.manifest)
+        zf.writestr("%s/%s" % (PACK_MEMBER, MANIFEST), json.dumps(manifest, indent=1))
+        skip = set(dropped) | {MANIFEST}
+        for top, dirs, files in os.walk(gd.pack_dir):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for each in sorted(files):
+                full = os.path.join(top, each)
+                inner = os.path.relpath(full, gd.pack_dir)
+                if each.startswith(".") or inner in skip:
+                    continue
+                zf.write(full, "%s/%s" % (PACK_MEMBER, inner.replace(os.sep, "/")))
+
 
 def _manifest_root(members):
     """The directory inside a zip that holds `manifest.json`: '' for the
@@ -401,46 +541,106 @@ def _manifest_root(members):
     found = [t for t in tops if "%s/%s" % (t, MANIFEST) in members]
     if len(found) == 1:
         return found[0] + "/"
-    raise store.StoreError("the zip holds no %s at its root or inside one top-level directory"
-                           % MANIFEST)
+    raise store.StoreError("the zip holds neither %s nor a %s at its root or inside one "
+                           "top-level directory" % (GEODATA_MEMBER, MANIFEST))
 
 
-def import_pack(zip_path, name, packs=None):
-    """A zip of a planner pack, expanded into the planner's pack cache as
-    `<name>/` and named by a new geodata file. Returns the loaded geodata.
+def _inside(inner, what):
+    """A path inside a zip, normalised, refused when it would leave it."""
+    inner = os.path.normpath(inner)
+    if os.path.isabs(inner) or inner == ".." or inner.startswith("../"):
+        raise store.StoreError("%s leaves the zip" % what)
+    return inner
 
-    The members go under a `.part-` sibling first, the manifest is read and
-    checked there, and only then is it renamed into place, so a pack
-    directory that exists is one that was checked. A member that would land
-    outside the pack is refused.
+
+def _named(text):
+    """The name in a `# geodata <name>` first line, or None."""
+    first = text.split("\n", 1)[0].strip()
+    if first.startswith("#"):
+        words = first[1:].split()
+        if len(words) == 2 and words[0] == "geodata" and store.NAME_RE.match(words[1]):
+            return words[1]
+    return None
+
+
+def zip_name(zf):
+    """The name a zip gives its geodata: a SIMesh geodata pack's `# geodata`
+    line, or a bare planner pack's manifest `name` made usable; None when it
+    gives none."""
+    members = [info.filename for info in zf.infolist() if not info.is_dir()]
+    if GEODATA_MEMBER in members:
+        return _named(zf.read(GEODATA_MEMBER).decode("utf-8", "replace"))
+    try:
+        manifest = json.loads(zf.read(_manifest_root(members) + MANIFEST).decode("utf-8"))
+    except (store.StoreError, ValueError, KeyError):
+        return None
+    got = store.slug(manifest.get("name") if isinstance(manifest, dict) else None, "")
+    return got or None
+
+
+def import_zip(zip_path, name=None, packs=None):
+    """A zip as new geodata: a SIMesh geodata pack (`geodata.yaml` at the
+    top, and for a pack the pack directory its `pack:` names inside the zip),
+    or a bare planner pack (a `manifest.json` at the top or inside one
+    directory), which becomes pack geodata. `name` is the new geodata's; by
+    default the one the zip gives. Returns the loaded geodata.
+
+    A pack is expanded into `packs/<name>/`. Its members go under a `.part-`
+    sibling first, the manifest is read and checked there, a `Nodes` layer's
+    files and manifest entry are dropped, and only then is it renamed into
+    place, so a pack directory that exists is one that was checked. A member
+    that would land outside the pack is refused.
     """
-    store.check_name(name, "geodata")
-    path = geodata_path(name)
-    if os.path.exists(path):
-        raise store.StoreError("there is already geodata called %r" % name)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            name = store.check_name(name or zip_name(zf) or "", "geodata")
+            path = geodata_path(name)
+            if os.path.exists(path):
+                raise store.StoreError("there is already geodata called %r" % name)
+            members = [info.filename for info in zf.infolist() if not info.is_dir()]
+            if GEODATA_MEMBER not in members:
+                _expand_pack(zf, _manifest_root(members), name, packs)
+                return load(name)
+            data = parse(yaml.safe_load(zf.read(GEODATA_MEMBER).decode("utf-8")) or {},
+                         GEODATA_MEMBER)
+            if SYNTHETIC in data:
+                write(path, data, "imported geodata %s" % name)
+                return load(name)
+            root = _inside(data[PACK], "the geodata's pack")
+            root = "" if root == "." else root + "/"
+            if root + MANIFEST not in members:
+                raise store.StoreError("the geodata names pack %s, and the zip has no %s there"
+                                       % (data[PACK], MANIFEST))
+            _expand_pack(zf, root, name, packs)
+            return load(name)
+    except zipfile.BadZipFile as err:
+        raise store.StoreError("not a zip: %s" % err) from err
+    except yaml.YAMLError as err:
+        raise store.StoreError("%s: %s" % (GEODATA_MEMBER, err)) from err
+
+
+def _expand_pack(zf, root, name, packs=None):
+    """The pack under `root` in an open zip, into `packs/<name>/`, and the
+    geodata file that names it."""
     packs = packs or packs_dir()
     dest = os.path.join(packs, name)
     if os.path.exists(dest):
-        raise store.StoreError("the planner already has a pack called %r in %s" % (name, packs))
+        raise store.StoreError("there is already a pack called %r in %s" % (name, packs))
     os.makedirs(packs, exist_ok=True)
     part = os.path.join(packs, PART_PREFIX + name)
     shutil.rmtree(part, ignore_errors=True)
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            members = [info.filename for info in zf.infolist() if not info.is_dir()]
-            root = _manifest_root(members)
-            for info in zf.infolist():
-                if info.is_dir() or not info.filename.startswith(root):
-                    continue
-                inner = os.path.normpath(info.filename[len(root):])
-                if os.path.isabs(inner) or inner == ".." or inner.startswith("../"):
-                    raise store.StoreError("member %s leaves the pack" % info.filename)
-                target = os.path.join(part, inner)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, CHUNK)
+        for info in zf.infolist():
+            if info.is_dir() or not info.filename.startswith(root):
+                continue
+            inner = _inside(info.filename[len(root):], "member %s" % info.filename)
+            target = os.path.join(part, inner)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, CHUNK)
+        manifest_path = os.path.join(part, MANIFEST)
         try:
-            with open(os.path.join(part, MANIFEST), encoding="utf-8") as handle:
+            with open(manifest_path, encoding="utf-8") as handle:
                 manifest = json.load(handle)
             region = manifest["region"]
             utm_zone_of(region["crs_epsg"])
@@ -448,11 +648,14 @@ def import_pack(zip_path, name, packs=None):
                 raise ValueError("bbox is not four numbers")
         except (OSError, ValueError, KeyError, TypeError, store.StoreError) as err:
             raise store.StoreError("the pack's %s is not usable: %s" % (MANIFEST, err)) from err
+        kept, dropped = without_nodes(manifest)
+        if kept != manifest:
+            for inner in dropped:
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(part, _inside(inner, "the Nodes layer")))
+            store.write_text(manifest_path, json.dumps(kept, indent=1))
         os.rename(part, dest)
-    except zipfile.BadZipFile as err:
-        raise store.StoreError("not a zip: %s" % err) from err
     finally:
         shutil.rmtree(part, ignore_errors=True)
-    write(path, {PACK: os.path.relpath(dest, store.GEODATA_DIR)},
+    write(geodata_path(name), {PACK: os.path.relpath(dest, store.GEODATA_DIR)},
           "imported pack %s" % manifest.get("name", name))
-    return load(name)

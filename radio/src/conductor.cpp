@@ -32,6 +32,10 @@ const struct simradio_services* B() { return simradio_services(); }
  * runs, rather than stopping the run. */
 constexpr long kBusyGraceNs = 20 * 1000 * 1000;
 
+/* How long, in wall time, an idle goes unanswered before it is said again
+ * (resendIdle in the header). */
+constexpr long kResendNs = 250 * 1000 * 1000;
+
 std::atomic<int>     s_mode{-1};
 std::atomic<int64_t> s_T{0};
 std::atomic<int64_t> s_epoch{0};
@@ -39,6 +43,7 @@ std::atomic<bool>    s_joined{false};
 std::atomic<int64_t> s_nodeAtJoin{0};
 std::atomic<uint64_t> s_seq{0};
 std::atomic<bool>    s_owed{false};
+std::atomic<bool>    s_resending{false};   /* an idle is out and nothing has come back */
 std::atomic<int64_t> s_until{kNever};
 std::atomic<int64_t> s_lastUntil{kNever};
 void               (*s_sendIdle)(uint64_t, int64_t) = nullptr;
@@ -183,18 +188,22 @@ int spawnReader(int fd, void (*onDatagram)(const char*, size_t))
 
 /* ---- The busy watchdog ---- */
 
-void disarmWatchdog()
-{
-    if (s_tfd < 0) return;
-    struct itimerspec its = {};
-    timerfd_settime(s_tfd, 0, &its, nullptr);
-}
-
 void armWatchdog()
 {
     if (s_tfd < 0) return;
     struct itimerspec its = {};
     its.it_value.tv_nsec = kBusyGraceNs;
+    timerfd_settime(s_tfd, 0, &its, nullptr);
+}
+
+/* After an idle: the timer says it again kResendNs on unless the ether has
+ * answered or the station has spoken first. */
+void armResend()
+{
+    s_resending.store(true);
+    if (s_tfd < 0) return;
+    struct itimerspec its = {};
+    its.it_value.tv_nsec = kResendNs;
     timerfd_settime(s_tfd, 0, &its, nullptr);
 }
 
@@ -212,7 +221,13 @@ void* watchdogMain(void*)
     for (;;) {
         uint64_t n;
         if (read(s_tfd, &n, sizeof n) != (ssize_t)sizeof n) continue;
-        if (s_owed.exchange(false)) sendIdleNow(s_until.load());
+        if (s_owed.exchange(false)) {
+            sendIdleNow(s_until.load());
+            armResend();
+        } else if (s_resending.load()) {
+            if (s_sendIdle) s_sendIdle(s_seq.load(), s_lastUntil.load());
+            armResend();
+        }
     }
     return nullptr;
 }
@@ -386,6 +401,7 @@ void granted(uint64_t seq)
 {
     if (!isVirtual()) return;
     s_seq.store(seq);
+    s_resending.store(false);
     s_owed.store(true);
     armWatchdog();
 }
@@ -393,8 +409,17 @@ void granted(uint64_t seq)
 void spoke()
 {
     if (!isVirtual() || !s_joined.load()) return;
+    s_resending.store(false);
     s_owed.store(true);
     armWatchdog();
+}
+
+uint64_t lastSeq() { return s_seq.load(); }
+
+void resendIdle()
+{
+    if (!isVirtual() || !s_joined.load() || !s_sendIdle) return;
+    s_sendIdle(s_seq.load(), s_lastUntil.load());
 }
 
 int wakeCreate(void (*due)(void*), void* arg)
@@ -424,8 +449,8 @@ void idle()
     B()->unlock();
     bool owed = s_owed.exchange(false);
     if (owed || until < s_lastUntil.load()) {
-        disarmWatchdog();
         sendIdleNow(until);
+        armResend();
     }
 }
 

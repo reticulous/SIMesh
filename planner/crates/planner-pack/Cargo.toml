@@ -3,11 +3,13 @@ name = "planner-pack"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Offline data-pack manifest; the pack compiler runs on the build server, packs are static artifacts"
+description = "A pack's manifest and layers, and the compiler that builds a pack from files already on disk"
 
 [dependencies]
 planner-core.workspace = true
 planner-terrain.workspace = true
+planner-buildings.workspace = true
+osmpbf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

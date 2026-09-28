@@ -10,11 +10,30 @@ export interface MapNode {
   height_m: number
   height_from: string
   tags: string[]
-  /** Its declared role, and when it runs, the role its kind reads from it. */
-  role?: string | null
+  /** When it runs, the role its kind reads from it. */
   liveRole?: string | null
   status?: string
   stale?: boolean
+}
+
+/** The roles of a node that carries others' traffic, as tags and as a kind reads them. */
+export const FORWARDING = ['transport', 'router', 'repeater']
+
+/** A node's forwarding role: the live one when it runs, else the first
+ *  forwarding tag it carries; null for none. */
+export function forwardingRole(n: MapNode): string | null {
+  if (n.liveRole) return FORWARDING.includes(n.liveRole) ? n.liveRole : null
+  return FORWARDING.find(r => n.tags.includes(r)) ?? null
+}
+
+/** A node of another shown layer: drawn, named on hover, and a click on it
+ *  makes its layer the active one. */
+export interface OtherNode {
+  layer: string
+  name: string
+  lat: number
+  lon: number
+  colour: string
 }
 
 /** One other node as heard from the selected one. */

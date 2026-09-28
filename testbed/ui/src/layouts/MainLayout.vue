@@ -5,7 +5,8 @@
         <q-tabs v-model="tab" dense no-caps inline-label align="left" class="sim-tabs"
                 active-color="white" indicator-color="primary">
           <template v-if="socket.front">
-            <q-tab name="devices" label="Devices" />
+            <q-tab name="devices" label="Firmware" />
+            <q-tab name="antennas" label="Antennas" />
             <q-tab name="geodata" label="Geodata" />
           </template>
           <q-tab name="nodes" label="Nodes" />
@@ -28,6 +29,7 @@
            a nodeset half-built or a script half-written is still there on the
            way back. -->
       <DevicesPage v-if="socket.front" v-show="sim.view === 'devices'" />
+      <AntennasPage v-if="socket.front" v-show="sim.view === 'antennas'" />
       <GeodataPage v-if="socket.front" v-show="sim.view === 'geodata'" />
       <!-- One map for both: the nodeset being edited on the Nodes tab, and an
            open simulation's live map on the Simulations tab, in place of its list. -->
@@ -51,7 +53,7 @@
 </template>
 
 <script setup lang="ts">
-/* The page: Devices, Geodata, Nodes, Scripts and Simulations, and a status
+/* The page: Firmware, Antennas, Geodata, Nodes, Scripts and Simulations, and a status
  * line under them all. Served by a simd on its own there is one simulation
  * and only the Nodes tab, attached to it. */
 import { computed, watch } from 'vue'
@@ -60,11 +62,13 @@ import { useSim, type SimSummary, type Tab } from '../stores/sim'
 import { useSocket } from '../stores/socket'
 import { useCatalog } from '../stores/catalog'
 import DevicesPage from '../pages/DevicesPage.vue'
+import AntennasPage from '../pages/AntennasPage.vue'
 import GeodataPage from '../pages/GeodataPage.vue'
 import NodesPage from '../pages/NodesPage.vue'
 import ScriptsPage from '../pages/ScriptsPage.vue'
 import SimsPage from '../pages/SimsPage.vue'
 import { etaText, paceText, phaseText } from '../components/runtime'
+import { whenSaved } from '../lib/unsaved'
 
 const sim = useSim()
 const socket = useSocket()
@@ -73,7 +77,10 @@ const quasar = useQuasar()
 
 const tab = computed<Tab>({
   get: () => sim.view,
-  set: (v) => sim.show(v),
+  set: (v) => {
+    if (sim.view === 'nodes' && v !== 'nodes') whenSaved(quasar, () => sim.show(v))
+    else sim.show(v)
+  },
 })
 
 const mapTab = computed(() => (socket.front && sim.attached ? 'sims' : 'nodes'))
@@ -85,6 +92,11 @@ function statusTitle(s: SimSummary) {
 }
 
 socket.connect()
+
+// With the front, the page starts where work starts: choosing a geodata.
+watch(() => socket.front, (front, was) => {
+  if (front && !was && sim.view === 'nodes' && !sim.attached) sim.show('geodata')
+}, { immediate: true })
 
 // simd and the front report what they could not do; the page says so and moves on.
 watch(() => sim.errors.length, () => {

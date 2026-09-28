@@ -19,6 +19,7 @@ import slt  # noqa: E402
 import store  # noqa: E402
 
 SETUP = "async def setup(node):\n    await node.run('hello {name}')\n"
+GLOBALS = "FREQ_MHZ = 433.92\nSF = 9\nBW_KHZ = 125\nCR = 5\n"
 
 
 @pytest.fixture
@@ -29,11 +30,12 @@ def setup(tmp_path, monkeypatch):
         monkeypatch.setattr(store, key, str(tmp_path / sub))
     geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 2.7}})
     ns = nodeset.create("pair")
-    ns.add_node("a", 0.0, 0.0, role="transport")
+    ns.add_node("a", 0.0, 0.0, tags=["transport"])
     ns.add_node("b", 0.006, 0.0)
     ns.save()
     os.makedirs(store.SCRIPTS_DIR)
     (tmp_path / "scripts" / "hello.py").write_text(SETUP)
+    (tmp_path / "scripts" / "globals.py").write_text(GLOBALS)
     gd, ns = geodata.load("flat"), nodeset.load("pair")
     path, _ = asyncio.run(losses.compute(gd, ns, "868"))
     run = runs.create_run(runs.run_path("r1"), gd, ns, "hello", "max", {"868": path},
@@ -52,8 +54,13 @@ def test_a_run_holds_its_own_copies(setup):
     assert run.geodata().exponent == 2.7
     with open(run.script_path) as handle:
         assert handle.read() == SETUP
+    # globals.py as it was when the run began, whatever the store's says later.
+    assert run.radio() == {"freq_mhz": 433.92, "sf": 9, "bw_khz": 125.0, "cr": 5}
+    with open(os.path.join(store.SCRIPTS_DIR, "globals.py"), "w") as handle:
+        handle.write(GLOBALS.replace("SF = 9", "SF = 12"))
+    assert run.radio()["sf"] == 9
     ns = run.nodeset()
-    assert ns.node("a")["role"] == "transport"
+    assert nodeset.tag_role(ns.node("a")["tags"]) == "transport"
     # The run's nodeset is its own: editing it leaves nodesets/ alone.
     ns.move_node("b", 0.01, 0.0)
     ns.save()

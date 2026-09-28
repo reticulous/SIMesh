@@ -1,0 +1,8 @@
+# four: the tests' four stations on plain-27. n01 and n02 (2.8 km) hear each
+# other; n03 and n04 (19 km) do not, and meet through n02, a transport.
+nodes:
+  n01: { id: 1, lat: 0.0077532, lon: -0.0459349, height_m: 2, height_from: assumed, max_dbm: 14,antenna: { type: rubber_duck }, tags: [transport, lxmf] }
+  n02: { id: 2, lat: 0.0182173, lon: -0.022797, height_m: 2, height_from: assumed, max_dbm: 14,antenna: { type: rubber_duck }, tags: [transport, supe, lxmf] }
+  n03: { id: 3, lat: -0.0761624, lon: 0.0220388, height_m: 2, height_from: assumed, max_dbm: 14,antenna: { type: rubber_duck }, tags: [transport, rnode-tcp] }
+  n04: { id: 4, lat: 0.0591579, lon: -0.0853415, height_m: 2, height_from: assumed, max_dbm: 14,antenna: { type: rubber_duck }, tags: [transport, supe, rnode-tcp] }
+offsets: []
