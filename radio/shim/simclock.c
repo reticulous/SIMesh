@@ -18,7 +18,14 @@
  *                                            reaching the timeout
  *   pthread_cond_timedwait, pthread_cond_clockwait
  *                                            a signal, or node time reaching the
- *                                            deadline (ETIMEDOUT)
+ *                                            deadline (ETIMEDOUT); a timedwait's
+ *                                            deadline below the run's epoch is
+ *                                            on the monotonic clock, the one a
+ *                                            condition made with
+ *                                            pthread_condattr_setclock keeps
+ *   sem_timedwait, sem_clockwait            a post, a signal, or node time
+ *                                            reaching the deadline (ETIMEDOUT):
+ *                                            what CPython's locks wait in
  *
  * A wait blocks on a descriptor of its own thread's (an eventfd), which a wake
  * the chip library runs when a grant reaches the instant writes to. So a thread
@@ -29,14 +36,20 @@
  * With SIMESH_IDLE=threads the shim also keeps a census of the process's
  * threads: every thread created through pthread_create, and the first. A
  * thread is blocked while it is inside one of the waits above, an untimed
- * pthread_cond_wait, or a read, recv or accept on a blocking descriptor that
- * is not a file (a regular file, directory or disk never waits on anything
- * outside the process); when the last one blocks, the station is idle, and
- * the shim says so to the chip library, whose wakes already hold every
- * deadline the blocked threads are waiting for. A wake that fires counts its
- * thread as running at once, and so does a pthread_cond_signal or
- * pthread_cond_broadcast every thread waiting on that condition, so the
+ * pthread_cond_wait or sem_wait, or a read, recv or accept on a blocking
+ * descriptor that is not a file (a regular file, directory or disk never
+ * waits on anything outside the process); when the last one blocks, the
+ * station is idle, and the shim says so to the chip library, whose wakes
+ * already hold every deadline the blocked threads are waiting for. A wake
+ * that fires counts its thread as running at once, and so does a
+ * pthread_cond_signal or pthread_cond_broadcast every thread waiting on that
+ * condition, and a sem_post every thread waiting on that semaphore, so the
  * station cannot look idle between the wake and the thread getting the CPU.
+ *
+ * A process with no radio of its own joins the run the same way, as a
+ * station without a slot: it opens its link (simradio_station_open) and
+ * never opens a chip. A Python host behind a radio in another process of its
+ * station is one (testbed/kinds/standard_reticulum.py).
  *
  * With SIMESH_SEED in the environment as well, the shim is also the station's
  * randomness: getentropy, getrandom and syscall(SYS_getrandom) — what ESP-IDF's
@@ -64,6 +77,10 @@
  *                                             after it, without "go", minus
  *                                             what the call did not take
  *   {"type":"read","ch":"tcp/A>B","n":N}      N bytes read from it
+ *   {"type":"listen","at":"addr:port"}        the station listens there, so a
+ *                                             connection to that end is its,
+ *                                             whichever other process of the
+ *                                             run shares the address
  *
  * The ether holds T while a channel has bytes its reader has not taken, and
  * lets a TCP write go when its reader is in step (ether/INTERNALS.md). A
@@ -83,6 +100,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -146,6 +164,12 @@ static int (*r_pthread_cond_wait)(pthread_cond_t*, pthread_mutex_t*);
 static int (*r_pthread_cond_signal)(pthread_cond_t*);
 static int (*r_pthread_cond_broadcast)(pthread_cond_t*);
 static int (*r_pthread_create)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+static int (*r_sem_wait)(sem_t*);
+static int (*r_sem_trywait)(sem_t*);
+static int (*r_sem_timedwait)(sem_t*, const struct timespec*);
+static int (*r_sem_clockwait)(sem_t*, clockid_t, const struct timespec*);
+static int (*r_sem_post)(sem_t*);
+static int (*r_listen)(int, int);
 static ssize_t (*r_read)(int, void*, size_t);
 static ssize_t (*r_readv)(int, const struct iovec*, int);
 static ssize_t (*r_write)(int, const void*, size_t);
@@ -249,6 +273,9 @@ struct thread_rec {
     pthread_cond_t* _Atomic cond;   /* the condition a timed wait is on */
     pthread_mutex_t* mutex;         /* and its mutex; under s_condLock */
     int         cond_fired;         /* its deadline came; under s_condLock */
+    int         sem_wake;
+    sem_t* _Atomic sem;             /* the semaphore it waits on */
+    atomic_int  sem_fired;          /* a timed wait's deadline came */
     int         counted;    /* in the census */
 };
 
@@ -352,6 +379,16 @@ static void cond_due(void* arg)
     }
 }
 
+/* A timed semaphore wait's deadline has come. A post of its own would be a
+ * token some other waiter could take, so it only says so; the waiter, which
+ * looks every SEM_LOOK_NS of wall, sees it (sem_node_wait). */
+static void sem_due(void* arg)
+{
+    struct thread_rec* r = (struct thread_rec*)arg;
+    atomic_store(&r->sem_fired, 1);
+    if (atomic_exchange(&r->blocked, 0)) atomic_fetch_sub(&s_blocked, 1);
+}
+
 static struct thread_rec* rec(const struct simclock_ops* o)
 {
     if (t_rec) return t_rec;
@@ -360,6 +397,7 @@ static struct thread_rec* rec(const struct simclock_ops* o)
     r->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     r->wake = o->wake_create(wake_due, r);
     r->cond_wake = o->wake_create(cond_due, r);
+    r->sem_wake = o->wake_create(sem_due, r);
     /* The process's first thread is in the census from the start; every other
      * one arrives through pthread_create. */
     r->counted = gettid() == getpid();
@@ -407,6 +445,7 @@ static void* trampoline(void* p)
         r->efd = -1;
         r->wake = -1;
         r->cond_wake = -1;
+        r->sem_wake = -1;
         r->counted = 1;
         pthread_setspecific(s_key, r);
         t_rec = r;
@@ -441,6 +480,7 @@ static struct thread_rec* ready_rec(const struct simclock_ops* o)
         r->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         r->wake = o->wake_create(wake_due, r);
         r->cond_wake = o->wake_create(cond_due, r);
+        r->sem_wake = o->wake_create(sem_due, r);
     }
     return r;
 }
@@ -796,11 +836,21 @@ static int cond_node_wait(const struct simclock_ops* o, pthread_cond_t* c, pthre
     return rc;
 }
 
+/* A timedwait's deadline on the clock its condition keeps, as node time: the
+ * wall clock's, or the monotonic one's for a condition made with
+ * pthread_condattr_setclock, whose deadlines fall far below the run's epoch. */
+static int64_t cond_deadline(const struct simclock_ops* o, const struct timespec* abst)
+{
+    int64_t at = ts_us(abst);
+    int64_t epoch = o->epoch_us();
+    return at < epoch / 2 ? at : at - epoch;
+}
+
 int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* abst)
 {
     const struct simclock_ops* o = ops();
     if (!o) return REAL(pthread_cond_timedwait)(c, m, abst);
-    int rc = cond_node_wait(o, c, m, ts_us(abst) - o->epoch_us());
+    int rc = cond_node_wait(o, c, m, cond_deadline(o, abst));
     return rc == -2 ? REAL(pthread_cond_timedwait)(c, m, abst) : rc;
 }
 
@@ -871,6 +921,117 @@ int pthread_cond_broadcast(pthread_cond_t* c)
 {
     cond_waiters_run(c);
     return REAL(pthread_cond_broadcast)(c);
+}
+
+/* ---- Semaphores ---- */
+
+static atomic_int s_semWaiting;     /* threads inside a semaphore wait */
+
+#define SEM_LOOK_NS (2 * 1000 * 1000)   /* wall between a timed wait's looks at its deadline */
+
+static void sem_enter(struct thread_rec* r, sem_t* s)
+{
+    atomic_store(&r->sem, s);
+    atomic_fetch_add(&s_semWaiting, 1);
+}
+
+static void sem_leave(struct thread_rec* r)
+{
+    atomic_store(&r->sem, NULL);
+    atomic_fetch_sub(&s_semWaiting, 1);
+}
+
+/* A timed wait in node time. The C library's own wait, in slices of
+ * SEM_LOOK_NS of wall, ended by a post, a signal, or the thread's wake at the
+ * deadline (sem_due), which says ETIMEDOUT as the real one does. The thread
+ * counts as blocked across the slices: they are the shim looking, not the
+ * station working. */
+static int sem_node_wait(const struct simclock_ops* o, sem_t* s, int64_t deadline)
+{
+    struct thread_rec* r = ready_rec(o);
+    if (!r || r->sem_wake < 0) return -2;
+    if (REAL(sem_trywait)(s) == 0) return 0;
+    if (errno != EAGAIN) return -1;
+    if (o->node_us() >= deadline) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    atomic_store(&r->sem_fired, 0);
+    sem_enter(r, s);
+    o->wake_at(r->sem_wake, resolve(deadline));
+    int rc, err = 0;
+    for (;;) {
+        census_block(o, r);
+        struct timespec until;
+        REAL(clock_gettime)(CLOCK_MONOTONIC, &until);
+        until.tv_nsec += SEM_LOOK_NS;
+        if (until.tv_nsec >= 1000000000) {
+            until.tv_sec += 1;
+            until.tv_nsec -= 1000000000;
+        }
+        rc = REAL(sem_clockwait)(s, CLOCK_MONOTONIC, &until);
+        if (rc == 0) break;
+        err = errno;
+        if (err != ETIMEDOUT || atomic_load(&r->sem_fired)) break;
+    }
+    census_run(r);
+    o->wake_at(r->sem_wake, NEVER);
+    sem_leave(r);
+    if (rc != 0) errno = err;
+    return rc;
+}
+
+int sem_wait(sem_t* s)
+{
+    const struct simclock_ops* o = ops();
+    if (!o || !s_census) return REAL(sem_wait)(s);
+    struct thread_rec* r = ready_rec(o);
+    if (!r) return REAL(sem_wait)(s);
+    sem_enter(r, s);
+    census_block(o, r);
+    int rc = REAL(sem_wait)(s);
+    int e = errno;
+    census_run(r);
+    sem_leave(r);
+    errno = e;
+    return rc;
+}
+
+int sem_timedwait(sem_t* s, const struct timespec* abst)
+{
+    const struct simclock_ops* o = ops();
+    if (!o) return REAL(sem_timedwait)(s, abst);
+    int rc = sem_node_wait(o, s, ts_us(abst) - o->epoch_us());
+    return rc == -2 ? REAL(sem_timedwait)(s, abst) : rc;
+}
+
+int sem_clockwait(sem_t* s, clockid_t clk, const struct timespec* abst)
+{
+    const struct simclock_ops* o = ops();
+    if (!o || !(monotonic_clock(clk) || wall_clock(clk)))
+        return REAL(sem_clockwait)(s, clk, abst);
+    int rc = sem_node_wait(o, s, ts_us(abst) - (wall_clock(clk) ? o->epoch_us() : 0));
+    return rc == -2 ? REAL(sem_clockwait)(s, clk, abst) : rc;
+}
+
+/* A post wakes one waiter the C library chooses, so every thread waiting on
+ * the semaphore counts as running from now, as for a condition's signal. */
+int sem_post(sem_t* s)
+{
+    if (s_census && atomic_load(&s_semWaiting) > 0 && ops()) {
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        pthread_mutex_lock(&s_condLock);
+        for (int i = 0; i < MAX_RECS; i++) {
+            struct thread_rec* r = s_recs[i];
+            if (r && atomic_load(&r->sem) == s && atomic_exchange(&r->blocked, 0))
+                atomic_fetch_sub(&s_blocked, 1);
+        }
+        pthread_mutex_unlock(&s_condLock);
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+    }
+    return REAL(sem_post)(s);
 }
 
 /* ---- Blocking reads, for the census ---- */
@@ -1255,6 +1416,27 @@ int accept4(int fd, struct sockaddr* a, socklen_t* al, int fl)
 {
     int rc;
     CENSUS_RUN(rc, REAL(accept4)(fd, a, al, fl), fd, 0);
+    return rc;
+}
+
+/* A listening TCP socket is the station's end of whatever connects to it: the
+ * ether is told, so a connection to it is known to be this station's before
+ * the station has read from it, whichever process of the run shares its
+ * address. */
+int listen(int fd, int backlog)
+{
+    int rc = REAL(listen)(fd, backlog);
+    if (rc != 0 || !reporting(fd)) return rc;
+    int saved = errno;
+    struct sockaddr_in me;
+    socklen_t ml = sizeof me;
+    if (getsockname(fd, (struct sockaddr*)&me, &ml) == 0 && me.sin_family == AF_INET) {
+        char a[INET_ADDRSTRLEN], line[128];
+        inet_ntop(AF_INET, &me.sin_addr, a, sizeof a);
+        report(line, snprintf(line, sizeof line, "{\"type\":\"listen\",\"sid\":%d,\"at\":\"%s:%u\"}",
+                              s_sid, a, ntohs(me.sin_port)));
+    }
+    errno = saved;
     return rc;
 }
 

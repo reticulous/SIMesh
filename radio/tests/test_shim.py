@@ -130,9 +130,19 @@ def test_the_shim_keeps_the_station_on_node_time(conductor):
     waits = [(int(l[1]), int(l[2])) for l in station.lines if l[0] == "waiter"]
     assert waits[:4] == [(40_000, ETIMEDOUT), (80_000, ETIMEDOUT), (120_000, ETIMEDOUT),
                          (160_000, ETIMEDOUT)]
-    # Every instant the station asked for is a tick or a sleep ending.
+    # So does one on a condition that keeps the monotonic clock, and a timed
+    # semaphore wait; a post wakes a sem_wait at the instant it is made.
+    monos = [(int(l[1]), int(l[2])) for l in station.lines if l[0] == "monowaiter"]
+    assert monos[:5] == [(30_000 * i, ETIMEDOUT) for i in range(1, 6)]
+    sems = [(int(l[1]), int(l[2])) for l in station.lines if l[0] == "semwaiter"]
+    assert sems[:5] == [(30_000 * i, ETIMEDOUT) for i in range(1, 6)]
+    posts = [int(l[1]) for l in station.lines if l[0] == "posted"]
+    assert posts[:1] == [120_000]
+    # Every instant the station asked for is a tick, a sleep ending or a
+    # 30 ms wait ending.
     ticks = {10_000 * i for i in range(1, 25)}
-    assert set(untils) <= ticks | set(sleeps) | {s + 25_000 for s in sleeps}
+    thirties = {30_000 * i for i in range(1, 8)}
+    assert set(untils) <= ticks | thirties | set(sleeps) | {s + 25_000 for s in sleeps}
     # Twenty grants of T went by without the busy watchdog: well under its
     # 20 ms of wall each.
     assert took < grants * 0.02
@@ -176,7 +186,7 @@ def test_the_shim_counts_console_and_tcp_bytes_and_waits_to_write():
     """A console line read a byte at a time is reported once, as a running
     total; a TCP write to another address of the run is asked for, waited on,
     and leaves from the station's own address; what it reads back is
-    reported."""
+    reported; a socket it listens on is reported as its own."""
     build_standin()
     ether = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ether.bind(("127.0.0.1", 0))
@@ -205,7 +215,7 @@ def test_the_shim_counts_console_and_tcp_bytes_and_waits_to_write():
         while time.monotonic() < deadline and not asked:
             data, sender = ether.recvfrom(65535)
             msg = json.loads(data)
-            if msg["type"] in ("read", "wrote"):
+            if msg["type"] in ("read", "wrote", "listen"):
                 reports.append(msg)
             if msg["type"] == "wrote" and "go" in msg:
                 asked = msg
@@ -229,6 +239,9 @@ def test_the_shim_counts_console_and_tcp_bytes_and_waits_to_write():
         assert msg == {"type": "read", "sid": 3, "ch": "tcp/%s>%s" % (b, a), "n": 5}
         station.pump(1.0)
         assert ["tcp", "pong"] in station.lines
+        # Its listening socket was said to be its own.
+        port = next(l[1] for l in station.lines if l[0] == "listening")
+        assert {"type": "listen", "sid": 3, "at": "127.0.0.3:%s" % port} in reports
     finally:
         if conn is not None:
             conn.close()

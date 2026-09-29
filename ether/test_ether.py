@@ -1172,6 +1172,30 @@ def test_a_tcp_write_waits_for_its_reader_and_holds_t_until_it_is_read(conductor
         asker.close()
 
 
+def test_a_listener_owns_its_endpoint_on_an_address_two_stations_share(conductor):
+    """Two processes of one station, each a station of the run on one
+    address: a connection to the one that listens is its, not the other's,
+    before it has read anything from it."""
+    a = at_address(conductor(1), "127.0.0.11")
+    b = at_address(conductor(2), "127.0.0.11")
+    join_virtual(a)
+    join_virtual(b)
+    b.send({"type": "listen", "at": "127.0.0.11:7633"})
+    idle(b, 1, None)
+    idle(a, 1, 10_000)
+    assert a.expect("run")["t"] == 10_000
+    asker = Asker(a)
+    try:
+        req = asker.ask("tcp/127.0.0.11:40000>127.0.0.11:7633", 4)
+        # b, the reader, is told this T before a may write.
+        run = b.expect("run")
+        assert run["t"] == 10_000
+        idle(b, run["seq"], None)
+        assert asker.go() == req
+    finally:
+        asker.close()
+
+
 def test_two_stations_writing_to_each_other_go_in_station_order(conductor):
     a = at_address(conductor(1), "127.0.0.11")
     b = at_address(conductor(2), "127.0.0.12")

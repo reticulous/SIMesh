@@ -43,6 +43,14 @@ nowhere else, so two stations on one host never collide.
   set up" is the kind's to name.
 - **Ports are its own**, on its own address. Which ones, and what answers on
   them, is the kind's to say.
+- **It may be several processes.** A process it starts that waits on time
+  joins a virtual-time run as a station of its own, under the id its kind
+  names for it (`sids`), with the same address, the time shim and
+  `SIMESH_IDLE=threads`: it opens its link (`simradio_station_open`) and,
+  with no radio, no chip. Whichever of them reads the console is the kind's
+  to name (`console_sid`); `SIMESH_NODE_ID` is that process's id, and the
+  radio's is the node's own. A `standard_reticulum` station is two: its
+  RNode, and the Python behind it that reads the console.
 
 ## The radio
 
@@ -83,8 +91,8 @@ differ hear each other here and may not on a bench. Set them equal in a
 nodeset that means to say anything about hardware.
 
 **Sync words differ by default between kinds**: `reticulous` uses 0x42,
-`sergeyculum` and `microreticulum` (as RNode) 0x12, and theirs cannot be
-changed. The startup script sets every radio to `globals.py`'s `SYNC`,
+`sergeyculum`, `microreticulum` and `standard_reticulum` (as RNode) 0x12,
+and theirs cannot be changed. The startup script sets every radio to `globals.py`'s `SYNC`,
 0x12, RNode's, so a `reticulous` station hears them; when nothing crosses
 between kinds, the `state` lines in `record.tsv` (sync, carrier, bandwidth,
 spreading factor) are the first thing to read.
@@ -97,8 +105,10 @@ four promises:
 
 - **It reads time only through the C library or `radio/`.** The shim answers
   `clock_gettime`, `gettimeofday`, `time`, the sleeps, `setitimer` and the
-  timeouts of `poll`, `select`, `epoll_wait` and `pthread_cond_timedwait` in
-  node time; the model's own timers are on T. A raw `rdtsc`, a `clock_gettime`
+  timeouts of `poll`, `select`, `epoll_wait`, `pthread_cond_timedwait`
+  (on either clock a condition keeps) and `sem_timedwait`/`sem_clockwait`
+  (what CPython's locks wait in) in node time; the model's own timers are on
+  T. A raw `rdtsc`, a `clock_gettime`
   made by system call, or a wait that none of those is does not move with the
   run.
 - **It opens its link early**, before anything in it waits on time:
@@ -135,7 +145,10 @@ four promises:
   ether, which holds T until a station has read what it was sent and lets a
   TCP write go only when its reader is in step. Input taken some other way
   (through `stdio` from `stdin`, say) is not seen as read, and T waits a
-  second of wall time for it before going on.
+  second of wall time for it before going on. A socket it listens on is
+  reported as its own once its link is open, so a connection to it is known
+  to be this station's before it has read anything, even from another
+  process of the run on the same address.
 
 A kind waits between two questions to a station with `pause()`, which is on
 T in a virtual run, so a poll costs the station the same time in either mode.
@@ -153,6 +166,7 @@ a kind is a class in `testbed/kinds/` that says, for one firmware:
 | | |
 |---|---|
 | `env` | the environment above, plus what that firmware and its device read |
+| `sids`, `console_sid` | the ether ids of its processes that join a run, and of the one that reads the console: the node's own, unless it is several processes |
 | `wait_up` | when a started station counts as up: answering, and done booting |
 | `pause` | a wait on the run's clock, for a kind's polls |
 | `run` | how one line, from setup, a script or **Run command**, is put to it |

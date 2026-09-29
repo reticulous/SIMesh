@@ -319,6 +319,16 @@ class Station:
         env.update(self.kind.env(self))
         return env
 
+    def expect(self):
+        """Tell the ether every process of this station's that joins the run
+        is starting (kinds.Kind.sids)."""
+        for sid in self.kind.sids(self):
+            self.clock.expect(sid)
+
+    def leave(self):
+        for sid in self.kind.sids(self):
+            self.clock.leave(sid)
+
     async def start(self):
         self.was_configured = self.configured
         os.makedirs(self.state_dir, exist_ok=True)
@@ -340,7 +350,7 @@ class Station:
         self.starts += 1
         self.set_status(STARTING)
         if self.clock is not None:
-            self.clock.expect(self.node_id)
+            self.expect()
         if self.cpu is None:
             self.cpu = next_cpu()
         try:
@@ -350,7 +360,7 @@ class Station:
                 preexec_fn=functools.partial(os.sched_setaffinity, 0, (self.cpu,)))
         except OSError:
             if self.clock is not None:
-                self.clock.leave(self.node_id)
+                self.leave()
             raise
         os.close(slave)
         os.set_blocking(master, False)
@@ -402,11 +412,11 @@ class Station:
             # read these bytes, and they go out once the station has the T
             # the run has, so a line typed at an instant is read at it.
             self.typed += len(data)
-            self.clock.typed(self.node_id, self.typed)
+            self.clock.typed(self.kind.console_sid(self), self.typed)
             if not self.syncing:
                 self.syncing = True
                 start = self.starts
-                self.clock.sync(self.node_id, lambda: self.synced(start))
+                self.clock.sync(self.kind.console_sid(self), lambda: self.synced(start))
             return
         self.writable()
 
@@ -467,7 +477,7 @@ class Station:
                 if watcher is not None:
                     watcher.cancel()
                 if self.clock is not None:
-                    self.clock.leave(self.node_id)
+                    self.leave()
             self.detach_reader()
             if self.stopping:
                 return
@@ -484,7 +494,7 @@ class Station:
         if self.clock is not None:
             # Now, not when the supervisor gets to it: T must not move on
             # without a station that is about to exist.
-            self.clock.expect(self.node_id)
+            self.expect()
         self.supervisor = asyncio.ensure_future(self.supervise(after_start))
         return self.supervisor
 
@@ -492,7 +502,7 @@ class Station:
         """Stop the process and the supervisor, and wait for both to go."""
         self.stopping = True
         if self.clock is not None:
-            self.clock.leave(self.node_id)
+            self.leave()
         if self.supervisor is not None:
             self.supervisor.cancel()
             try:

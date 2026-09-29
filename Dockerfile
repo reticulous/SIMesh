@@ -17,6 +17,9 @@
 #   - cargo via rustup, with the wasm32 target (the planner, the sergeyculum
 #     kind)
 #   - the station runtime: libstdc++, zlib, libbsd
+#   - Reticulum and LXMF, the Python reference implementations a
+#     standard_reticulum station runs, and what they need (cryptography,
+#     pyserial), from PyPI
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -28,7 +31,9 @@ RUN set -eux; \
         python3 python3-aiohttp python3-yaml python3-pytest \
         build-essential cmake pkg-config \
         libstdc++6 zlib1g libbsd0 \
+        python3-pip \
         procps; \
+    pip3 install --break-system-packages --no-cache-dir rns==1.5.2 lxmf==1.1.1; \
     mkdir -p /etc/apt/keyrings; \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \

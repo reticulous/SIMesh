@@ -848,6 +848,13 @@ class Ether(asyncio.DatagramProtocol):
                 return sid
         return None
 
+    def recv_listen(self, sid, msg):
+        """A station listens at a TCP endpoint: a connection to it is that
+        station's, though another station of the run shares its address."""
+        at = msg.get("at")
+        if sid in self.stations and isinstance(at, str):
+            self.endpoints[at] = sid
+
     def recv_io(self, sid, addr, msg):
         """A station's count of bytes it put into or took out of a channel.
 
@@ -1178,6 +1185,8 @@ class Ether(asyncio.DatagramProtocol):
             return
         if kind == "hello":
             self.recv_hello(sid, addr, msg)
+        elif kind == "listen":
+            self.recv_listen(sid, msg)
         elif not self.clock.virtual:
             if kind == "state":
                 self.recv_state(sid, addr, msg)

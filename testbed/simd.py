@@ -484,7 +484,7 @@ class Simd:
         the marker), so what it makes the testbed do happens at this T."""
         wanted = set(sids)
         drains = [s.drain for s in self.stations.values()
-                  if s.node_id in wanted and s.drain is not None]
+                  if wanted.intersection(s.kind.sids(s)) and s.drain is not None]
         if not drains:
             done()
             return

@@ -151,7 +151,10 @@ run does the same thing whatever the host's scheduler does:
   connection name a station, since the shim makes a station's connections to
   a loopback address leave from its own; a connection with an end that is not
   a station of the run (the testbed's web proxy) is not counted, and its asks
-  are answered at once.
+  are answered at once. An end is the station that has reported from it, else
+  the one that said it listens there (`listen`), else the station at its
+  address: two processes of one station share an address, and the one that
+  listens owns the connections made to it.
 
 Counts are running totals for the console and per call for TCP (a write the
 kernel took less of is followed by the difference, negative). A channel whose

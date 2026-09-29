@@ -133,6 +133,16 @@ class Kind:
         env.update(self.extra_env)
         return env
 
+    def sids(self, station):
+        """The ether ids of the station's processes that join the run: its
+        own, and those of processes it starts that join as stations without
+        a radio."""
+        return (station.node_id,)
+
+    def console_sid(self, station):
+        """The ether id of the process that reads the station's console."""
+        return station.node_id
+
     async def pause(self, station, seconds):
         """Wait on the run's clock: the ether's T in a virtual-time run, so a
         poll between two questions costs the station the same time in either
@@ -217,9 +227,10 @@ class Kind:
 
 def kind_types():
     """Every kind class by its type name."""
-    from . import microreticulum, reticulous, sergeyculum
+    from . import microreticulum, reticulous, sergeyculum, standard_reticulum
     return {cls.type_name: cls for cls in (reticulous.Reticulous, sergeyculum.Sergeyculum,
-                                           microreticulum.Microreticulum)}
+                                           microreticulum.Microreticulum,
+                                           standard_reticulum.StandardReticulum)}
 
 
 BUILD_KEYS = ("ref", "elf", "fixed", "tools", "env", "kind_type", "stamp", "arch", "name",

@@ -6,6 +6,14 @@
  *     sleeper <node us>        a 25 ms sleep ended
  *     waiter <node us> <rc>    a 40 ms pthread_cond_timedwait nobody signals
  *                              ended, and what it returned
+ *     monowaiter <node us> <rc>
+ *                              the same, 30 ms, on a condition that keeps the
+ *                              monotonic clock
+ *     semwaiter <node us> <errno>
+ *                              a 30 ms sem_clockwait nobody posts ended, and
+ *                              the errno it left
+ *     posted <node us>         a sem_wait ended by the semwaiter's post,
+ *                              every fourth of its waits
  *     alarm <count>            SIGALRM, counted in the handler
  *     clock <mono us> <wall s> what clock_gettime and time() said at start
  *     entropy <hex> <hex> <hex>
@@ -14,11 +22,14 @@
  *                              thing, before the chip library is opened
  *     tcp <text>               what came back over TCP for a console line,
  *                              given a second argument (relay, below)
+ *     listening <port>         the port it listens on at SIMESH_BIND_ADDR,
+ *                              given a second argument
  */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +91,64 @@ static void* waiter(void* arg)
         int rc = pthread_cond_timedwait(&c, &m, &end);
         printf("waiter %lld %d\n", (long long)mono_us(), rc);
         fflush(stdout);
+    }
+    return NULL;
+}
+
+static void add_ms(struct timespec* ts, long ms)
+{
+    ts->tv_nsec += ms * 1000 * 1000;
+    if (ts->tv_nsec >= 1000000000) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000;
+    }
+}
+
+static void* monowaiter(void* arg)
+{
+    (void)arg;
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_t c;
+    pthread_cond_init(&c, &ca);
+    pthread_mutex_lock(&m);
+    for (;;) {
+        struct timespec end;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        add_ms(&end, 30);
+        int rc = pthread_cond_timedwait(&c, &m, &end);
+        printf("monowaiter %lld %d\n", (long long)mono_us(), rc);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+static sem_t s_never, s_posted;
+
+static void* posted(void* arg)
+{
+    (void)arg;
+    for (;;) {
+        if (sem_wait(&s_posted) != 0) continue;
+        printf("posted %lld\n", (long long)mono_us());
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+static void* semwaiter(void* arg)
+{
+    (void)arg;
+    for (int n = 1;; n++) {
+        struct timespec end;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        add_ms(&end, 30);
+        int rc = sem_clockwait(&s_never, CLOCK_MONOTONIC, &end);
+        printf("semwaiter %lld %d\n", (long long)mono_us(), rc == 0 ? 0 : errno);
+        fflush(stdout);
+        if (n % 4 == 0) sem_post(&s_posted);
     }
     return NULL;
 }
@@ -163,14 +232,31 @@ int main(int argc, char** argv)
     if (argc > 2) {
         pthread_t r;
         pthread_create(&r, NULL, relay, argv[2]);
+        const char* own = getenv("SIMESH_BIND_ADDR");
+        int l = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in at = { 0 };
+        at.sin_family = AF_INET;
+        inet_pton(AF_INET, own ? own : "127.0.0.1", &at.sin_addr);
+        socklen_t al = sizeof at;
+        if (bind(l, (struct sockaddr*)&at, sizeof at) != 0 || listen(l, 1) != 0
+            || getsockname(l, (struct sockaddr*)&at, &al) != 0)
+            return 1;
+        printf("listening %u\n", ntohs(at.sin_port));
+        fflush(stdout);
     }
+
+    sem_init(&s_never, 0, 0);
+    sem_init(&s_posted, 0, 0);
 
     /* The alarm lands on the first thread only: the others block it. */
     pthread_sigmask(SIG_BLOCK, &alrm, NULL);
-    pthread_t a, b, w;
+    pthread_t a, b, w, mw, sw, p;
     pthread_create(&a, NULL, sleeper, NULL);
     pthread_create(&b, NULL, reporter, NULL);
     pthread_create(&w, NULL, waiter, NULL);
+    pthread_create(&mw, NULL, monowaiter, NULL);
+    pthread_create(&sw, NULL, semwaiter, NULL);
+    pthread_create(&p, NULL, posted, NULL);
     pthread_sigmask(SIG_UNBLOCK, &alrm, NULL);
 
     struct itimerval it = { { 0, 10000 }, { 0, 10000 } };

@@ -18,7 +18,8 @@ Phases, each skipped when its option says so:
   warm      rounds of announces across the stations (the `announce` meta
             command; warm_rounds, each spread over warm_spread seconds with
             warm_gap between rounds), then, on the stations whose kind can
-            count its paths (`reticulous`: `rnpath -s`), a sample every
+            count its paths (`reticulous`: `rnpath -s`;
+            `standard_reticulum`: `paths`), a sample every
             settle_every seconds until their total does not rise between
             two samples (or settle_max has passed). With no such station,
             two settle_every waits. warm_rounds 0 skips the phase.
@@ -43,8 +44,8 @@ runs longer, so the page can say which phase the run is in and when it will
 be done. The result holds the phases (wall and T at each boundary), every
 clock message, the warm-up samples, every send with its route and reply,
 and the gathered output. How much of it was delivered is counted from the
-stations' logs afterwards, which is Reticulous's for now
-(simesh.reticulum.delivery, `report`).
+stations' logs afterwards, from the lines `reticulous` and
+`standard_reticulum` stations log (simesh.reticulum.delivery, `report`).
 """
 
 import asyncio
@@ -66,9 +67,10 @@ WORDS = ("mesh relay gateway lora packet announce proof link path hop station "
 CLASSES = ["short"] * 167 + ["two"] * 76 + ["big"] * 39
 # What each kind is asked at the end, by kind.
 DEFAULT_GATHER = {"reticulous": ["rnpath -s", "lxmf unfinished", "lxmf msgs received",
-                                 "lxmf msgs delivered", "lora 0", "lora 0 supe"]}
+                                 "lxmf msgs delivered", "lora 0", "lora 0 supe"],
+                  "standard_reticulum": ["paths"]}
 # The kinds that can count the paths they know, and how.
-PATH_COUNT = {"reticulous": "rnpath -s"}
+PATH_COUNT = {"reticulous": "rnpath -s", "standard_reticulum": "paths"}
 QUEUED = re.compile(r"queued (\S+)")
 RESULT_FILE = "traffic.json"
 

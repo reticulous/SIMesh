@@ -227,6 +227,7 @@ learns where it is.
 | `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
 | `read` | virtual time: bytes it took in from outside the air — `"ch": "tty", "total": N`, its console, a running total; `"ch": "tcp/A>B", "n": N`, a TCP connection from another station |
 | `wrote` | virtual time: `"ch": "tcp/A>B", "n": N`, bytes it is about to write to another station; with `"go": k`, sent from the writing thread's own socket, which waits for the `go` |
+| `listen` | virtual time: `"at": "addr:port"`, a TCP endpoint it listens on, whose connections are its own |
 
 **Ether → station**
 
