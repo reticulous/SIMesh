@@ -597,10 +597,10 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 ## Building a pack, and the node maps
 
 ```
-front ── fetch into packs/.cache/<source>/ ─────────────► the sources' hosts (sources.py)
+front ── fetch into geodata/.cache/<source>/ ───────────► the sources' hosts (sources.py)
 front ── planner-job pack-build, one JSON object on stdin ─► planner-job   (packbuild.py)
 planner-job ── {"step","done","total"[,"part","parts"]} per line ─► front ── geodata_progress ─► pages
-planner-job ── {"manifest": path} | {"error": sentence}, last ─► front: packs/<name>/, geodata/<name>.yaml
+planner-job ── {"manifest": path} | {"error": sentence}, last ─► front: geodata/<name>/, its geodata.yaml
 front ── planner-job nodes-import {source, file, bbox, companions, max_age_days, now_unix} ─► planner-job
 planner-job ── {"nodes": [...], "report": {...}} ─► front ── nodeset.from_imported ─► nodesets/<name>.yaml
 ```

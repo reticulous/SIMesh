@@ -18,7 +18,10 @@ within `RADIUS_KM`, as its `loss.bin` serves it:
     "PLS2" | u32 w | u32 h | f64 ox | f64 oy | f64 rx | f64 ry | u16 loss_db·100 [w·h]
 
 in the pack's CRS, row-major from the north-west, `(ox, oy)` the centre of
-the first cell, 65535 where nothing was evaluated. It is path loss only:
+the first cell, 65535 where nothing was evaluated. Its cells are the pack's
+own, up to `CELLS` across the square (planner-web answers no finer than the
+sweep, and no more than 2048 a side): 10 m on a 10 m pack, 30 m on a 30 m
+one, about 10 m on anything finer. It is path loss only:
 the page adds the node's transmit power and antenna gain, and draws the best
 level at each point over the nodes on show.
 
@@ -41,16 +44,18 @@ import store
 MAGIC = b"PLS2"
 RX_HEIGHT_M = 2.0
 RADIUS_KM = 10.0
-CELLS = 512                         # across the raster's square, each way
+CELLS = 2048                        # asked across the square, each way; planner-web's most
 POLL_S = 0.5
 SWEEP_TIMEOUT_S = 600.0
 
 
 def key(gd, node, rx_h=RX_HEIGHT_M, radius_km=RADIUS_KM):
     """What a node's raster depends on, hashed: the pack's content, the
-    node's position and antenna height, the receiver's height, the radius."""
+    node's position and antenna height, the receiver's height, the radius
+    and the cells asked for."""
     text = json.dumps([gd.content_hash, round(float(node["lat"]), 7), round(float(node["lon"]), 7),
-                       round(float(node["height_m"]), 2), rx_h, radius_km], separators=(",", ":"))
+                       round(float(node["height_m"]), 2), rx_h, radius_km, CELLS],
+                      separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 

@@ -1,10 +1,10 @@
 """A pack built from its sources, as a child process the front never waits on.
 
 ```
-front ── fetch into packs/.cache/<source>/ ─────► source hosts     (sources.py)
+front ── fetch into geodata/.cache/<source>/ ───► source hosts     (sources.py)
 front ── planner-job pack-build, JSON on stdin ─► planner-job
 planner-job ── one JSON line per step ─────────► front ── geodata_progress ──► every page
-planner-job ── packs/.part-<name>/ ────────────► front: packs/<name>/, geodata/<name>.yaml
+planner-job ── geodata/.part-<name>/ ──────────► front: geodata/<name>/, its geodata.yaml
 ```
 
 A build is a name, a rectangle and a resolution. It fetches what the
@@ -12,10 +12,10 @@ rectangle needs of each source (sources.plan chooses the sources and says
 what), lays out the compiler's inputs, and runs
 `planner-job pack-build` with them as one JSON object on its standard input;
 the compiler's steps come back one JSON line each and its diagnostics on
-standard error, which go to `packs/.cache/logs/<name>.log`. The pack is
-written under `packs/.part-<name>/` and renamed into place only when it is
-whole, and the geodata file naming it is written last, so geodata that
-exists is geodata that was built.
+standard error, which go to `geodata/.cache/logs/<name>.log`. The pack is
+written under `geodata/.part-<name>/`, its geodata file is written beside it
+when it is whole, and only then is the directory renamed into place, so
+geodata that exists is geodata that was built.
 
 Berlin's tiles are handed over as a directory of links to just the tiles
 this rectangle meets, since the compiler reads every file of the directory
@@ -43,16 +43,15 @@ FETCH_PARALLEL = 4
 
 
 class Build:
-    def __init__(self, cache, spec, binary, say, preexec_fn=None, packs=None):
+    def __init__(self, cache, spec, binary, say, preexec_fn=None):
         self.cache = cache
         self.binary = binary
         self.say = say
         self.preexec_fn = preexec_fn
-        self.packs = packs or geodata.packs_dir()
         self.name = spec["name"]
         self.spec = {k: spec.get(k) for k in ("bbox", "res_m")}
         self.planned = None
-        self.part = os.path.join(self.packs, geodata.PART_PREFIX + self.name)
+        self.part = os.path.join(store.GEODATA_DIR, geodata.PART_PREFIX + self.name)
         self.inputs = self.part + ".inputs"
         self.log_path = os.path.join(self.cache.root, "logs", self.name + ".log")
         self.process = None
@@ -169,6 +168,7 @@ class Build:
 
     async def compile(self, params):
         shutil.rmtree(self.part, ignore_errors=True)
+        os.makedirs(os.path.dirname(self.part), exist_ok=True)
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         self.process = await asyncio.create_subprocess_exec(
             self.binary, "pack-build", stdin=asyncio.subprocess.PIPE,
@@ -220,27 +220,25 @@ class Build:
                 os.killpg(process.pid, signal.SIGKILL)
 
     def finish(self):
-        """The pack into place, and the geodata that names it."""
-        dest = os.path.join(self.packs, self.name)
+        """The geodata file beside the pack, and the directory into place."""
+        dest = geodata.geodata_dir(self.name)
         if os.path.exists(dest):
-            raise store.StoreError("there is already a pack called %r in %s" % (self.name, self.packs))
-        os.rename(self.part, dest)
+            raise store.StoreError("there is already geodata called %r" % self.name)
         spec = self.spec
-        geodata.write(geodata.geodata_path(self.name),
-                      {geodata.PACK: os.path.relpath(dest, store.GEODATA_DIR)},
+        geodata.write(os.path.join(self.part, geodata.GEODATA_FILE),
+                      {geodata.PACK: geodata.OWN_PACK},
                       "built from sources: %s at %g m\n%s"
                       % (", ".join("%.5f" % v for v in spec["bbox"]), float(spec["res_m"]),
                          "\n".join("%s: %s" % (r["title"], r["used_for"])
                                    for r in self.planned["sources"])))
+        os.rename(self.part, dest)
         geodata.load(self.name)
 
 
-def refuse(spec, packs=None):
+def refuse(spec):
     """Why a build of `spec` cannot start, before anything is fetched: a
     StoreError, or None."""
     name = store.check_name(spec.get("name"), "geodata")
-    if os.path.exists(geodata.geodata_path(name)):
+    if os.path.exists(geodata.geodata_dir(name)):
         raise store.StoreError("there is already geodata called %r" % name)
-    if os.path.exists(os.path.join(packs or geodata.packs_dir(), name)):
-        raise store.StoreError("there is already a pack called %r" % name)
     sources.check(spec.get("bbox"), float(spec.get("res_m") or 30))

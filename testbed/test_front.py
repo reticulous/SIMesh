@@ -30,7 +30,7 @@ import sources  # noqa: E402
 import store  # noqa: E402
 import webrtc  # noqa: E402
 
-BERLIN_PACK = os.path.join(geodata.PACKS_DIR, "berlin-city")
+BERLIN_PACK = os.path.join(store.GEODATA_DIR, "berlin-city")
 FOUR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "four.yaml")
 PLAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "plain-27.yaml")
 
@@ -244,7 +244,8 @@ def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatc
     (tmp_path / "scripts").mkdir()
     (tmp_path / "geodata").mkdir()
     shutil.copy(FOUR, str(tmp_path / "nodesets" / "four.yaml"))
-    shutil.copy(PLAIN, str(tmp_path / "geodata" / "plain-27.yaml"))
+    (tmp_path / "geodata" / "plain-27").mkdir()
+    shutil.copy(PLAIN, str(tmp_path / "geodata" / "plain-27" / "geodata.yaml"))
     (tmp_path / "scripts" / "four.py").write_text("from simesh import *\n")
     (tmp_path / "scripts" / "globals.py").write_text("FREQ_MHZ = 869.525\nSF = 8\n"
                                                      "BW_KHZ = 125\nCR = 5\n")
@@ -300,16 +301,15 @@ def test_a_pack_is_refused_for_no_planner_before_its_manifest_is_read(tmp_path, 
     is the planner, not the manifest. With a planner, an unreadable manifest
     is said as such, and synthetic ground works either way."""
     ground = tmp_path / "geodata"
-    ground.mkdir()
-    (ground / "berlin.yaml").write_text("pack: %s\n" % (tmp_path / "gone"))
-    (ground / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
     monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    geodata.write(geodata.geodata_path("berlin"), {"pack": str(tmp_path / "gone")})
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
     monkeypatch.setattr(front, "planner_web", lambda: None)
     with pytest.raises(store.StoreError) as err:
         front.load_geodata("berlin")
     assert str(err.value) == front.NO_PLANNER % "berlin"
     with pytest.raises(store.StoreError) as err:
-        front.read_geodata(str(ground / "berlin.yaml"))
+        front.read_geodata(geodata.geodata_path("berlin"))
     assert str(err.value) == front.NO_PLANNER % "berlin"
     assert front.load_geodata("flat").kind == "synthetic"
     monkeypatch.setattr(front, "planner_web", lambda: "/usr/bin/true")
@@ -345,9 +345,8 @@ def stores(tmp_path, monkeypatch):
     monkeypatch.setattr(devices, "web_catalogues", no_web)
     monkeypatch.setattr(front, "planner_web", lambda: None)
     monkeypatch.setattr(geodata, "PLANNER_DIR", str(tmp_path / "planner"))
-    monkeypatch.setattr(geodata, "PACKS_DIR", str(tmp_path / "packs"))
-    monkeypatch.setattr(sources, "CACHE_DIR", str(tmp_path / "packs" / ".cache"))
-    (tmp_path / "geodata_dir" / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
+    monkeypatch.setattr(sources, "CACHE_DIR", str(tmp_path / "geodata_dir" / ".cache"))
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
     (tmp_path / "nodesets_dir" / "here.yaml").write_text(
         "nodes:\n  a: { id: 1, lat: 0, lon: 0, tags: [x] }\n")
     (tmp_path / "nodesets_dir" / "there.yaml").write_text(
@@ -461,7 +460,7 @@ def test_a_device_and_a_pack_are_imported_over_http(stores):
                                 data=pack.getvalue()) as resp:
             got = await resp.json()
         assert got["ok"] and got["geodata"]["kind"] == "pack"
-        assert os.path.isfile(os.path.join(geodata.packs_dir(), "tiny", "manifest.json"))
+        assert os.path.isfile(os.path.join(store.GEODATA_DIR, "tiny", "manifest.json"))
         assert not [n for n in os.listdir(front.SIM_DIR) if n.startswith(".upload-")]
 
         async with session.get(base + "/api/geodata/export", params={"name": "tiny"}) as resp:
@@ -498,7 +497,7 @@ def test_a_node_map_becomes_a_layer_and_shown_layers_save_as_one(stores, monkeyp
     job.write_text(FAKE_NODES_JOB)
     job.chmod(0o755)
     monkeypatch.setattr(front, "planner_job", lambda: str(job))
-    meta = stores / "packs" / ".cache" / "meta"
+    meta = stores / "geodata_dir" / ".cache" / "meta"
     meta.mkdir(parents=True)
     (meta / front.MESHCORE_META).write_text(json.dumps([
         {"label": "Alex Repeater 🗼", "lat": 0.01, "lon": 0.01, "kind": "repeater"},
@@ -607,12 +606,11 @@ def test_a_node_raster_is_swept_once_and_then_cached(tmp_path, monkeypatch):
 
 def test_the_planner_is_started_for_a_pack_and_passed_through(tmp_path, monkeypatch):
     if front.planner_web() is None or not os.path.isdir(BERLIN_PACK):
-        pytest.skip("no planner-web build in planner/ or no berlin-city pack in packs/")
+        pytest.skip("no planner-web build in planner/ or no berlin-city geodata")
     ground = tmp_path / "geodata"
-    ground.mkdir()
-    (ground / "berlin.yaml").write_text("pack: %s\n" % BERLIN_PACK)
-    (ground / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
     monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    geodata.write(geodata.geodata_path("berlin"), {"pack": BERLIN_PACK})
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
     monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
 
     async def check(f, session, base, ws):

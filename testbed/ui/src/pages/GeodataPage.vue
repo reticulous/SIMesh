@@ -88,8 +88,8 @@
                    hint="lower-case letters, digits and hyphens" />
           <div class="text-caption text-grey-6">
             A SIMesh geodata pack, as Export zip writes one, or a bare planner pack
-            (its manifest.json at the top or inside one directory). A pack goes into
-            packs/, and becomes geodata by this name. Nodes are never ground: a pack's
+            (its manifest.json at the top or inside one directory), which becomes
+            geodata by this name. Nodes are never ground: a pack's
             Nodes layer is left out.
           </div>
         </q-card-section>
@@ -212,8 +212,8 @@ function askRename(n: string) {
 function askDelete(n: string) {
   const go = () => quasar.dialog({
     title: `Delete ${n}`,
-    message: `Delete the geodata ${n}, and its pack when nothing else uses it? This cannot be undone. `
-      + 'Nodesets are not touched.',
+    message: `Delete the geodata ${n}, its pack included? This cannot be undone. `
+      + 'Nodesets are not touched; geodata a run or a snapshot stands on is not deleted.',
     ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
     cancel: { flat: true, noCaps: true }, persistent: true,
   }).onOk(async () => {
@@ -221,8 +221,7 @@ function askDelete(n: string) {
     if (!r.ok) { tell(r.error); return }
     if (nodes.geodata === n) { await nodes.chooseGeodata(null); preview.value = null; await ground.open(null) }
     await catalog.refreshGeodata()
-    const kept = r.kept_by as string[]
-    tell(null, kept.length ? `deleted; the pack stays, used by ${kept.join(', ')}` : 'deleted')
+    tell(null, 'deleted')
   })
   if (nodes.geodata === n) whenSaved(quasar, go)
   else go()

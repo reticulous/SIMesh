@@ -156,6 +156,8 @@
                    @close="nodes.pair = null" @reverse="nodes.pair = [nodes.pair![1], nodes.pair![0]]" />
     <ConsoleWindow v-for="name in consoles" :key="name" :name="name" :visible="true"
                    @update:visible="v => !v && closeConsole(name)" />
+    <WebWindow v-for="name in webs" :key="`web-${name}`" :name="name" :visible="true"
+               @update:visible="v => !v && closeWeb(name)" />
 
     <!-- A new layer from a source: the public node maps, or a planner CSV. -->
     <q-dialog v-model="importing">
@@ -270,6 +272,7 @@ import DisplayMenu from '../components/DisplayMenu.vue'
 import PairInspector, { type PairEnd } from '../components/PairInspector.vue'
 import PlaceSearch from '../components/PlaceSearch.vue'
 import ConsoleWindow from '../components/ConsoleWindow.vue'
+import WebWindow from '../components/WebWindow.vue'
 import { useRouter } from 'vue-router'
 import { NO_RADIO, useNodes, type NodeView } from '../stores/nodes'
 import { whenSaved } from '../lib/unsaved'
@@ -325,6 +328,7 @@ watch(importing, async (open) => {
   } catch { meshcoreDate.value = null }
 })
 const consoles = ref<string[]>([])
+const webs = ref<string[]>([])
 const commandLine = ref('')
 const commandSpread = ref(0)
 const commandKind = ref<string | null>(null)
@@ -702,7 +706,8 @@ watch(() => sim.kinds, (list) => {
 
 function openConsole(name: string) { if (!consoles.value.includes(name)) consoles.value.push(name) }
 function closeConsole(name: string) { consoles.value = consoles.value.filter(n => n !== name) }
-function openWeb(name: string) { window.open(sim.stationUrl(name), '_blank') }
+function openWeb(name: string) { if (!webs.value.includes(name)) webs.value.push(name) }
+function closeWeb(name: string) { webs.value = webs.value.filter(n => n !== name) }
 
 /* The selected station's levels, asked again when a moved row lands. */
 watch(() => nodes.selection, (sel) => { if (nodes.attached && sel.length === 1) sim.askLevels(sel[0]!) })
@@ -711,6 +716,7 @@ watch(() => sim.nodeList.some(n => n.stale), (anyStale, was) => {
 })
 watch(() => sim.selected, () => {
   consoles.value = []
+  webs.value = []
   nodes.selection = []
 })
 </script>

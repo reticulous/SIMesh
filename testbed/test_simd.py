@@ -111,7 +111,8 @@ def stores(tmp_path, monkeypatch):
                                            "elf: %s\n" % elf)
     (local / "stubtwo_local.yaml").write_text("kind: stub\nproject: Stubtwo\nelf: %s\n" % elf)
     (local / "other_local.yaml").write_text("kind: other\nelf: %s\n" % elf)
-    (tmp_path / "geodata_dir" / "flat.yaml").write_text(
+    (tmp_path / "geodata_dir" / "flat").mkdir()
+    (tmp_path / "geodata_dir" / "flat" / "geodata.yaml").write_text(
         "synthetic:\n  exponent: 3.0\n")
     (tmp_path / "nodesets_dir" / "three.yaml").write_text(
         "nodes:\n"

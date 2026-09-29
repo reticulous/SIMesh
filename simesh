@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # simesh — SIMesh, from a shell.
 #
-#     simesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page
+#     simesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page,
+#                                    first building whichever of the page, the chip
+#                                    library and the planner is not built
 #     simesh new [NAME] (--geodata G --nodeset N | --snapshot S)
 #                [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
 #                                    start a simulation (and the front, when none runs);
@@ -239,6 +241,9 @@ cmd_front() {
     [ -f "$ROOT/radio/build/libsimclock.so" ] || build_radio
     [ -f "$ROOT/testbed/ui/dist/spa/index.html" ] || build_page \
         || say "the page did not build; the front will say so when it is opened"
+    [ -x "$PLANNER/target/release/planner-web" ] && [ -x "$PLANNER/target/release/planner-job" ] \
+        || (build_planner) \
+        || say "the planner did not build; synthetic ground works, and a pack is refused saying so"
     say "the page: $URL"
     [ -n "${SIMESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
     "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" "$@" &

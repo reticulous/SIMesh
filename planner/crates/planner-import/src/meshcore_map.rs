@@ -843,7 +843,7 @@ mod tests {
     fn snapshot_path() -> std::path::PathBuf {
         std::env::var_os("SIMESH_MESHCORE_SNAPSHOT").map(Into::into).unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../packs/.cache/meshcore/nodes.json")
+                .join("../../../testbed/geodata/.cache/meshcore/nodes.json")
         })
     }
 

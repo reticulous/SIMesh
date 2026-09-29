@@ -227,7 +227,7 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
     served = tmp_path / "served"
     serve_sources(served)
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    packs = tmp_path / "packs"
+    ground = tmp_path / "geodata"
     job = tmp_path / "planner-job"
     job.write_text(FAKE_JOB)
     job.chmod(0o755)
@@ -276,8 +276,8 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
 
         said = []
         spec = {"name": "mitte", "bbox": MITTE, "res_m": 30}
-        packbuild.refuse(spec, str(packs))
-        build = packbuild.Build(cache, spec, str(job), said.append, packs=str(packs))
+        packbuild.refuse(spec)
+        build = packbuild.Build(cache, spec, str(job), said.append)
         await build.start()
         assert build.row["state"] == "done", build.row
         params = json.loads(saw.read_text())
@@ -293,14 +293,14 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
         assert [r["step"] for r in said if r["state"] == "compiling"][1:4] == \
             ["terrain", "clutter", "roads"]
         gd = geodata.load("mitte")
-        assert gd.is_pack and gd.pack_dir == str(packs / "mitte")
-        assert not [n for n in os.listdir(packs) if n.startswith(".part-")]
+        assert gd.is_pack and gd.pack_dir == str(ground / "mitte")
+        assert (ground / "mitte" / "geodata.yaml").read_text().startswith("# built from sources")
+        assert os.listdir(ground) == ["mitte"]
         with pytest.raises(store.StoreError, match="already"):
-            packbuild.refuse(spec, str(packs))
+            packbuild.refuse(spec)
 
         fetched = len(calls)
-        build = packbuild.Build(cache, dict(spec, name="broken"), str(job), said.append,
-                                packs=str(packs))
+        build = packbuild.Build(cache, dict(spec, name="broken"), str(job), said.append)
         await build.start()
         assert build.row["state"] == "failed"
         assert build.row["error"] == "the DSM tiles leave holes"
@@ -309,12 +309,11 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
         # The second build over the same ground fetched nothing new.
         assert not [c for c in calls[fetched:] if c[0] == "GET" and "glo30" in c[1]]
 
-        build = packbuild.Build(cache, dict(spec, name="gone"), str(job), said.append,
-                                packs=str(packs))
+        build = packbuild.Build(cache, dict(spec, name="gone"), str(job), said.append)
         task = build.start()
         await asyncio.sleep(0)
         build.cancel()
         await task
         assert build.row["state"] == "cancelled"
-        assert not os.path.exists(packs / "gone")
+        assert os.listdir(ground) == ["mitte"]
     running_host(served, check)

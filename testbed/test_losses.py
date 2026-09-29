@@ -23,7 +23,7 @@ import slt  # noqa: E402
 import store  # noqa: E402
 
 PLANNER_WEB = os.path.join(HERE, "..", "planner", "target", "release", "planner-web")
-BERLIN_PACK = os.path.join(HERE, "..", "packs", "berlin-city")
+BERLIN_PACK = os.path.join(HERE, "geodata", "berlin-city")
 
 
 @pytest.fixture
@@ -214,7 +214,7 @@ def free_port():
 
 def run_sidecar(ready):
     if not (os.path.isfile(PLANNER_WEB) and os.path.isfile(os.path.join(BERLIN_PACK, "manifest.json"))):
-        pytest.skip("no planner-web build in planner/ or no berlin-city pack in packs/")
+        pytest.skip("no planner-web build in planner/ or no berlin-city geodata")
     port = free_port()
     proc = subprocess.Popen([PLANNER_WEB, "--pack", BERLIN_PACK, "--host", "127.0.0.1",
                              "--port", str(port)],
@@ -354,7 +354,7 @@ def test_a_table_begun_while_the_sidecar_indexes_waits_for_the_index(stores, fre
 
 def test_a_pack_has_only_the_868_table(stores):
     if not os.path.isfile(os.path.join(BERLIN_PACK, "manifest.json")):
-        pytest.skip("no berlin-city pack in packs/")
+        pytest.skip("no berlin-city geodata")
     geodata.write(geodata.geodata_path("berlin"), {"pack": BERLIN_PACK})
     gd = geodata.load("berlin")
     ns = nodeset.create("empty")

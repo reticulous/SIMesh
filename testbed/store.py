@@ -1,7 +1,8 @@
 """Where geodata, nodesets, scripts, loss tables, coverage, runs and snapshots
 live, and what a name for any of them may be.
 
-    testbed/geodata/<name>.yaml       the ground: a planner pack, or synthetic ground at 0°, 0°
+    testbed/geodata/<name>/           the ground: a planner pack, or synthetic ground at 0°, 0°;
+                                      geodata.yaml, and the pack's files beside it
     testbed/nodesets/<name>.yaml      which nodes stand where, with their device, role and radio
     testbed/scripts/<name>.py         Python against the simesh library: setup and drivers
     testbed/losses/<geodata>/<nodeset geometry hash>/<band>.bin

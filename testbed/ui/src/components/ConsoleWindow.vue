@@ -3,11 +3,15 @@
     :id="`sim-console-${name}`"
     :title="`${name} console`"
     :visible="visible"
-    :default-geom="{ x: 18, y: 18, w: 46, h: 46 }"
-    :min-size="{ w: 20, h: 14 }"
+    :default-geom="{ x: 18, y: 18, w: 34, h: 30 }"
+    :min-size="{ w: 16, h: 12 }"
     flush
     @update:visible="v => $emit('update:visible', v)"
   >
+    <template #titlebar-right>
+      <span class="fw-zoom-btn" @click="zoomBy(-1)">-</span>
+      <span class="fw-zoom-btn" @click="zoomBy(1)">+</span>
+    </template>
     <template #default="{ size }">
       <div ref="host" class="console-host" :data-w="size.w" :data-h="size.h" />
     </template>
@@ -19,7 +23,9 @@
  *
  * Keystrokes go out as binary frames and land on the pty exactly as a cable
  * would deliver them, so nothing a person can type is special to the
- * transport; the terminal's size goes the other way as a JSON text frame. */
+ * transport; the terminal's size goes the other way as a JSON text frame.
+ * − and + step the font by 2 px, from 8 px up, as spangap's CLI window does;
+ * the step is kept, one for every console. */
 import { ref, watch, onUnmounted, nextTick } from 'vue'
 import FloatingWindow from './FloatingWindow.vue'
 import { Terminal } from '@xterm/xterm'
@@ -37,6 +43,20 @@ let fit: FitAddon | null = null
 let socket: WebSocket | null = null
 let observer: ResizeObserver | null = null
 
+const BASE_FONT = 10
+const ZOOM_KEY = 'simesh.console.zoom'
+function storedZoom() {
+  try { return Number(localStorage.getItem(ZOOM_KEY)) || 0 } catch { return 0 }
+}
+const zoom = ref(storedZoom())
+const fontSize = () => Math.max(8, BASE_FONT + zoom.value * 2)
+
+function zoomBy(step: number) {
+  zoom.value = Math.min(10, Math.max(-1, zoom.value + step))
+  try { localStorage.setItem(ZOOM_KEY, String(zoom.value)) } catch { /* private window */ }
+  if (term) { term.options.fontSize = fontSize(); fit?.fit(); sendSize() }
+}
+
 function open() {
   if (term || !host.value) return
   term = new Terminal({
@@ -45,7 +65,7 @@ function open() {
     // translation an `onlcr` tty would, or every line staircases.
     convertEol: true,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    fontSize: 12,
+    fontSize: fontSize(),
     theme: { background: '#0e1116', foreground: '#d1d5db' },
   })
   fit = new FitAddon()

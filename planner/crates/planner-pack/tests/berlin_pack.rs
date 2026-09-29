@@ -1,5 +1,5 @@
 //! End-to-end pack build against the real GLO-30 Berlin tile; skips cleanly
-//! when the tile isn't in the download cache (`packs/.cache/glo30/`).
+//! when the tile isn't in the download cache (`testbed/geodata/.cache/glo30/`).
 
 use planner_core::geo::Xy;
 use planner_pack::build::{build, inspect, BuildParams};
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[test]
 fn small_berlin_pack_builds_and_reads_back() {
     let tile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../packs/.cache/glo30/Copernicus_DSM_COG_10_N52_00_E013_00_DEM.tif");
+        .join("../../../testbed/geodata/.cache/glo30/Copernicus_DSM_COG_10_N52_00_E013_00_DEM.tif");
     if !tile.exists() {
         eprintln!("SKIP: GLO-30 tile not downloaded ({})", tile.display());
         return;

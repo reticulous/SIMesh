@@ -3,8 +3,11 @@
     <div class="fw-bar" @pointerdown.prevent="startDrag">
       <div class="fw-close" @pointerdown.stop @click="$emit('update:visible', false)" />
       <span class="fw-title">{{ title }}</span>
+      <div class="fw-bar-right" @pointerdown.stop>
+        <slot name="titlebar-right" />
+      </div>
     </div>
-    <div ref="body" class="fw-body" :class="{ 'fw-body-flush': flush }">
+    <div ref="body" class="fw-body" :class="{ 'fw-body-flush': flush, 'fw-body-held': moving }">
       <slot :size="size" />
     </div>
     <div class="fw-grip fw-grip-e" @pointerdown.prevent="startResize('e', $event)" />
@@ -27,7 +30,9 @@ let zCounter = 1000
  * Geometry is in percent of the parent, so a window stays where it was put
  * relative to the page when the browser is resized, and it is kept per `id`
  * in localStorage, so a console reopened after a reload comes back where it
- * was. Storage that throws (a private window) leaves the default geometry. */
+ * was. Storage that throws (a private window) leaves the default geometry.
+ * While a window is dragged or resized its body takes no pointer events, so
+ * a frame inside it cannot swallow the gesture. */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 
 interface Geom { x: number; y: number; w: number; h: number }
@@ -52,6 +57,7 @@ const body = ref<HTMLDivElement>()
 const geom = reactive<Geom>({ ...props.defaultGeom })
 const z = ref(++zCounter)
 const size = reactive({ w: 0, h: 0 })
+const moving = ref(false)
 const KEY = `simesh.window.${props.id}`
 
 const style = computed(() => ({
@@ -95,6 +101,7 @@ function begin(kind: 'drag' | Edge, event: PointerEvent) {
   if (!event.isPrimary) return
   raise()
   gesture = { kind, x: event.clientX, y: event.clientY, start: { ...geom } }
+  moving.value = true
   window.addEventListener('pointermove', follow)
   window.addEventListener('pointerup', end)
   window.addEventListener('pointercancel', end)
@@ -121,6 +128,7 @@ function follow(event: PointerEvent) {
 
 function end() {
   gesture = null
+  moving.value = false
   window.removeEventListener('pointermove', follow)
   window.removeEventListener('pointerup', end)
   window.removeEventListener('pointercancel', end)
@@ -176,8 +184,16 @@ onUnmounted(() => {
   flex: 1; text-align: center; font-size: 12px; font-weight: 500;
   color: rgba(255, 255, 255, 0.7);
 }
+.fw-bar-right { display: flex; gap: 4px; flex-shrink: 0; }
+.fw-bar-right :slotted(.fw-zoom-btn) {
+  width: 18px; height: 18px; display: flex; align-items: center; justify-content: center;
+  border-radius: 4px; font-size: 14px; font-weight: 700;
+  color: rgba(255, 255, 255, 0.5); cursor: pointer; font-family: system-ui; line-height: 1;
+}
+.fw-bar-right :slotted(.fw-zoom-btn:hover) { color: rgba(255, 255, 255, 0.9); background: rgba(255, 255, 255, 0.1); }
 .fw-body { flex: 1; min-height: 0; overflow: hidden; padding: 0 5px; border-radius: 0 0 5px 5px; }
 .fw-body-flush { padding: 0; }
+.fw-body-held { pointer-events: none; }
 .fw-grip { position: absolute; z-index: 2; touch-action: none; }
 .fw-grip-e { right: -6px; top: 28px; bottom: 12px; width: 12px; cursor: e-resize; }
 .fw-grip-s { bottom: -6px; left: 12px; right: 12px; height: 12px; cursor: s-resize; }

@@ -9,17 +9,19 @@ front ── HEAD <file> ──────────────────�
 front ── GET <file>, Range: bytes=<n>- ► the source's host       into the cache, resumed
 ```
 
-    packs/.cache/glo30/<tile>.tif            Copernicus GLO-30 surface model, 1° tiles
-    packs/.cache/worldcover/<tile>.tif       ESA WorldCover 2021 land cover, 3° tiles
-    packs/.cache/itu/DN50.TXT, N050.TXT      ITU-R P.1812-8's ΔN and N0 maps, never packed
-    packs/.cache/geofabrik/<id>.osm.pbf      one OpenStreetMap extract
-    packs/.cache/berlin-dgm1/<tile>.zip      Berlin's 1 m terrain, 2 km tiles; x/ extracted
-    packs/.cache/berlin-bdom/<tile>.zip      Berlin's 1 m surface, 2 km tiles; x/ extracted
-    packs/.cache/berlin-lod2/<tile>.zip      Berlin's LoD2 building models, 1 km tiles; x/ extracted
-    packs/.cache/zensus/<zip>                Zensus 2022's population grid; x/ extracted
-    packs/.cache/meta/                       what the sources have: Geofabrik's index, Berlin's
-                                             feeds, the MeshCore map's node list; a week old at most
-    packs/.cache/sizes.json                  each file's size as its host said, by URL
+    testbed/geodata/.cache/glo30/<tile>.tif        Copernicus GLO-30 surface model, 1° tiles
+    testbed/geodata/.cache/worldcover/<tile>.tif   ESA WorldCover 2021 land cover, 3° tiles
+    testbed/geodata/.cache/itu/DN50.TXT, N050.TXT  ITU-R P.1812-8's ΔN and N0 maps, never packed
+    testbed/geodata/.cache/geofabrik/<id>.osm.pbf  one OpenStreetMap extract
+    testbed/geodata/.cache/berlin-dgm1/<tile>.zip  Berlin's 1 m terrain, 2 km tiles; x/ extracted
+    testbed/geodata/.cache/berlin-bdom/<tile>.zip  Berlin's 1 m surface, 2 km tiles; x/ extracted
+    testbed/geodata/.cache/berlin-lod2/<tile>.zip  Berlin's LoD2 building models, 1 km tiles;
+                                                   x/ extracted
+    testbed/geodata/.cache/zensus/<zip>            Zensus 2022's population grid; x/ extracted
+    testbed/geodata/.cache/meta/                   what the sources have: Geofabrik's index,
+                                                   Berlin's feeds, the MeshCore map's node list;
+                                                   a week old at most
+    testbed/geodata/.cache/sizes.json              each file's size as its host said, by URL
 
 Every build shares the cache, so a second region beside the first fetches
 only what is new. A file is fetched once: into `<file>.part`, resumed from
@@ -58,7 +60,7 @@ import aiohttp
 import geodata
 import store
 
-CACHE_DIR = os.path.join(geodata.PACKS_DIR, ".cache")
+CACHE_DIR = os.path.join(store.GEODATA_DIR, ".cache")
 USER_AGENT = "SIMesh (+https://github.com/reticulous/SIMesh)"
 CHUNK = 1 << 16
 TRIES = 4

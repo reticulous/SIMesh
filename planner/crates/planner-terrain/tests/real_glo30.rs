@@ -1,6 +1,6 @@
 //! Smoke test against a real Copernicus GLO-30 COG (tiled + DEFLATE +
 //! overview IFDs). Runs only when the tile is in the download cache
-//! (`packs/.cache/glo30/`) — CI without it stays green.
+//! (`testbed/geodata/.cache/glo30/`) — CI without it stays green.
 
 use planner_core::geo::Xy;
 use planner_terrain::cog::CogReader;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 fn tile_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../packs/.cache/glo30/Copernicus_DSM_COG_10_N52_00_E013_00_DEM.tif")
+        .join("../../../testbed/geodata/.cache/glo30/Copernicus_DSM_COG_10_N52_00_E013_00_DEM.tif")
 }
 
 #[test]

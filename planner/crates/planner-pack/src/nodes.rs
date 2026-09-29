@@ -1008,7 +1008,7 @@ mod tests {
         // the importer's real-data tests already use.
         let path = std::env::var_os("SIMESH_MESHCORE_SNAPSHOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../packs/.cache/meshcore/nodes.json")
+                .join("../../../testbed/geodata/.cache/meshcore/nodes.json")
         });
         if !path.exists() {
             eprintln!("SKIP: MeshCore advert map not downloaded ({})", path.display());

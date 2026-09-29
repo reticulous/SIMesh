@@ -727,7 +727,7 @@ def _progress_printer():
 
 def _load_geodata(text):
     if text.endswith(".yaml") or os.sep in text:
-        return geodata_module.read(text, os.path.splitext(os.path.basename(text))[0])
+        return geodata_module.read(text)
     return geodata_module.load(text)
 
 

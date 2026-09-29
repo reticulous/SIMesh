@@ -29,7 +29,7 @@ fn repo() -> PathBuf {
 }
 
 fn cache() -> PathBuf {
-    repo().join("packs/.cache")
+    repo().join("testbed/geodata/.cache")
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn small_build(buildings: &str, out: &Path) -> Option<(Vec<Value>, Value)> {
 /// kilometre column and OpenStreetMap on the rest. Slow in a debug build:
 /// `cargo test --release -p planner-job -- --ignored`.
 #[test]
-#[ignore = "reads the real inputs in packs/.cache; run with --release -- --ignored"]
+#[ignore = "reads the real inputs in testbed/geodata/.cache; run with --release -- --ignored"]
 fn small_real_builds_with_osm_lod2_and_both_buildings() {
     let base = std::env::temp_dir().join("planner_job_real_builds");
     let common_layers = [

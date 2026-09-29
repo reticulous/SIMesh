@@ -18,7 +18,7 @@ front ── GET /api/v1/nodes (weekly) ─────────────�
 front ── planner-job nodes-import, JSON on stdin ──► planner-job      the nodes inside the geodata
 browser ── GET  localhost:8800/api/geodata/sources ► front          what a rectangle's build takes
 browser ── POST localhost:8800/api/geodata/build ──► front          a build started (DELETE cancels)
-front ── fetch into packs/.cache/<source>/ ────────► source hosts     (sources.py)
+front ── fetch into geodata/.cache/<source>/ ──────► source hosts     (sources.py)
 front ── planner-job pack-build, JSON on stdin ────► planner-job      (packbuild.py)
 front ── geodata_progress {build} ─► every page     as it fetches and compiles
 driver  ── ws   localhost:8800/ws?sim=lora  {type: "plan", ...} ─────► child
@@ -925,7 +925,7 @@ class Front:
         self.reporter = None
         self.fetcher = None
         self.changed = False
-        self.cache = None                   # sources.Cache: packs/.cache and its fetches
+        self.cache = None                   # sources.Cache: geodata/.cache and its fetches
         self.build = None                   # packbuild.Build: the one running, or the last failed
         self.tiles = {}                     # OSM tile path -> the fetch of it under way
         self.nominatim_lock = asyncio.Lock()
@@ -1380,8 +1380,9 @@ class Front:
     def write_geodata(self, name, data, new):
         path = geodata_module.geodata_path(name)
         (self.new_path if new else self.old_path)(path, "geodata", name)
-        if geodata_module.PACK in geodata_module.parse(data, path) and planner_web() is None:
-            raise store.StoreError(NO_PLANNER % name)
+        if geodata_module.PACK in geodata_module.parse(data, path) \
+                or (not new and geodata_module.pack_of(path)):
+            raise store.StoreError("geodata on a pack is built or imported, not written")
         geodata_module.write(path, data)
         return {"geodata": load_geodata(name).as_dict()}
 
@@ -1447,7 +1448,8 @@ class Front:
                 to = store.check_name(msg.get("to"), "geodata")
                 geodata_module.rename(name, to)
                 return {"name": to}
-            return {"name": name, "kept_by": geodata_module.delete(name)}
+            geodata_module.delete(name)
+            return {"name": name}
         if verb == "geodata_open":
             return await self.open_geodata(conn, load_geodata(name))
         if verb == "geodata_close":
@@ -2125,8 +2127,8 @@ class Front:
 
     async def api_geodata_import(self, request):
         """POST a SIMesh geodata pack or a bare planner pack, `?name=` the
-        geodata it becomes (empty: the one the zip gives): a pack into
-        `packs/`, and a geodata file."""
+        geodata it becomes (empty: the one the zip gives), expanded into its
+        own directory."""
         tmp = await self.upload(request)
         try:
             gd = await asyncio.to_thread(geodata_module.import_zip, tmp,

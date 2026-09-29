@@ -104,7 +104,7 @@ mod tests {
     /// whisker of those.
     #[test]
     fn berlin_values_from_real_maps() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../packs/.cache/itu");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../testbed/geodata/.cache/itu");
         if !dir.join("DN50.TXT").exists() {
             eprintln!("SKIP: ITU maps not present at {}", dir.display());
             return;

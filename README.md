@@ -28,7 +28,7 @@ SIMesh keeps, each on its own because each changes on its own:
 |---|---|---|
 | a **device** | one station build: its executable, its `/fixed` tree, its tools | `devices/latest/`, `devices/saved/`, `devices/local/<project>_<catalogue>.yaml` |
 | an **antenna** | a kind of antenna and its radiation pattern | `testbed/antennas/` |
-| **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>.yaml`, `packs/<name>/` |
+| **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
 | a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, and the offsets; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
 | a **script** | plain Python against the simesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
@@ -82,7 +82,9 @@ SIMesh/simesh build
 SIMesh/simesh
 ```
 
-It starts the front and opens `http://localhost:8800/`. The terminal is the
+It builds whichever of the page, the chip library and the planner is not
+built yet, so a fresh clone may skip step 2, then starts the front and opens
+`http://localhost:8800/`. The terminal is the
 testbed's: Ctrl-C there stops every simulation and everything they started.
 
 **4. Stations.** A station is a device file: the firmware built for Linux
@@ -119,8 +121,10 @@ again.
 
 - **Click a station** for the editor: how it is doing, its **Console** (its
   serial console) and **Web UI** (its own web interface, as a board serves
-  it, with no login: a Reticulous station is built without credentials), and
-  every setting it has.
+  it, with no login: a Reticulous station is built without credentials),
+  each in a window over the map with **−** and **+** for its zoom (the
+  console's font; the web UI's page, as the browser's zoom, 75 % to start),
+  and every setting it has.
 - **Right-click the map ▸ New node here** puts down a station. It comes up
   and is set up on its own.
 - **Drag a station** and its links change once its row of the loss table is
@@ -292,10 +296,13 @@ one on the horizon, and a yagi hears what it faces.
 
 ## Geodata
 
-Geodata is the ground nodes stand on, one of two kinds:
+Geodata is the ground nodes stand on, one directory each,
+`testbed/geodata/<name>/`, holding everything it is: renaming or deleting
+the directory renames or deletes the geodata. Its `geodata.yaml` says which
+of two kinds it is:
 
 ```yaml
-# testbed/geodata/plain-27.yaml: synthetic ground, a flat plane at 0°, 0°
+# testbed/geodata/plain-27/geodata.yaml: synthetic ground, a flat plane at 0°, 0°
 synthetic:
   terrain: flat
   exponent: 2.7                     # log-distance path-loss exponent
@@ -303,8 +310,8 @@ synthetic:
 ```
 
 ```yaml
-# testbed/geodata/berlin-city.yaml: a pack, by path from this file
-pack: ../../packs/berlin-city
+# testbed/geodata/berlin/geodata.yaml: a pack, whose files are this directory's
+pack: .
 ```
 
 **Synthetic ground** lies at 0°, 0°, and its degrees are metres by one fixed
@@ -318,8 +325,8 @@ space, 2.7 suburban, and higher numbers bring the neighbourhoods in closer.
 
 **A pack** is ground data compiled from public sources: terrain, clutter,
 buildings, roads and places in a UTM (Universal Transverse Mercator) zone.
-Packs live in `SIMesh/packs/<name>/` (not committed). A pack's geodata says
-nothing its pack does not: its extent, projection and layers come from the
+A pack's files sit beside its `geodata.yaml` (not committed), which says
+nothing the pack does not: its extent, projection and layers come from the
 pack's `manifest.json`. On a pack, a pair's loss is ITU-R (International
 Telecommunication Union, radio sector) Recommendation P.1812-8 over the real
 profile, as SIMesh's planner computes it, and the map draws the pack's
@@ -357,15 +364,15 @@ and each source's notice.
 page ── GET /osm/<z>/<x>/<y>.png ─────────────────► front ── (cache miss) ──► tile.openstreetmap.org
 page ── GET /api/geodata/sources?bbox=&res_m= ─────► front         the grid, the sources chosen, the downloads
 page ── POST /api/geodata/build {name, bbox, res_m} ► front
-front ── fetch into packs/.cache/<source>/ ────────► the sources' hosts (below)
+front ── fetch into geodata/.cache/<source>/ ──────► the sources' hosts (below)
 front ── planner-job pack-build, JSON on stdin ────► planner-job
 planner-job ── one JSON line per step ─────────────► front ── geodata_progress ──► every page
-planner-job ── packs/.part-<name>/ ────────────────► front: packs/<name>/, geodata/<name>.yaml
+planner-job ── geodata/.part-<name>/ ──────────────► front: geodata/<name>/, with its geodata.yaml
 ```
 
 A view of its own, with **‹ Back**. The map is OpenStreetMap's standard
 tiles, fetched through the front and kept under `testbed/osmtiles/` a week
-at least, as the tile usage policy asks; the packs there are are outlined
+at least, as the tile usage policy asks; the packs there are outlined
 with their names, and the areas of the sources that do not cover the world
 (Berlin's own data, Germany's census grid) are tinted. A drag pans, the
 wheel zooms, Ctrl or Cmd and a drag draws the rectangle, and the place
@@ -397,9 +404,9 @@ part, and goes back to the list, where the build's row shows its step and
 progress and has **Cancel**; when it ends the row is geodata like any
 other, or says why it failed. One
 build runs at a time, as a child process the front never waits on; the
-compiler's diagnostics go to `packs/.cache/logs/<name>.log`.
+compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`.
 
-**The sources** are fetched into `packs/.cache/<source>/`, shared by every
+**The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file
 is fetched once, resumed where it stopped, and one its host does not have
 (GLO-30 over open sea) is not asked for again:
@@ -414,7 +421,7 @@ is fetched once, resumed where it stopped, and one its host does not have
 | Zensus 2022 100 m grid | Germany | `destatis.de` |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
-`packs/.cache/meta/` and asked again when a week old. A Berlin tile's name
+`testbed/geodata/.cache/meta/` and asked again when a week old. A Berlin tile's name
 is its south-west corner in kilometres of EPSG:25833, so a district costs
 megabytes rather than the city's gigabytes. OpenStreetMap is read from one
 protocol buffer file (PBF) extract, not from Overpass: one file serves roads,
@@ -829,10 +836,9 @@ it is shown on its own, with no nodes, scrollable and zoomable, with
 the view shared between the two; **‹ Back** returns to the list, where the
 chosen row is marked. Choosing another asks first when the nodeset being
 edited has unsaved changes: save them, discard them, or stay. Each row
-renames its geodata (its pack directory with it, when that is
-`packs/<name>` and nothing else names it) or deletes it, with its pack
-unless another geodata, a run or a snapshot names the pack, which the page
-then says; neither is allowed while a running simulation stands on it. **New synthetic…**
+renames its geodata or deletes it, its pack included; neither is allowed
+while a run or a snapshot stands on its pack, whose copy of the geodata
+names the pack's directory, and the page says which. **New synthetic…**
 makes flat synthetic ground at an exponent and an extent, **Build from
 sources…** opens the build view, and **Import zip…** takes a SIMesh geodata
 pack or a bare planner pack ([Geodata](#geodata)).
@@ -1677,10 +1683,10 @@ the way a driver does, and play the ether on a UDP socket of their own; the
 conductor's tests do the same in virtual time, and the shim's run a small C
 stand-in station (`radio/tests/standin.c`) under `libsimclock.so`. The
 testbed's pack tests run against a real `planner-web` when it is built in
-`planner/` and the `berlin-city` pack is in `packs/`, and are skipped otherwise.
+`planner/` and there is `berlin-city` geodata, and are skipped otherwise.
 The builds from sources and the node-map imports are tested against a host and
 a `planner-job` of the tests' own; the planner's tests of real data read the
-download cache, `packs/.cache/`, and skip what is not there, and two real builds
+download cache, `testbed/geodata/.cache/`, and skip what is not there, and two real builds
 of a few square kilometres of Berlin run through the binary with
 
 ```sh
@@ -1688,7 +1694,7 @@ cd SIMesh/planner && cargo test --release -p planner-job -- --ignored
 ```
 
 `SIMESH_MESHCORE_SNAPSHOT` names a saved MeshCore node list for the importer's
-tests, in place of `packs/.cache/meshcore/nodes.json`.
+tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 
 ## Where the code lives
 
