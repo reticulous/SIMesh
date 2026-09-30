@@ -348,7 +348,7 @@ def test_a_compiled_build_is_the_latest_of_its_catalogue_run_in_place(tmp_path):
     assert (got["project"], got["catalogue"], got["virtual_hardware"]) == \
         ("sergeyculum", "local", "nRF52840")
     assert got["name"].startswith("Sergeyculum local ")
-    with pytest.raises(devices.DeviceError, match="build it first"):
+    with pytest.raises(devices.DeviceError, match=devices.NOT_BUILT):
         devices.resolve("broken_local_latest", devices_dir=dd, arch=ARCH)
     rows = {r["ref"]: r for r in devices.listing(dd, ARCH)["latest"]}
     assert set(rows) == {"sergeyculum_local_latest", "broken_local_latest"}

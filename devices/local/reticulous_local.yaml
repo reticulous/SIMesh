@@ -1,0 +1,11 @@
+# Reticulous as last built for the host target in the workspace beside SIMesh —
+# `spangap build reticulous/reticulous --with spangap/hw-linux …`, which leaves
+# the executable and the merged /fixed tree in the target's own build dir:
+# reticulous_local_latest, run in place, until the catalogues carry a
+# hw-simesh-<arch> build of their own.
+project: Reticulous
+kind: reticulous
+virtual_hardware: ESP32-S3
+virtual_radio: SX1262
+elf: ../../../reticulous/esp-idf/build.linux/reticulous.elf
+fixed: ../../../reticulous/esp-idf/build.linux/data_merged

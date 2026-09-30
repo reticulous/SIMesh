@@ -95,6 +95,7 @@ LATEST = "latest"               # devices/latest/: the newest of each catalogue,
 SAVED = "saved"                 # devices/saved/: copies that stay
 IMPORTED = "imported"           # the catalogue an imported zip joins
 COMPILED = "compiled"           # a latest row's source: a compiled build, run in place
+NOT_BUILT = "no firmware"       # a compiled build whose executable is not there
 PEEK_TAIL = 1 << 16             # a zip's end read for its directory, by range request
 INDEX_YAML = "index.yaml"
 DEFAULT_BASE = os.environ.get("SIMESH_CATALOGUES", "https://reticulous.net/builds/")
@@ -330,8 +331,11 @@ def local_result(key, devices_dir=None, arch=None):
 
     elf = where(doc["elf"])
     if not os.path.isfile(elf):
-        raise DeviceError("device %s_%s: no executable at %s (build it first)"
-                          % (key, LATEST, elf))
+        # A compiled build is a tree someone builds themselves, so this is the
+        # ordinary state of one nobody has built yet, on every row of every
+        # listing until they do: it says that and no more. Where its executable
+        # would be is in the file that names it.
+        raise DeviceError(NOT_BUILT)
     fixed = where(doc["fixed"]) if doc.get("fixed") else None
     stamp = datetime.datetime.fromtimestamp(os.stat(elf).st_mtime, datetime.timezone.utc)
     stamp = stamp.strftime("%Y%m%d%H%M%S")
